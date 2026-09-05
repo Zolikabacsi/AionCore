@@ -102,6 +102,16 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
+    /// Update the project binding and workspace path of an existing team member
+    /// conversation. Used when a team's project is switched.
+    async fn update_conversation_project_binding(
+        &self,
+        conversation_id: &str,
+        project_id: Option<String>,
+        folder_id: Option<String>,
+        workspace: Option<String>,
+    ) -> Result<(), TeamError>;
+
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
@@ -1055,6 +1065,16 @@ mod tests {
 
         async fn conversation_assistant_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
             Ok(None)
+        }
+
+        async fn update_conversation_project_binding(
+            &self,
+            _conversation_id: &str,
+            _project_id: Option<String>,
+            _folder_id: Option<String>,
+            _workspace: Option<String>,
+        ) -> Result<(), TeamError> {
+            Ok(())
         }
 
         async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {

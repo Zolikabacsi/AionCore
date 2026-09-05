@@ -161,6 +161,8 @@ pub struct Team {
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -292,6 +294,7 @@ impl Team {
             workspace: row.workspace.clone(),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
+            project_id: row.project_id.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -304,6 +307,7 @@ impl Team {
             workspace: self.workspace.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
+            project_id: self.project_id.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -683,6 +687,7 @@ mod tests {
                 cli_path: None,
             }],
             lead_agent_id: Some("s1".into()),
+            project_id: None,
             created_at: 1000,
             updated_at: 2000,
         };

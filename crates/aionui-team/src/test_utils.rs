@@ -1051,6 +1051,39 @@ pub(crate) mod workspace_harness {
             }))
         }
 
+        async fn update_conversation_project_binding(
+            &self,
+            conversation_id: &str,
+            project_id: Option<String>,
+            folder_id: Option<String>,
+            workspace: Option<String>,
+        ) -> Result<(), TeamError> {
+            let mut extra = self.repo.get_extra(conversation_id).unwrap_or_else(|| serde_json::json!({}));
+            if let (Some(workspace), Some(obj)) = (workspace, extra.as_object_mut()) {
+                obj.insert("workspace".to_owned(), serde_json::Value::String(workspace));
+                obj.insert("custom_workspace".to_owned(), serde_json::Value::Bool(true));
+            }
+            let user_id = self
+                .repo
+                .owner_user_id(conversation_id)
+                .await?
+                .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+            self.repo
+                .update(
+                    &user_id,
+                    conversation_id,
+                    &ConversationRowUpdate {
+                        extra: Some(serde_json::to_string(&extra).unwrap()),
+                        project_id,
+                        folder_id,
+                        updated_at: Some(now_ms()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+
         async fn create_team_temp_workspace(&self, _user_id: &str, team_id: &str) -> Result<String, TeamError> {
             let path = self
                 .workspace_root
@@ -1793,6 +1826,7 @@ pub(crate) mod workspace_harness {
                 conversation_id: None,
             }],
             workspace: None,
+            project_id: None,
         }
     }
 }

@@ -486,6 +486,32 @@ impl TeamSessionService {
         }
     }
 
+    /// Resolve a project_id into the team's workspace folder path and folder_id.
+    /// Errors if the project does not exist or has no workspace folder.
+    async fn resolve_project_workspace(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<(String, String), TeamError> {
+        let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
+        let Some(project_service) = project_service else {
+            return Err(TeamError::InvalidRequest("project service unavailable".into()));
+        };
+        let detail = project_service
+            .get_project(user_id, project_id)
+            .await
+            .map_err(|err| TeamError::InvalidRequest(format!("failed to resolve project: {err}")))?;
+        let workspace_entry = detail
+            .explorer
+            .entries
+            .iter()
+            .find(|e| e.role == "workspace")
+            .ok_or_else(|| TeamError::InvalidRequest("project has no workspace folder".into()))?;
+        let path = canonical::uri_to_path(&workspace_entry.folder.resource_uri)
+            .map_err(|err| TeamError::InvalidRequest(format!("invalid project workspace uri: {err}")))?;
+        Ok((path.to_string_lossy().into_owned(), workspace_entry.folder.folder_id.clone()))
+    }
+
     /// Lazily backfill `teams.project_id`/`folder_id` on read. Best-effort;
     /// no-op when already bound, workspace empty, or service unset.
     async fn backfill_team_binding_best_effort(&self, row: &TeamRow) {
@@ -774,10 +800,19 @@ impl TeamSessionService {
             ));
         }
 
-        let shared_workspace = match req.workspace.as_deref() {
-            Some(workspace) if !workspace.is_empty() => Some(validate_create_workspace_path(workspace)?),
-            _ => None,
-        };
+        // Resolve workspace from explicit project binding, explicit workspace path,
+        // or leave blank to derive from the leader agent's conversation.
+        let (shared_workspace, initial_project_id, initial_folder_id) =
+            match (req.project_id.as_deref(), req.workspace.as_deref()) {
+                (Some(project_id), _) => {
+                    let (workspace, folder_id) = self.resolve_project_workspace(user_id, project_id).await?;
+                    (Some(workspace), Some(project_id.to_owned()), Some(folder_id))
+                }
+                (None, Some(workspace)) if !workspace.is_empty() => {
+                    (Some(validate_create_workspace_path(workspace)?), None, None)
+                }
+                _ => (None, None, None),
+            };
 
         let team_id = generate_id();
         let now = now_ms();
@@ -791,8 +826,12 @@ impl TeamSessionService {
         let team_workspace = provisioned.team_workspace;
         let agents_json = serde_json::to_string(&agents)?;
 
-        // Project-bind side branch (best-effort; never affects team creation).
-        let (project_id, folder_id) = self.resolve_binding_best_effort(user_id, &team_workspace).await;
+        // Project binding: prefer an explicit project_id request, then fall back
+        // to resolving from the workspace path.
+        let (project_id, folder_id) = match (initial_project_id, initial_folder_id) {
+            (Some(pid), Some(fid)) => (Some(pid), Some(fid)),
+            _ => self.resolve_binding_best_effort(user_id, &team_workspace).await,
+        };
 
         let row = TeamRow {
             id: team_id.clone(),
@@ -817,13 +856,16 @@ impl TeamSessionService {
             workspace: team_workspace,
             agents,
             lead_agent_id,
+            project_id: row.project_id.clone(),
             created_at: now,
             updated_at: now,
         };
 
         info!(
             team_id = %team.id,
-            workspace_source = if shared_workspace.is_some() {
+            workspace_source = if req.project_id.is_some() {
+                "project_derived"
+            } else if shared_workspace.is_some() {
                 "user_supplied"
             } else {
                 "auto_from_leader"
@@ -954,6 +996,53 @@ impl TeamSessionService {
             .await?;
         self.broadcast_team_renamed(user_id, team_id, name);
         Ok(())
+    }
+
+    pub async fn update_team_project(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+    ) -> Result<TeamResponse, TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+
+        // Resolve the new project's workspace folder.
+        let (new_workspace, new_folder_id) = self.resolve_project_workspace(user_id, project_id).await?;
+
+        // Tear down the live runtime so agents pick up the new workspace/project
+        // on the next session start.
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::RuntimeRestart).await;
+
+        // Persist the new binding on the team row.
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    project_id: Some(project_id.to_owned()),
+                    folder_id: Some(new_folder_id.clone()),
+                    workspace: Some(new_workspace.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        // Update each member conversation's workspace and project binding.
+        for agent in &team.agents {
+            self.conversation_port
+                .update_conversation_project_binding(
+                    &agent.conversation_id,
+                    Some(project_id.to_owned()),
+                    Some(new_folder_id.clone()),
+                    Some(new_workspace.clone()),
+                )
+                .await?;
+        }
+
+        self.broadcast_team_list_changed(user_id, team_id, "updated");
+
+        // Reload and return the updated team.
+        self.get_team(user_id, team_id).await
     }
 
     pub async fn add_agent(
@@ -3502,6 +3591,7 @@ mod tests {
                 },
             ],
             workspace: None,
+            project_id: None,
         }
     }
 

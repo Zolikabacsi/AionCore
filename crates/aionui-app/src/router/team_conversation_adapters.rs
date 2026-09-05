@@ -11,7 +11,7 @@ use aionui_conversation::{
     ConversationService,
 };
 use aionui_db::models::{AgentMetadataRow, MessageRow};
-use aionui_db::{IAgentMetadataRepository, IConversationRepository};
+use aionui_db::{ConversationRowUpdate, IAgentMetadataRepository, IConversationRepository};
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, NativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition,
@@ -516,6 +516,36 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned))
+    }
+
+    async fn update_conversation_project_binding(
+        &self,
+        conversation_id: &str,
+        project_id: Option<String>,
+        folder_id: Option<String>,
+        workspace: Option<String>,
+    ) -> Result<(), TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
+        let mut update = ConversationRowUpdate {
+            project_id,
+            folder_id,
+            ..Default::default()
+        };
+        if let Some(workspace) = workspace {
+            let mut extra: serde_json::Value = self
+                .conversation_repo
+                .get(&user_id, conversation_id)
+                .await?
+                .and_then(|row| serde_json::from_str(&row.extra).ok())
+                .unwrap_or_default();
+            if let Some(obj) = extra.as_object_mut() {
+                obj.insert("workspace".to_owned(), serde_json::Value::String(workspace));
+                obj.insert("custom_workspace".to_owned(), serde_json::Value::Bool(true));
+            }
+            update.extra = Some(extra.to_string());
+        }
+        self.conversation_repo.update(&user_id, conversation_id, &update).await?;
+        Ok(())
     }
 
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {

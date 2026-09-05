@@ -15,7 +15,7 @@ use aionui_api_types::{
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse, UpdateTeamProjectRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -185,6 +185,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/tasks", get(list_tasks))
         .route("/api/teams/{id}/activity", get(list_activity))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
+        .route("/api/teams/{id}/project", axum::routing::patch(update_team_project))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
         .route(
@@ -391,6 +392,20 @@ async fn rename_team(
     let Json(req) = body.map_err(ApiError::from)?;
     state.service.rename_team(&user.id, &id, &req.name).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn update_team_project(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateTeamProjectRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let team = state
+        .service
+        .update_team_project(&user.id, &id, &req.project_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(team)))
 }
 
 #[derive(serde::Deserialize)]

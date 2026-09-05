@@ -108,12 +108,23 @@ pub struct CreateTeamRequest {
     pub agents: Vec<TeamAgentInput>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Optional explicit project binding. When provided, the team's workspace
+    /// is derived from the project's workspace folder instead of the
+    /// user-supplied `workspace` path.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// Request body for `PATCH /api/teams/:id/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameTeamRequest {
     pub name: String,
+}
+
+/// Request body for `PATCH /api/teams/:id/project`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateTeamProjectRequest {
+    pub project_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +604,8 @@ pub struct TeamResponse {
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
