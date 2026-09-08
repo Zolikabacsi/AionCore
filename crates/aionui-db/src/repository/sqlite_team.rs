@@ -810,23 +810,40 @@ impl ITeamRepository for SqliteTeamRepository {
         self.create_engagement(user_id, team_id, project_id, workspace).await
     }
 
-    async fn list_tasks_by_engagement(&self, engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+    async fn list_tasks_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
         // SELECT * is fine: sqlx FromRow ignores the engagement_id column the
-        // row struct intentionally does not declare in Phase 1.
+        // row struct intentionally does not declare in Phase 1. The EXISTS
+        // guard scopes the read to the engagement's owning user (data isolation).
         let rows = sqlx::query_as::<_, TeamTaskRow>(
-            "SELECT * FROM team_tasks WHERE engagement_id = ? ORDER BY created_at ASC",
+            "SELECT * FROM team_tasks \
+             WHERE engagement_id = ?1 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2) \
+             ORDER BY created_at ASC",
         )
         .bind(engagement_id)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
 
-    async fn list_messages_by_engagement(&self, engagement_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    async fn list_messages_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
-            "SELECT * FROM mailbox WHERE engagement_id = ? ORDER BY created_at ASC",
+            "SELECT * FROM mailbox \
+             WHERE engagement_id = ?1 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2) \
+             ORDER BY created_at ASC",
         )
         .bind(engagement_id)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)

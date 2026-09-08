@@ -63,8 +63,8 @@ async fn tasks_and_mail_are_isolated_per_engagement() {
     insert_message(pool, "m1", "team-x", &ea.id).await;
     insert_message(pool, "m2", "team-x", &eb.id).await;
 
-    let tasks_a = repo.list_tasks_by_engagement(&ea.id).await.unwrap();
-    let tasks_b = repo.list_tasks_by_engagement(&eb.id).await.unwrap();
+    let tasks_a = repo.list_tasks_by_engagement("u1", &ea.id).await.unwrap();
+    let tasks_b = repo.list_tasks_by_engagement("u1", &eb.id).await.unwrap();
     assert_eq!(
         tasks_a.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
         vec!["t1".to_string()]
@@ -74,8 +74,8 @@ async fn tasks_and_mail_are_isolated_per_engagement() {
         vec!["t2".to_string()]
     );
 
-    let msgs_a = repo.list_messages_by_engagement(&ea.id).await.unwrap();
-    let msgs_b = repo.list_messages_by_engagement(&eb.id).await.unwrap();
+    let msgs_a = repo.list_messages_by_engagement("u1", &ea.id).await.unwrap();
+    let msgs_b = repo.list_messages_by_engagement("u1", &eb.id).await.unwrap();
     assert_eq!(
         msgs_a.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
         vec!["m1".to_string()]
@@ -83,5 +83,24 @@ async fn tasks_and_mail_are_isolated_per_engagement() {
     assert_eq!(
         msgs_b.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
         vec!["m2".to_string()]
+    );
+
+    // Negative: a non-owning user_id sees nothing even with the real engagement
+    // id, proving the team_engagements.user_id ownership guard.
+    let stolen_tasks = repo
+        .list_tasks_by_engagement("attacker_user", &ea.id)
+        .await
+        .unwrap();
+    assert!(
+        stolen_tasks.is_empty(),
+        "non-owner must not read another user's engagement tasks"
+    );
+    let stolen_msgs = repo
+        .list_messages_by_engagement("attacker_user", &ea.id)
+        .await
+        .unwrap();
+    assert!(
+        stolen_msgs.is_empty(),
+        "non-owner must not read another user's engagement mail"
     );
 }

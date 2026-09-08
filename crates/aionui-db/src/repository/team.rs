@@ -257,15 +257,25 @@ pub trait ITeamRepository: Send + Sync {
         ))
     }
 
-    /// Returns all tasks bound to `engagement_id`, oldest first.
-    async fn list_tasks_by_engagement(&self, _engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+    /// Returns all tasks bound to `engagement_id` owned by `user_id`, oldest
+    /// first. Scoped via the engagement's owner (`team_engagements.user_id`).
+    async fn list_tasks_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
         Err(DbError::NotFound(
             "list_tasks_by_engagement not implemented".to_string(),
         ))
     }
 
-    /// Returns all mailbox messages bound to `engagement_id`, oldest first.
-    async fn list_messages_by_engagement(&self, _engagement_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
+    /// Returns all mailbox messages bound to `engagement_id` owned by `user_id`,
+    /// oldest first. Scoped via the engagement's owner (`team_engagements.user_id`).
+    async fn list_messages_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         Err(DbError::NotFound(
             "list_messages_by_engagement not implemented".to_string(),
         ))
