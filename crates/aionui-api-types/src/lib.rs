@@ -17,6 +17,7 @@ mod connection_test;
 mod conversation;
 mod cron;
 mod custom_agent;
+mod delegate_tools;
 mod extension;
 mod file;
 mod lifecycle;
@@ -111,6 +112,13 @@ pub use cron::{
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,
+};
+pub use delegate_tools::{
+    DelegateAskRequest, DelegateAskResponse, DelegateCliEnvelope, DelegateDeliveryStatus, DelegateDispatchRequest,
+    DelegateDispatchResponse, DelegateEnvelopeBlock, DelegateEnvelopeKind, DelegateTarget, DelegateTargetsQuery,
+    DelegateTargetsResponse, DelegateToolDescriptor, DelegateToolErrorCode, DelegateToolErrorPayload,
+    DelegateToolName, DELEGATE_TOOLS_SCHEMA_VERSION, delegate_tool_descriptor, delegate_tool_descriptors,
+    tool_name_for_delegate_cli_path,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,

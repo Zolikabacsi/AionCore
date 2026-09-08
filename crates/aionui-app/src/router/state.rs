@@ -40,6 +40,7 @@ use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
+use aionui_delegate::state::DelegateRouterState;
 use aionui_shell::ShellRouterState;
 use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
 use aionui_skill_runtime::{SkillRuntimeRouterState, SkillRuntimeService};
@@ -144,6 +145,7 @@ pub struct ModuleStates {
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
     pub session_message: SessionMessageRouterState,
+    pub delegate: DelegateRouterState,
     pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
@@ -329,6 +331,7 @@ pub async fn build_module_states(
             )
         }),
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
+        delegate: build_module_state_phase(&boot, "delegate", || build_delegate_state(services)),
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
@@ -412,6 +415,35 @@ pub fn build_session_message_state(services: &AppServices) -> SessionMessageRout
     .spawn(services.session_message_notify.clone());
 
     state
+}
+
+/// Build the `aionui-delegate` router state. Mirrors the `session-message`
+/// shape: queue + rate limiter + suspend registry + service + repo wiring.
+pub fn build_delegate_state(services: &AppServices) -> DelegateRouterState {
+    use aionui_delegate::service::DelegateService;
+
+    let service = Arc::new(DelegateService::new(
+        services.conversation_service.clone(),
+        services.conversation_repo.clone(),
+        services.settings_repo.clone(),
+        services.event_broadcaster.clone(),
+        services.worker_task_manager.clone(),
+    ));
+
+    DelegateRouterState {
+        service: service.clone(),
+        conversation_service: services.conversation_service.clone(),
+        conversation_repo: services.conversation_repo.clone(),
+        settings_repo: services.settings_repo.clone(),
+        broadcaster: services.event_broadcaster.clone(),
+        runtime_token_service: services.runtime_token_service.clone(),
+        task_manager: services.worker_task_manager.clone(),
+        // queue/rate_limiter/suspend are exposed via the service's
+        // `Arc` clone — the router only needs `service` to dispatch.
+        queue: service.queue.clone(),
+        rate_limiter: service.rate_limiter.clone(),
+        suspend: service.suspend.clone(),
+    }
 }
 
 /// Build the default `AssistantRouterState` from application services.

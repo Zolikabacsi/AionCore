@@ -1498,6 +1498,26 @@ impl IConversationRepository for SqliteConversationRepository {
 
         Ok(rows)
     }
+
+    // ── Raw escape hatches (aionui-delegate, migration 044) ─────────
+
+    async fn raw_query(&self, sql: &str, params: Vec<String>) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
+        let mut q = sqlx::query(sql);
+        for p in params {
+            q = q.bind(p);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    async fn raw_execute(&self, sql: &str, params: Vec<String>) -> Result<u64, DbError> {
+        let mut q = sqlx::query(sql);
+        for p in params {
+            q = q.bind(p);
+        }
+        let result = q.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ── Dynamic bind helpers ────────────────────────────────────────────

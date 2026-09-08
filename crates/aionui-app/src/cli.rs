@@ -117,6 +117,10 @@ pub(crate) enum Command {
     /// Cross-session messaging: list deliverable conversations and deliver a
     /// message to one of them.
     Session(SessionArgs),
+    /// Cross-agent delegation: dispatch to or ask another agent by name.
+    /// CrewAI-style hierarchical delegation — works for any agent whose
+    /// `allow_delegation = 1`, addressed by name or assistant_id.
+    Delegate(DelegateArgs),
     /// Agent-facing read-only runtime CLI for THIS conversation's skills.
     /// Channel A of skill delivery: a normal tool call instead of the
     /// `[LOAD_SKILL]` text-protocol round trip.
@@ -160,6 +164,7 @@ impl Command {
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
             Self::Session(_) => "session",
+            Self::Delegate(_) => "delegate",
             Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
@@ -240,6 +245,22 @@ pub(crate) enum SessionCommand {
     Capabilities,
     List,
     SendMessage,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DelegateArgs {
+    #[command(subcommand)]
+    pub command: DelegateCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DelegateCommand {
+    Capabilities,
+    Targets,
+    Dispatch,
+    Ask,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
@@ -819,8 +840,9 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SecretArgs,
-        SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
+        Cli, Command, ConfigArgs, ConfigCommand, DelegateArgs, DelegateCommand, ManagedResourcesModeArg,
+        PrepareManagedResourcesArgs, SecretArgs, SecretCommand, SessionCommand, TeamCommand, UserArgs,
+        UserCommand, UserStatusArgs,
     };
 
     #[test]
@@ -1069,6 +1091,48 @@ mod tests {
             SessionCommand::Unknown(_) => None,
             command => Some(command),
         }
+    }
+
+    fn parse_delegate_command(argv: &[&str]) -> Option<DelegateCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Delegate(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            DelegateCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    /// Every tool in the delegate registry advertises a `cli_command`, and that
+    /// path is printed by `delegate capabilities` and copied into the
+    /// auto-inject skill. A registry entry with no wired subcommand sends
+    /// agents at a command that can only fail.
+    #[test]
+    fn every_registry_tool_has_a_wired_delegate_cli_subcommand() {
+        for tool in aionui_api_types::delegate_tool_descriptors() {
+            let mut argv = vec!["aioncore", "delegate"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_delegate_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into DelegateCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn delegate_cli_accepts_capabilities() {
+        assert!(parse_delegate_command(&["aioncore", "delegate", "capabilities"]).is_some());
+    }
+
+    #[test]
+    fn unwired_delegate_subcommand_is_reported_as_unknown() {
+        assert!(
+            parse_delegate_command(&["aioncore", "delegate", "definitely-not-a-command"]).is_none(),
+            "unknown subcommand must surface as DelegateCommand::Unknown"
+        );
     }
 
     /// Every tool in the session registry advertises a `cli_command`, and that

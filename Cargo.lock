@@ -409,6 +409,7 @@ dependencies = [
  "aionui-conversation",
  "aionui-cron",
  "aionui-db",
+ "aionui-delegate",
  "aionui-extension",
  "aionui-file",
  "aionui-mcp",
@@ -647,6 +648,31 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aionui-delegate"
+version = "0.2.1"
+dependencies = [
+ "aionui-ai-agent",
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-conversation",
+ "aionui-db",
+ "aionui-realtime",
+ "async-trait",
+ "axum",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
