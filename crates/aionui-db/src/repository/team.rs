@@ -222,7 +222,8 @@ pub trait ITeamRepository: Send + Sync {
     // that don't exercise engagement CRUD still satisfy the trait; the real
     // `SqliteTeamRepository` overrides every method and is authoritative.
 
-    /// Inserts a new engagement for a `(team, project)` pair.
+    /// Inserts a new engagement for a `(team, project)` pair. Fails with
+    /// `NotFound` unless `user_id` owns `team_id` (P2-1 ownership guard).
     async fn create_engagement(
         &self,
         _user_id: &str,
@@ -233,8 +234,14 @@ pub trait ITeamRepository: Send + Sync {
         Err(DbError::NotFound("create_engagement not implemented".to_string()))
     }
 
-    /// Returns the engagement binding `team_id` to `project_id`, or `None`.
-    async fn find_engagement(&self, _team_id: &str, _project_id: &str) -> Result<Option<TeamEngagementRow>, DbError> {
+    /// Returns the engagement binding `team_id` to `project_id` owned by
+    /// `user_id`, or `None`. Scoped to `user_id` for data isolation.
+    async fn find_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
         Err(DbError::NotFound("find_engagement not implemented".to_string()))
     }
 

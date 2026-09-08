@@ -751,6 +751,17 @@ impl ITeamRepository for SqliteTeamRepository {
     ) -> Result<TeamEngagementRow, DbError> {
         let id = generate_id();
         let now = now_ms();
+        // P2-1 ownership guard (fail closed): a `team_engagements` row is keyed
+        // on `team_id`, so reject before any write unless `user_id` owns that
+        // team. Mirrors the `create_task` ownership invariant (`NotFound`).
+        let owns: Option<i64> = sqlx::query_scalar("SELECT 1 FROM teams WHERE id = ? AND user_id = ?")
+            .bind(team_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if owns.is_none() {
+            return Err(DbError::NotFound(format!("team {team_id}")));
+        }
         // ON CONFLICT DO NOTHING makes this idempotent under the unique
         // (team_id, project_id) race; the read-back returns the winning row.
         sqlx::query(
@@ -767,18 +778,27 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        sqlx::query_as::<_, TeamEngagementRow>("SELECT * FROM team_engagements WHERE team_id = ? AND project_id = ?")
-            .bind(team_id)
-            .bind(project_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("engagement for team {team_id} project {project_id}")))
+        sqlx::query_as::<_, TeamEngagementRow>(
+            "SELECT * FROM team_engagements WHERE user_id = ? AND team_id = ? AND project_id = ?",
+        )
+        .bind(user_id)
+        .bind(team_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("engagement for team {team_id} project {project_id}")))
     }
 
-    async fn find_engagement(&self, team_id: &str, project_id: &str) -> Result<Option<TeamEngagementRow>, DbError> {
+    async fn find_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
         let row = sqlx::query_as::<_, TeamEngagementRow>(
-            "SELECT * FROM team_engagements WHERE team_id = ? AND project_id = ?",
+            "SELECT * FROM team_engagements WHERE user_id = ? AND team_id = ? AND project_id = ?",
         )
+        .bind(user_id)
         .bind(team_id)
         .bind(project_id)
         .fetch_optional(&self.pool)
@@ -804,17 +824,13 @@ impl ITeamRepository for SqliteTeamRepository {
         project_id: &str,
         workspace: &str,
     ) -> Result<TeamEngagementRow, DbError> {
-        if let Some(engagement) = self.find_engagement(team_id, project_id).await? {
+        if let Some(engagement) = self.find_engagement(user_id, team_id, project_id).await? {
             return Ok(engagement);
         }
         self.create_engagement(user_id, team_id, project_id, workspace).await
     }
 
-    async fn list_tasks_by_engagement(
-        &self,
-        user_id: &str,
-        engagement_id: &str,
-    ) -> Result<Vec<TeamTaskRow>, DbError> {
+    async fn list_tasks_by_engagement(&self, user_id: &str, engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
         // SELECT * is fine: sqlx FromRow ignores the engagement_id column the
         // row struct intentionally does not declare in Phase 1. The EXISTS
         // guard scopes the read to the engagement's owning user (data isolation).
