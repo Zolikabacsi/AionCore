@@ -56,7 +56,7 @@ use crate::session::{
     spawn_attach_agent_process_bg,
 };
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
+use crate::types::{Team, TeamAgent, TeamEngagement, TeamTask, TeammateRole};
 use crate::work_coordinator::{
     McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
 };
@@ -783,6 +783,23 @@ impl TeamSessionService {
         if !teams.is_empty() {
             tracing::info!(count = teams.len(), "team sessions restored on startup");
         }
+    }
+
+    /// Find-or-create the engagement binding `team_id` to `project_id`,
+    /// reusing the same project→workspace resolution as `create_team`.
+    /// Thin service seam; not wired to runtime routing in Phase 1.
+    pub async fn ensure_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+    ) -> Result<TeamEngagement, TeamError> {
+        let (workspace, _folder_id) = self.resolve_project_workspace(user_id, project_id).await?;
+        let row = self
+            .repo
+            .find_or_create_engagement(user_id, team_id, project_id, &workspace)
+            .await?;
+        Ok(TeamEngagement::from_row(&row))
     }
 
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {

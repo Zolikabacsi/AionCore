@@ -280,10 +280,28 @@ pub struct TeamTask {
 }
 
 // ---------------------------------------------------------------------------
+// TeamEngagement
+// ---------------------------------------------------------------------------
+
+/// Domain view of a `team_engagements` row: a team bound to one project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TeamEngagement {
+    pub id: String,
+    pub user_id: String,
+    pub team_id: String,
+    pub project_id: String,
+    pub workspace: String,
+    pub process: String,
+    pub status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+// ---------------------------------------------------------------------------
 // Conversion helpers: DB rows ↔ domain types
 // ---------------------------------------------------------------------------
 
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 
 impl Team {
     pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
@@ -356,6 +374,22 @@ impl TeamTask {
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
+    }
+}
+
+impl TeamEngagement {
+    pub fn from_row(row: &TeamEngagementRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            user_id: row.user_id.clone(),
+            team_id: row.team_id.clone(),
+            project_id: row.project_id.clone(),
+            workspace: row.workspace.clone(),
+            process: row.process.clone(),
+            status: row.status.clone(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
     }
 }
 
