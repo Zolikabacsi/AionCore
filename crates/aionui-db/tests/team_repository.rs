@@ -63,7 +63,6 @@ fn make_mailbox_msg(id: &str, team_id: &str, to: &str, from: &str, msg_type: &st
         files: None,
         read: false,
         created_at: now_ms(),
-        engagement_id: None,
     }
 }
 
@@ -81,7 +80,6 @@ fn make_task(id: &str, team_id: &str, subject: &str) -> TeamTaskRow {
         metadata: None,
         created_at: now,
         updated_at: now,
-        engagement_id: None,
     }
 }
 

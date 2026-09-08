@@ -43,8 +43,6 @@ pub struct MailboxMessageRow {
     pub files: Option<String>,
     pub read: bool,
     pub created_at: TimestampMs,
-    /// Engagement scope (project-bind re-key); NULL until bound/backfilled.
-    pub engagement_id: Option<String>,
 }
 
 /// Row mapping for the `team_tasks` table.
@@ -68,8 +66,6 @@ pub struct TeamTaskRow {
     pub metadata: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
-    /// Engagement scope (project-bind re-key); NULL until bound/backfilled.
-    pub engagement_id: Option<String>,
 }
 
 /// Row mapping for the `team_engagements` table.
@@ -129,7 +125,6 @@ mod tests {
             files: None,
             read: false,
             created_at: 0,
-            engagement_id: None,
         };
         assert_eq!(row.msg_type, "message");
     }
@@ -148,7 +143,6 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
-            engagement_id: None,
         };
         let blocked: Vec<String> = serde_json::from_str(&row.blocked_by).expect("blocked_by should be valid JSON");
         assert!(blocked.is_empty());
@@ -170,7 +164,6 @@ mod tests {
             metadata: Some(r#"{"priority":"high"}"#.into()),
             created_at: 1000,
             updated_at: 2000,
-            engagement_id: None,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         let restored: TeamTaskRow = serde_json::from_str(&json).expect("deserialize");

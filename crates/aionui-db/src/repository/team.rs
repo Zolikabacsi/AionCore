@@ -217,29 +217,43 @@ pub trait ITeamRepository: Send + Sync {
     async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError>;
 
     // ── Engagements ──────────────────────────────────────────────────
+    //
+    // Declared with default "not implemented" bodies so non-SQLite test doubles
+    // that don't exercise engagement CRUD still satisfy the trait; the real
+    // `SqliteTeamRepository` overrides every method and is authoritative.
 
     /// Inserts a new engagement for a `(team, project)` pair.
     async fn create_engagement(
         &self,
-        user_id: &str,
-        team_id: &str,
-        project_id: &str,
-        workspace: &str,
-    ) -> Result<TeamEngagementRow, DbError>;
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        _workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        Err(DbError::NotFound("create_engagement not implemented".to_string()))
+    }
 
     /// Returns the engagement binding `team_id` to `project_id`, or `None`.
-    async fn find_engagement(&self, team_id: &str, project_id: &str) -> Result<Option<TeamEngagementRow>, DbError>;
+    async fn find_engagement(&self, _team_id: &str, _project_id: &str) -> Result<Option<TeamEngagementRow>, DbError> {
+        Err(DbError::NotFound("find_engagement not implemented".to_string()))
+    }
 
-    /// Returns all active engagements for `user_id` in a team, oldest first.
-    async fn list_engagements(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError>;
+    /// Returns all engagements for `user_id` in a team, oldest first.
+    async fn list_engagements(&self, _user_id: &str, _team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError> {
+        Err(DbError::NotFound("list_engagements not implemented".to_string()))
+    }
 
     /// Returns the engagement for `(team_id, project_id)`, creating it if absent.
     /// Tolerant of the `uq_team_engagements_team_project` race.
     async fn find_or_create_engagement(
         &self,
-        user_id: &str,
-        team_id: &str,
-        project_id: &str,
-        workspace: &str,
-    ) -> Result<TeamEngagementRow, DbError>;
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        _workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        Err(DbError::NotFound(
+            "find_or_create_engagement not implemented".to_string(),
+        ))
+    }
 }
