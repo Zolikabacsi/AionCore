@@ -85,6 +85,14 @@ pub struct TeamEngagementRow {
     pub status: String,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    /// Optional drive folder backing the engagement.
+    pub folder_id: Option<String>,
+    /// Creation path: 'user' (default) or 'delegated'.
+    pub origin: String,
+    /// Originating conversation when delegated.
+    pub created_by_conversation_id: Option<String>,
+    /// Correlation id for reply-driven engagements.
+    pub reply_to: Option<String>,
 }
 
 #[cfg(test)]
