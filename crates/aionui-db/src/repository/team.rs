@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 
 /// Sort/paging direction for the activity feed cursor queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,4 +215,31 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Deletes all tasks belonging to a team.
     async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError>;
+
+    // ── Engagements ──────────────────────────────────────────────────
+
+    /// Inserts a new engagement for a `(team, project)` pair.
+    async fn create_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+        workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError>;
+
+    /// Returns the engagement binding `team_id` to `project_id`, or `None`.
+    async fn find_engagement(&self, team_id: &str, project_id: &str) -> Result<Option<TeamEngagementRow>, DbError>;
+
+    /// Returns all active engagements for `user_id` in a team, oldest first.
+    async fn list_engagements(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError>;
+
+    /// Returns the engagement for `(team_id, project_id)`, creating it if absent.
+    /// Tolerant of the `uq_team_engagements_team_project` race.
+    async fn find_or_create_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+        workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError>;
 }

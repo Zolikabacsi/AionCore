@@ -1,8 +1,8 @@
-use aionui_common::now_ms;
+use aionui_common::{generate_id, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
@@ -738,5 +738,75 @@ impl ITeamRepository for SqliteTeamRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ── Engagements ──────────────────────────────────────────────────
+
+    async fn create_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+        workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        let id = generate_id();
+        let now = now_ms();
+        // ON CONFLICT DO NOTHING makes this idempotent under the unique
+        // (team_id, project_id) race; the read-back returns the winning row.
+        sqlx::query(
+            "INSERT INTO team_engagements (id, user_id, team_id, project_id, workspace, process, status, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 'hierarchical', 'active', ?, ?) \
+             ON CONFLICT (team_id, project_id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(team_id)
+        .bind(project_id)
+        .bind(workspace)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query_as::<_, TeamEngagementRow>("SELECT * FROM team_engagements WHERE team_id = ? AND project_id = ?")
+            .bind(team_id)
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("engagement for team {team_id} project {project_id}")))
+    }
+
+    async fn find_engagement(&self, team_id: &str, project_id: &str) -> Result<Option<TeamEngagementRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamEngagementRow>(
+            "SELECT * FROM team_engagements WHERE team_id = ? AND project_id = ?",
+        )
+        .bind(team_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn list_engagements(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError> {
+        let rows = sqlx::query_as::<_, TeamEngagementRow>(
+            "SELECT * FROM team_engagements WHERE user_id = ? AND team_id = ? ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn find_or_create_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+        workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        if let Some(engagement) = self.find_engagement(team_id, project_id).await? {
+            return Ok(engagement);
+        }
+        self.create_engagement(user_id, team_id, project_id, workspace).await
     }
 }
