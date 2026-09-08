@@ -63,5 +63,9 @@ SELECT
 FROM teams t
 WHERE t.archived_at IS NULL;
 
-UPDATE team_tasks SET engagement_id = team_id WHERE engagement_id IS NULL;
-UPDATE mailbox    SET engagement_id = team_id WHERE engagement_id IS NULL;
+UPDATE team_tasks SET engagement_id = team_id
+    WHERE engagement_id IS NULL
+      AND team_id IN (SELECT id FROM team_engagements);
+UPDATE mailbox SET engagement_id = team_id
+    WHERE engagement_id IS NULL
+      AND team_id IN (SELECT id FROM team_engagements);
