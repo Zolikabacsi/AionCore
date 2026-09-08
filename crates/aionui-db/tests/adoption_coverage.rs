@@ -27,6 +27,7 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_engagement_members", "engagement_id", "team_engagements"),
+    ("suspended_turns", "envelope_id", "delegation_envelopes"),
     ("team_tasks", "team_id", "teams"),
 ];
 

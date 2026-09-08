@@ -133,6 +133,16 @@ impl MockConversationRepo {
 
 #[async_trait::async_trait]
 impl IConversationRepository for MockConversationRepo {
+    async fn raw_query(
+        &self,
+        _sql: &str,
+        _params: Vec<String>,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
+        unimplemented!("raw_query is not exercised by aionui-team mocks")
+    }
+    async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, DbError> {
+        unimplemented!("raw_execute is not exercised by aionui-team mocks")
+    }
     async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
         let convs = self.conversations.lock().unwrap();
         Ok(convs.iter().find(|c| c.user_id == user_id && c.id == id).cloned())

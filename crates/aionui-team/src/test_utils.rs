@@ -465,6 +465,16 @@ pub(crate) mod workspace_harness {
 
     #[async_trait]
     impl IConversationRepository for MockConversationRepo {
+        async fn raw_query(
+            &self,
+            _sql: &str,
+            _params: Vec<String>,
+        ) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
+            unimplemented!("raw_query is not exercised by aionui-team mocks")
+        }
+        async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, DbError> {
+            unimplemented!("raw_execute is not exercised by aionui-team mocks")
+        }
         async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
             Ok(self
                 .conversations
