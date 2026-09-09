@@ -164,8 +164,8 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn write_message(&self, user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError> {
         let result = sqlx::query(
             "INSERT INTO mailbox \
-                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at, engagement_id) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
         )
         .bind(&row.id)
@@ -178,6 +178,7 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.files)
         .bind(row.read)
         .bind(row.created_at)
+        .bind(row.engagement_id.as_deref())
         .bind(&row.team_id)
         .bind(user_id)
         .execute(&self.pool)
@@ -204,7 +205,7 @@ impl ITeamRepository for SqliteTeamRepository {
 
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -241,7 +242,7 @@ impl ITeamRepository for SqliteTeamRepository {
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -271,7 +272,7 @@ impl ITeamRepository for SqliteTeamRepository {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                    AND id IN ({placeholders}) \
@@ -330,7 +331,7 @@ impl ITeamRepository for SqliteTeamRepository {
         let rows = if let Some(limit) = limit {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
                    AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -346,7 +347,7 @@ impl ITeamRepository for SqliteTeamRepository {
         } else {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
                    AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -364,7 +365,7 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? \
              ORDER BY created_at DESC \
@@ -395,7 +396,7 @@ impl ITeamRepository for SqliteTeamRepository {
         };
         let sql = format!(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? {cursor_clause}\
              ORDER BY created_at {order}, id {order} \
@@ -420,7 +421,7 @@ impl ITeamRepository for SqliteTeamRepository {
             let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE id IN ({placeholders}) \
                  ORDER BY created_at DESC"
@@ -454,8 +455,8 @@ impl ITeamRepository for SqliteTeamRepository {
         let result = sqlx::query(
             "INSERT INTO team_tasks \
                 (id, team_id, subject, description, status, owner, \
-                 blocked_by, blocks, metadata, created_at, updated_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                 blocked_by, blocks, metadata, created_at, updated_at, engagement_id) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
         )
         .bind(&row.id)
@@ -469,6 +470,7 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.metadata)
         .bind(row.created_at)
         .bind(row.updated_at)
+        .bind(row.engagement_id.as_deref())
         .bind(&row.team_id)
         .bind(user_id)
         .execute(&self.pool)

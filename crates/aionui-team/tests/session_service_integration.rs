@@ -2399,6 +2399,7 @@ async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() 
                 files: None,
                 read: false,
                 created_at: aionui_common::now_ms(),
+                engagement_id: None,
             },
         )
         .await
@@ -2527,6 +2528,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
                 files: None,
                 read: false,
                 created_at: aionui_common::now_ms(),
+                engagement_id: None,
             },
         )
         .await
@@ -8778,6 +8780,7 @@ fn activity_message_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::
         files: None,
         read: false,
         created_at,
+        engagement_id: None,
     }
 }
 
@@ -8794,6 +8797,7 @@ fn activity_task_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::mod
         metadata: Some(r#"{"secret":"xxx"}"#.into()),
         created_at,
         updated_at: created_at,
+        engagement_id: None,
     }
 }
 

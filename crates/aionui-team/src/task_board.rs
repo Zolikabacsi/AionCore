@@ -81,6 +81,7 @@ impl TaskBoard {
             metadata: None,
             created_at: now,
             updated_at: now,
+            engagement_id: None,
         };
 
         self.repo.create_task(&self.user_id, &row).await?;

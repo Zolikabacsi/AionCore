@@ -77,6 +77,7 @@ impl Mailbox {
             files: files_json,
             read: false,
             created_at: now_ms(),
+            engagement_id: None,
         };
 
         self.repo.write_message(&self.user_id, &row).await?;

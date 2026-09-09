@@ -112,6 +112,7 @@ mod tests {
             files: files.map(str::to_owned),
             read: true,
             created_at: 42,
+            engagement_id: None,
         }
     }
 

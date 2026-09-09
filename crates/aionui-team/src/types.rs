@@ -791,6 +791,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 1000,
+            engagement_id: None,
         };
         let msg = MailboxMessage::from_row(&row).unwrap();
         assert_eq!(msg.msg_type, MailboxMessageType::Message);
@@ -810,6 +811,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 2000,
+            engagement_id: None,
         };
         let msg = MailboxMessage::from_row(&row).unwrap();
         assert_eq!(msg.msg_type, MailboxMessageType::IdleNotification);
@@ -829,6 +831,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 0,
+            engagement_id: None,
         };
         assert!(MailboxMessage::from_row(&row).is_none());
     }
@@ -869,6 +872,7 @@ mod tests {
             metadata: Some(r#"{"priority":"high"}"#.into()),
             created_at: 1000,
             updated_at: 2000,
+            engagement_id: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::InProgress);
@@ -891,6 +895,7 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            engagement_id: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -913,6 +918,7 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            engagement_id: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -932,6 +938,7 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            engagement_id: None,
         };
         assert!(TeamTask::from_row(&row).is_err());
     }
