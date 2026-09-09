@@ -140,7 +140,6 @@ mod rate_limit {
 #[cfg(test)]
 mod turn_suspend {
     use crate::turn_suspend::{SuspendedTurn, TurnSuspendRegistry};
-    use aionui_common::TimestampMs;
 
     #[test]
     fn park_resolve_lifecycle() {
@@ -192,7 +191,6 @@ mod turn_suspend {
 mod envelope {
     use crate::service::compose_delivery_body;
     use aionui_api_types::{DelegateEnvelopeBlock, DelegateEnvelopeKind};
-    use aionui_common::TimestampMs;
 
     #[test]
     fn body_renders_block_with_terminator() {
