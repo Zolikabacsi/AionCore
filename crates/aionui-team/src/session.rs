@@ -96,6 +96,12 @@ pub struct SpawnAgentRequest {
 
 pub struct TeamSession {
     team: Team,
+    /// Active engagement (`team × project` binding) that this session's mailbox
+    /// and task-board writes are stamped with. Resolved once at session start
+    /// from the team's current project (legacy single-project teams resolve to
+    /// the backfilled default, i.e. `engagement_id == team_id`, so behavior is
+    /// unchanged). Used by the service to key `sessions`/`*_locks` maps.
+    engagement_id: String,
     scheduler: Arc<TeammateManager>,
     mailbox: Arc<Mailbox>,
     task_board: Arc<TaskBoard>,
@@ -172,6 +178,36 @@ impl TeamSession {
         .await
     }
 
+    /// Resolve the active engagement id for `team`, stamped on every mailbox and
+    /// task-board write this session performs:
+    /// - no project bound → `team.id` (the migration-045 backfilled default;
+    ///   identical to Phase 1 behavior, so legacy single-engagement teams are
+    ///   unaffected).
+    /// - project bound → `find_or_create_engagement(user, team, project).id`.
+    ///
+    /// Falls back to `team.id` if the repository can't resolve an engagement
+    /// (test doubles whose `find_or_create_engagement` is unimplemented).
+    async fn resolve_engagement_id(repo: &Arc<dyn ITeamRepository>, user_id: &str, team: &Team) -> String {
+        let Some(project_id) = team.project_id.clone() else {
+            return team.id.clone();
+        };
+        match repo
+            .find_or_create_engagement(user_id, &team.id, &project_id, &team.workspace)
+            .await
+        {
+            Ok(engagement) => engagement.id,
+            Err(err) => {
+                warn!(
+                    team_id = %team.id,
+                    project_id,
+                    error = %err,
+                    "team engagement resolution failed; falling back to team_id key"
+                );
+                team.id.clone()
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_prompt_dump(
         team: Team,
@@ -186,6 +222,7 @@ impl TeamSession {
         service: Weak<TeamSessionService>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
+        let engagement_id = Self::resolve_engagement_id(&repo, &user_id, &team).await;
         // Single emitter shared by mailbox, task board, and the run manager so
         // all team events reuse the same team-scoped subscription/delivery.
         let emitter = Arc::new(TeamEventEmitter::new(
@@ -193,8 +230,16 @@ impl TeamSession {
             user_id.clone(),
             broadcaster.clone(),
         ));
-        let mailbox = Arc::new(Mailbox::new_for_user(repo.clone(), user_id.clone()).with_events(emitter.clone()));
-        let task_board = Arc::new(TaskBoard::new_for_user(repo, user_id.clone()).with_events(emitter.clone()));
+        let mailbox = Arc::new(
+            Mailbox::new_for_user(repo.clone(), user_id.clone())
+                .with_events(emitter.clone())
+                .with_engagement(engagement_id.clone()),
+        );
+        let task_board = Arc::new(
+            TaskBoard::new_for_user(repo, user_id.clone())
+                .with_events(emitter.clone())
+                .with_engagement(engagement_id.clone()),
+        );
         let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
         let team_run_manager = Arc::new(TeamRunManager::new(team.id.clone(), emitter.clone()));
         let work_coordinator = Arc::new(SlotWorkCoordinator::new(
@@ -233,6 +278,7 @@ impl TeamSession {
 
         Ok(Self {
             team,
+            engagement_id,
             scheduler,
             mailbox,
             task_board,
@@ -267,6 +313,12 @@ impl TeamSession {
 
     pub fn team_id(&self) -> &str {
         &self.team.id
+    }
+
+    /// Active engagement (`team × project` binding) that every mailbox/task
+    /// write in this session is stamped with. Resolved once at `start`.
+    pub fn engagement_id(&self) -> &str {
+        &self.engagement_id
     }
 
     pub fn user_id(&self) -> &str {

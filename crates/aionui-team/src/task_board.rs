@@ -19,6 +19,10 @@ pub struct TaskBoard {
     /// directly.
     events: Option<Arc<TeamEventEmitter>>,
     user_id: String,
+    /// Active engagement (`team × project` binding) that every task created
+    /// through this board belongs to. Stamped on `TeamTaskRow` so the runtime
+    /// no longer leaves `engagement_id` NULL (Phase 1 legacy).
+    engagement_id: Option<String>,
 }
 
 /// Optional fields for task update.
@@ -41,12 +45,20 @@ impl TaskBoard {
             repo,
             events: None,
             user_id: user_id.into(),
+            engagement_id: None,
         }
     }
 
     /// Attaches a real-time event emitter for `team.taskChanged` broadcasts.
     pub fn with_events(mut self, events: Arc<TeamEventEmitter>) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Pin every task created through this board to a specific engagement id.
+    /// Set once at `TeamSession::start` from the team's resolved engagement.
+    pub fn with_engagement(mut self, engagement_id: impl Into<String>) -> Self {
+        self.engagement_id = Some(engagement_id.into());
         self
     }
 
@@ -81,7 +93,7 @@ impl TaskBoard {
             metadata: None,
             created_at: now,
             updated_at: now,
-            engagement_id: None,
+            engagement_id: self.engagement_id.clone(),
         };
 
         self.repo.create_task(&self.user_id, &row).await?;

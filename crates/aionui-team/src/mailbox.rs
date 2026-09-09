@@ -18,6 +18,10 @@ pub struct Mailbox {
     /// [`Mailbox::new`] directly.
     events: Option<Arc<TeamEventEmitter>>,
     user_id: String,
+    /// Active engagement (`team × project` binding) that this mailbox writes
+    /// belong to. Stamped on every `MailboxMessageRow` so the runtime no
+    /// longer leaves `engagement_id` NULL (Phase 1 legacy).
+    engagement_id: Option<String>,
 }
 
 impl Mailbox {
@@ -30,12 +34,20 @@ impl Mailbox {
             repo,
             events: None,
             user_id: user_id.into(),
+            engagement_id: None,
         }
     }
 
-    /// Attaches a real-time event emitter for `team.mailboxChanged` broadcasts.
+    /// Attach a real-time event emitter for `team.mailboxChanged` broadcasts.
     pub fn with_events(mut self, events: Arc<TeamEventEmitter>) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Pin every write from this mailbox to a specific engagement id. Set once
+    /// at `TeamSession::start` from the team's resolved engagement.
+    pub fn with_engagement(mut self, engagement_id: impl Into<String>) -> Self {
+        self.engagement_id = Some(engagement_id.into());
         self
     }
 
@@ -77,7 +89,7 @@ impl Mailbox {
             files: files_json,
             read: false,
             created_at: now_ms(),
-            engagement_id: None,
+            engagement_id: self.engagement_id.clone(),
         };
 
         self.repo.write_message(&self.user_id, &row).await?;
