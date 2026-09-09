@@ -384,6 +384,70 @@ impl ITeamRepository for MockTeamRepo {
         self.state.lock().unwrap().tasks.retain(|t| t.team_id != team_id);
         Ok(())
     }
+
+    // Engagement-scoped runtime reads. Every mock session here is a legacy
+    // single-project team where the resolved engagement equals the team id, so
+    // each delegates to its team variant with the engagement id in the team
+    // slot — identical rows and ordering, barriers included.
+    async fn peek_unread_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.peek_unread(user_id, engagement_id, to_agent_id).await
+    }
+
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.peek_unread_by_ids(user_id, engagement_id, to_agent_id, ids).await
+    }
+
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.read_unread_and_mark(user_id, engagement_id, to_agent_id).await
+    }
+
+    async fn mark_read_batch_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        ids: &[String],
+    ) -> Result<(), DbError> {
+        self.mark_read_batch(user_id, engagement_id, ids).await
+    }
+
+    async fn get_history_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.get_history(user_id, engagement_id, to_agent_id, limit).await
+    }
+
+    async fn find_task_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        self.find_task_by_id(user_id, engagement_id, task_id).await
+    }
+
+    async fn list_tasks_by_engagement(&self, user_id: &str, engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+        self.list_tasks(user_id, engagement_id).await
+    }
 }
 
 #[cfg(test)]
@@ -465,11 +529,7 @@ pub(crate) mod workspace_harness {
 
     #[async_trait]
     impl IConversationRepository for MockConversationRepo {
-        async fn raw_query(
-            &self,
-            _sql: &str,
-            _params: Vec<String>,
-        ) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
+        async fn raw_query(&self, _sql: &str, _params: Vec<String>) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
             unimplemented!("raw_query is not exercised by aionui-team mocks")
         }
         async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, DbError> {
@@ -918,6 +978,73 @@ pub(crate) mod workspace_harness {
         async fn delete_tasks_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
             Ok(())
         }
+
+        // Engagement-scoped runtime reads: every mock session here is a legacy
+        // single-project team (engagement == team id), so delegate to the team
+        // variant with the engagement id in the team slot.
+        async fn peek_unread_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.peek_unread(user_id, engagement_id, to_agent_id).await
+        }
+
+        async fn peek_unread_by_ids_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+            ids: &[String],
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.peek_unread_by_ids(user_id, engagement_id, to_agent_id, ids).await
+        }
+
+        async fn read_unread_and_mark_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.read_unread_and_mark(user_id, engagement_id, to_agent_id).await
+        }
+
+        async fn mark_read_batch_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            ids: &[String],
+        ) -> Result<(), DbError> {
+            self.mark_read_batch(user_id, engagement_id, ids).await
+        }
+
+        async fn get_history_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+            limit: Option<i64>,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.get_history(user_id, engagement_id, to_agent_id, limit).await
+        }
+
+        async fn find_task_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            task_id: &str,
+        ) -> Result<Option<TeamTaskRow>, DbError> {
+            self.find_task_by_id(user_id, engagement_id, task_id).await
+        }
+
+        async fn list_tasks_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+        ) -> Result<Vec<TeamTaskRow>, DbError> {
+            self.list_tasks(user_id, engagement_id).await
+        }
     }
 
     struct FakeConversationPorts {
@@ -1068,7 +1195,10 @@ pub(crate) mod workspace_harness {
             folder_id: Option<String>,
             workspace: Option<String>,
         ) -> Result<(), TeamError> {
-            let mut extra = self.repo.get_extra(conversation_id).unwrap_or_else(|| serde_json::json!({}));
+            let mut extra = self
+                .repo
+                .get_extra(conversation_id)
+                .unwrap_or_else(|| serde_json::json!({}));
             if let (Some(workspace), Some(obj)) = (workspace, extra.as_object_mut()) {
                 obj.insert("workspace".to_owned(), serde_json::Value::String(workspace));
                 obj.insert("custom_workspace".to_owned(), serde_json::Value::Bool(true));

@@ -111,7 +111,17 @@ impl Mailbox {
     }
 
     pub async fn read_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.read_unread_and_mark(&self.user_id, team_id, agent_id).await?;
+        // Session runtime reads are scoped to the engagement so two projects'
+        // sessions of one team cannot drain each other's mail; a `Mailbox` with
+        // no engagement (unit tests) keeps the legacy team-wide read.
+        let rows = match &self.engagement_id {
+            Some(engagement) => {
+                self.repo
+                    .read_unread_and_mark_by_engagement(&self.user_id, engagement, agent_id)
+                    .await?
+            }
+            None => self.repo.read_unread_and_mark(&self.user_id, team_id, agent_id).await?,
+        };
 
         debug!(team_id, agent_id, count = rows.len(), "mailbox unread messages read");
 
@@ -133,7 +143,14 @@ impl Mailbox {
     /// Reads all unread messages without marking them as read.
     /// Used by the drain_mailbox pattern: peek → prompt → mark_read on success.
     pub async fn peek_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.peek_unread(&self.user_id, team_id, agent_id).await?;
+        let rows = match &self.engagement_id {
+            Some(engagement) => {
+                self.repo
+                    .peek_unread_by_engagement(&self.user_id, engagement, agent_id)
+                    .await?
+            }
+            None => self.repo.peek_unread(&self.user_id, team_id, agent_id).await?,
+        };
         debug!(team_id, agent_id, count = rows.len(), "mailbox peek_unread");
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
@@ -146,10 +163,18 @@ impl Mailbox {
         agent_id: &str,
         ids: &[String],
     ) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self
-            .repo
-            .peek_unread_by_ids(&self.user_id, team_id, agent_id, ids)
-            .await?;
+        let rows = match &self.engagement_id {
+            Some(engagement) => {
+                self.repo
+                    .peek_unread_by_ids_by_engagement(&self.user_id, engagement, agent_id, ids)
+                    .await?
+            }
+            None => {
+                self.repo
+                    .peek_unread_by_ids(&self.user_id, team_id, agent_id, ids)
+                    .await?
+            }
+        };
         debug!(
             team_id,
             agent_id,
@@ -162,7 +187,14 @@ impl Mailbox {
 
     /// Marks the given message IDs as read. Called after successful prompt delivery.
     pub async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), TeamError> {
-        self.repo.mark_read_batch(&self.user_id, team_id, ids).await?;
+        match &self.engagement_id {
+            Some(engagement) => {
+                self.repo
+                    .mark_read_batch_by_engagement(&self.user_id, engagement, ids)
+                    .await?
+            }
+            None => self.repo.mark_read_batch(&self.user_id, team_id, ids).await?,
+        }
 
         // Fetch the (now-read) rows to build full payloads and broadcast one
         // `read` change per message; the frontend upserts by id idempotently.
@@ -210,7 +242,14 @@ impl Mailbox {
     }
 
     pub async fn has_unread(&self, team_id: &str, agent_id: &str) -> Result<bool, TeamError> {
-        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, None).await?;
+        let rows = match &self.engagement_id {
+            Some(engagement) => {
+                self.repo
+                    .get_history_by_engagement(&self.user_id, engagement, agent_id, None)
+                    .await?
+            }
+            None => self.repo.get_history(&self.user_id, team_id, agent_id, None).await?,
+        };
         Ok(rows.iter().any(|r| !r.read))
     }
 

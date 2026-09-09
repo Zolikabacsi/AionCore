@@ -133,11 +133,7 @@ impl MockConversationRepo {
 
 #[async_trait::async_trait]
 impl IConversationRepository for MockConversationRepo {
-    async fn raw_query(
-        &self,
-        _sql: &str,
-        _params: Vec<String>,
-    ) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
+    async fn raw_query(&self, _sql: &str, _params: Vec<String>) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
         unimplemented!("raw_query is not exercised by aionui-team mocks")
     }
     async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, DbError> {
@@ -601,7 +597,10 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         folder_id: Option<String>,
         workspace: Option<String>,
     ) -> Result<(), aionui_team::TeamError> {
-        let mut extra = self.repo.get_extra(conversation_id).unwrap_or_else(|| serde_json::json!({}));
+        let mut extra = self
+            .repo
+            .get_extra(conversation_id)
+            .unwrap_or_else(|| serde_json::json!({}));
         if let (Some(workspace), Some(obj)) = (workspace, extra.as_object_mut()) {
             obj.insert("workspace".to_owned(), serde_json::Value::String(workspace));
             obj.insert("custom_workspace".to_owned(), serde_json::Value::Bool(true));
@@ -1191,6 +1190,69 @@ impl ITeamRepository for FullMockTeamRepo {
     }
     async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
         self.inner.delete_tasks_by_team(user_id, team_id).await
+    }
+    // Engagement-scoped runtime reads: legacy mock teams resolve engagement ==
+    // team id, so delegate to the inner team variant with the id in the team slot.
+    async fn peek_unread_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.peek_unread(user_id, engagement_id, to_agent_id).await
+    }
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner
+            .peek_unread_by_ids(user_id, engagement_id, to_agent_id, ids)
+            .await
+    }
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner
+            .read_unread_and_mark(user_id, engagement_id, to_agent_id)
+            .await
+    }
+    async fn mark_read_batch_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        ids: &[String],
+    ) -> Result<(), DbError> {
+        self.inner.mark_read_batch(user_id, engagement_id, ids).await
+    }
+    async fn get_history_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.get_history(user_id, engagement_id, to_agent_id, limit).await
+    }
+    async fn find_task_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        task_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner.find_task_by_id(user_id, engagement_id, task_id).await
+    }
+    async fn list_tasks_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner.list_tasks(user_id, engagement_id).await
     }
 }
 

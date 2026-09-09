@@ -325,4 +325,67 @@ impl ITeamRepository for MockTeamRepo {
         self.state.lock().unwrap().tasks.retain(|t| t.team_id != team_id);
         Ok(())
     }
+
+    // Engagement-scoped runtime reads: every mock session here is a legacy
+    // single-project team (engagement == team id), so delegate to the team
+    // variant with the engagement id in the team slot.
+    async fn peek_unread_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.peek_unread(user_id, engagement_id, to_agent_id).await
+    }
+
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.peek_unread_by_ids(user_id, engagement_id, to_agent_id, ids).await
+    }
+
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.read_unread_and_mark(user_id, engagement_id, to_agent_id).await
+    }
+
+    async fn mark_read_batch_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        ids: &[String],
+    ) -> Result<(), DbError> {
+        self.mark_read_batch(user_id, engagement_id, ids).await
+    }
+
+    async fn get_history_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.get_history(user_id, engagement_id, to_agent_id, limit).await
+    }
+
+    async fn find_task_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        self.find_task_by_id(user_id, engagement_id, task_id).await
+    }
+
+    async fn list_tasks_by_engagement(&self, user_id: &str, engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+        self.list_tasks(user_id, engagement_id).await
+    }
 }

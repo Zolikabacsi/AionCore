@@ -866,4 +866,179 @@ impl ITeamRepository for SqliteTeamRepository {
         .await?;
         Ok(rows)
     }
+
+    async fn peek_unread_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at, engagement_id \
+             FROM mailbox \
+             WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(engagement_id)
+        .bind(to_agent_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                        type, content, summary, files, read, created_at, engagement_id \
+                 FROM mailbox \
+                 WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+                   AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+                 ORDER BY created_at ASC, id ASC"
+            );
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql)
+                .bind(engagement_id)
+                .bind(to_agent_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            rows.extend(query.fetch_all(&self.pool).await?);
+        }
+        rows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(rows)
+    }
+
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        // Same `BEGIN IMMEDIATE` two-step as the team variant so concurrent
+        // readers of the same engagement cannot claim the same unread rows.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("PRAGMA read_uncommitted = false").execute(&mut *tx).await?;
+
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at, engagement_id \
+             FROM mailbox \
+             WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+             ORDER BY created_at ASC",
+        )
+        .bind(engagement_id)
+        .bind(to_agent_id)
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !rows.is_empty() {
+            sqlx::query(
+                "UPDATE mailbox SET read = 1 \
+                 WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+                   AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?)",
+            )
+            .bind(engagement_id)
+            .bind(to_agent_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    async fn mark_read_batch_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        ids: &[String],
+    ) -> Result<(), DbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE mailbox SET read = 1 \
+                 WHERE engagement_id = ? AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?)"
+            );
+            let mut query = sqlx::query(&sql).bind(engagement_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            query.execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn get_history_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let limit_clause = if limit.is_some() { " LIMIT ?" } else { "" };
+        let sql = format!(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at, engagement_id \
+             FROM mailbox \
+             WHERE engagement_id = ? AND to_agent_id = ? \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+             ORDER BY created_at ASC{limit_clause}"
+        );
+        let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql)
+            .bind(engagement_id)
+            .bind(to_agent_id)
+            .bind(user_id);
+        if let Some(limit) = limit {
+            query = query.bind(limit);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    async fn find_task_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamTaskRow>(
+            "SELECT * FROM team_tasks \
+             WHERE engagement_id = ?1 AND id = ?3 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2)",
+        )
+        .bind(engagement_id)
+        .bind(user_id)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
 }

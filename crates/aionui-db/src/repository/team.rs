@@ -287,4 +287,89 @@ pub trait ITeamRepository: Send + Sync {
             "list_messages_by_engagement not implemented".to_string(),
         ))
     }
+
+    // ── Engagement-scoped runtime reads (Phase 2a Task 4b) ───────────────
+    //
+    // The session runtime must read ONLY the rows stamped with its own
+    // engagement, never every row in the team, so two projects' sessions of one
+    // team cannot observe each other's mail/tasks. These mirror the `team_id`
+    // read variants above but filter on `engagement_id`. Default bodies return
+    // `NotFound` (non-SQLite doubles that don't exercise them are unaffected);
+    // the real `SqliteTeamRepository` and the session mocks override them.
+    //
+    // For legacy single-engagement teams `engagement_id == team_id`, so these
+    // return the same rows the team-scoped variants would (no behavior change).
+
+    /// Engagement-scoped `peek_unread`: unread rows for `to_agent_id` bound to
+    /// `engagement_id`, ordered FIFO.
+    async fn peek_unread_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "peek_unread_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `peek_unread_by_ids`.
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+        _ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "peek_unread_by_ids_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `read_unread_and_mark`.
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "read_unread_and_mark_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `mark_read_batch`.
+    async fn mark_read_batch_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _ids: &[String],
+    ) -> Result<(), DbError> {
+        Err(DbError::NotFound(
+            "mark_read_batch_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `get_history`.
+    async fn get_history_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+        _limit: Option<i64>,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "get_history_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `find_task_by_id`.
+    async fn find_task_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        Err(DbError::NotFound("find_task_by_engagement not implemented".to_string()))
+    }
 }

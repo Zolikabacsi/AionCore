@@ -308,7 +308,77 @@ async fn two_projects_key_to_distinct_engagements() {
     sess_b.stop();
 }
 
-/// Legacy single-engagement team (no project) resolves to `engagement_id == team_id`
+/// Read-side isolation: two projects' sessions of one team each observe ONLY
+/// their own engagement's mail/tasks. Both sessions address the same `team-m`
+/// and the same `lead-1` slot, so WITHOUT engagement-scoped reads the session's
+/// `peek_unread`/`list_tasks` would return the sibling project's rows. This
+/// closes review L1 (the read path used to filter by `team_id`).
+#[tokio::test]
+async fn two_projects_do_not_observe_each_others_mail_or_tasks() {
+    use aionui_team::types::MailboxMessageType;
+
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+    let user = "u1";
+    seed_team(&repo, "team-m", user, None).await;
+
+    let sess_a = start_session(repo.clone(), team_domain("team-m", Some("proj-a")), user).await;
+    let sess_b = start_session(repo.clone(), team_domain("team-m", Some("proj-b")), user).await;
+
+    // Same recipient slot, same team — only the engagement differs.
+    sess_a
+        .mailbox()
+        .write("team-m", "lead-1", "user", MailboxMessageType::Message, "a mail", None)
+        .await
+        .unwrap();
+    sess_b
+        .mailbox()
+        .write("team-m", "lead-1", "user", MailboxMessageType::Message, "b mail", None)
+        .await
+        .unwrap();
+    let task_a = sess_a.scheduler().create_task("A task", None, None, &[]).await.unwrap();
+    let task_b = sess_b.scheduler().create_task("B task", None, None, &[]).await.unwrap();
+
+    // Each session's READ path sees exactly one mail (its own engagement).
+    let unread_a = sess_a.mailbox().peek_unread("team-m", "lead-1").await.unwrap();
+    let unread_b = sess_b.mailbox().peek_unread("team-m", "lead-1").await.unwrap();
+    assert_eq!(unread_a.len(), 1, "session A sees only its own unread mail");
+    assert_eq!(unread_a[0].content, "a mail");
+    assert_eq!(unread_b.len(), 1, "session B sees only its own unread mail");
+    assert_eq!(unread_b[0].content, "b mail");
+
+    // Each session's task board lists only its own engagement's tasks.
+    let tasks_a = sess_a.scheduler().list_tasks().await.unwrap();
+    let tasks_b = sess_b.scheduler().list_tasks().await.unwrap();
+    assert_eq!(
+        tasks_a.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        vec![task_a.id]
+    );
+    assert_eq!(
+        tasks_b.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        vec![task_b.id]
+    );
+
+    // Draining A's unread must not consume B's rows (read_unread is scoped too).
+    let drained_a = sess_a.mailbox().read_unread("team-m", "lead-1").await.unwrap();
+    assert_eq!(drained_a.len(), 1);
+    assert!(
+        sess_a
+            .mailbox()
+            .peek_unread("team-m", "lead-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        sess_b.mailbox().peek_unread("team-m", "lead-1").await.unwrap().len(),
+        1,
+        "draining A must leave B's unread untouched"
+    );
+
+    sess_a.stop();
+    sess_b.stop();
+}
 /// — i.e. exactly the pre-Phase-2a behaviour, just now explicitly stamped.
 #[tokio::test]
 async fn legacy_no_project_team_resolves_to_team_id() {

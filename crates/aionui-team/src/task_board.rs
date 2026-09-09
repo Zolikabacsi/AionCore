@@ -62,6 +62,20 @@ impl TaskBoard {
         self
     }
 
+    /// Engagement-scoped task lookup used by the runtime. A board with no
+    /// engagement (unit tests) keeps the legacy team-wide find.
+    async fn find_task(&self, team_id: &str, task_id: &str) -> Result<Option<TeamTaskRow>, TeamError> {
+        let row = match &self.engagement_id {
+            Some(engagement) => {
+                self.repo
+                    .find_task_by_engagement(&self.user_id, engagement, task_id)
+                    .await?
+            }
+            None => self.repo.find_task_by_id(&self.user_id, team_id, task_id).await?,
+        };
+        Ok(row)
+    }
+
     pub async fn create_task(
         &self,
         team_id: &str,
@@ -71,7 +85,7 @@ impl TaskBoard {
         blocked_by: &[String],
     ) -> Result<TeamTask, TeamError> {
         for dep_id in blocked_by {
-            let dep = self.repo.find_task_by_id(&self.user_id, team_id, dep_id).await?;
+            let dep = self.find_task(team_id, dep_id).await?;
             if dep.is_none() {
                 return Err(TeamError::BlockedTaskNotFound(dep_id.clone()));
             }
@@ -115,8 +129,7 @@ impl TaskBoard {
 
     pub async fn update_task(&self, team_id: &str, task_id: &str, update: &TaskUpdate) -> Result<TeamTask, TeamError> {
         let existing = self
-            .repo
-            .find_task_by_id(&self.user_id, team_id, task_id)
+            .find_task(team_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
 
@@ -135,8 +148,7 @@ impl TaskBoard {
         }
 
         let updated = self
-            .repo
-            .find_task_by_id(&self.user_id, team_id, task_id)
+            .find_task(team_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
 
@@ -152,7 +164,10 @@ impl TaskBoard {
     }
 
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
-        let rows = self.repo.list_tasks(&self.user_id, team_id).await?;
+        let rows = match &self.engagement_id {
+            Some(engagement) => self.repo.list_tasks_by_engagement(&self.user_id, engagement).await?,
+            None => self.repo.list_tasks(&self.user_id, team_id).await?,
+        };
         let tasks = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         Ok(tasks)
     }
@@ -178,7 +193,7 @@ impl TaskBoard {
             // is now (potentially) actionable. Non-fatal: a missing row or parse
             // failure must not abort the completing task's own update.
             if let Some(events) = &self.events
-                && let Ok(Some(row)) = self.repo.find_task_by_id(&self.user_id, team_id, downstream_id).await
+                && let Ok(Some(row)) = self.find_task(team_id, downstream_id).await
                 && let Ok(task) = TeamTask::from_row(&row)
             {
                 events.broadcast_task_changed(task_to_response(&task), TeamTaskChange::Updated);
