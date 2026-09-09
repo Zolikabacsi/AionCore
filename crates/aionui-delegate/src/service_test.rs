@@ -201,3 +201,16 @@ async fn delegated_room_inherits_caller_workspace_for_project_context() {
     assert_eq!(ws(&r, "caller1").await.as_deref(), Some("/home/proj/drszepkuti_hu"));
     assert_eq!(ws(&r, "caller2").await, None);
 }
+
+// P2-4: the sender-is-team guard reads the canonical `teamId` marker.
+#[test]
+fn team_guard_reads_canonical_teamid_key() {
+    // A team-owned conversation (camelCase teamId, as provisioning writes) is
+    // detected — previously the snake_case lookup made this guard inert.
+    assert_eq!(
+        super::team_id_from_extra(r#"{"teamId":"team-1"}"#).as_deref(),
+        Some("team-1")
+    );
+    // A plain solo conversation is not team-owned.
+    assert_eq!(super::team_id_from_extra(r#"{"backend":"opencode"}"#), None);
+}

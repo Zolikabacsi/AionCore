@@ -801,11 +801,12 @@ impl DelegateService {
 // ---------------------------------------------------------------------------
 
 fn team_id_from_extra(extra: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(extra).ok()?;
-    parsed
-        .get("team_id")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
+    // Canonical key is `teamId` (camelCase) — provisioned by the team runtime
+    // and read by session-message via the same shared helper. The previous
+    // hand-rolled `team_id` (snake_case) lookup never matched, leaving the
+    // sender-is-team guard permanently inert (spec §16 P2-4). Reuse the single
+    // source of truth so this cannot drift again.
+    aionui_conversation::session_mentions::team_id_from_extra_str(extra)
 }
 
 fn extract_assistant_id_from_extra_value(extra: &serde_json::Value) -> Option<String> {
