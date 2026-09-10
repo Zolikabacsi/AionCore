@@ -488,11 +488,7 @@ impl TeamSessionService {
 
     /// Resolve a project_id into the team's workspace folder path and folder_id.
     /// Errors if the project does not exist or has no workspace folder.
-    async fn resolve_project_workspace(
-        &self,
-        user_id: &str,
-        project_id: &str,
-    ) -> Result<(String, String), TeamError> {
+    async fn resolve_project_workspace(&self, user_id: &str, project_id: &str) -> Result<(String, String), TeamError> {
         let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
         let Some(project_service) = project_service else {
             return Err(TeamError::InvalidRequest("project service unavailable".into()));
@@ -509,7 +505,10 @@ impl TeamSessionService {
             .ok_or_else(|| TeamError::InvalidRequest("project has no workspace folder".into()))?;
         let path = canonical::uri_to_path(&workspace_entry.folder.resource_uri)
             .map_err(|err| TeamError::InvalidRequest(format!("invalid project workspace uri: {err}")))?;
-        Ok((path.to_string_lossy().into_owned(), workspace_entry.folder.folder_id.clone()))
+        Ok((
+            path.to_string_lossy().into_owned(),
+            workspace_entry.folder.folder_id.clone(),
+        ))
     }
 
     /// Lazily backfill `teams.project_id`/`folder_id` on read. Best-effort;
@@ -799,6 +798,15 @@ impl TeamSessionService {
             .repo
             .find_or_create_engagement(user_id, team_id, project_id, &workspace)
             .await?;
+        // Materialize this engagement's own member conversations (one per template
+        // slot), each bound to the engagement workspace. Idempotent. The team row
+        // is ownership-scoped by `get_team`, matching the guard already applied to
+        // the engagement lookup above.
+        let team_row = self.load_owned_team_row(user_id, team_id).await?;
+        let team = Team::from_row(&team_row)?;
+        self.provisioner()
+            .ensure_engagement_members(user_id, &row, &team)
+            .await?;
         Ok(TeamEngagement::from_row(&row))
     }
 
@@ -1028,7 +1036,8 @@ impl TeamSessionService {
 
         // Tear down the live runtime so agents pick up the new workspace/project
         // on the next session start.
-        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::RuntimeRestart).await;
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::RuntimeRestart)
+            .await;
 
         // Persist the new binding on the team row.
         self.repo

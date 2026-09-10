@@ -10,9 +10,10 @@ use aionui_api_types::{
     TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
+use aionui_db::DbError;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -197,12 +198,25 @@ impl TeamSession {
         {
             Ok(engagement) => engagement.id,
             Err(err) => {
-                warn!(
-                    team_id = %team.id,
-                    project_id,
-                    error = %err,
-                    "team engagement resolution failed; falling back to team_id key"
-                );
+                // `NotFound` is the expected result for test doubles whose
+                // `find_or_create_engagement` is unimplemented (and for the
+                // legacy no-engagement case): a safe, low-severity fallback. Any
+                // other error is a genuine DB failure that silently mis-stamps
+                // every write this session makes, so escalate it. (I2)
+                match err {
+                    DbError::NotFound(_) => warn!(
+                        team_id = %team.id,
+                        project_id,
+                        error = %err,
+                        "team engagement resolution failed; falling back to team_id key"
+                    ),
+                    other => error!(
+                        team_id = %team.id,
+                        project_id,
+                        error = %other,
+                        "team engagement resolution failed; falling back to team_id key"
+                    ),
+                }
                 team.id.clone()
             }
         }
@@ -4508,5 +4522,105 @@ mod tests {
             recorder.names()
         );
         session.stop();
+    }
+
+    // ── I2: resolve_engagement_id error-kind handling ──────────────────────
+    //
+    // A genuine (non-`NotFound`) repository failure must be escalated to `error!`
+    // (a DB fault silently mis-stamping every session write is a contract
+    // violation), while the expected `NotFound` from unimplemented test doubles
+    // stays a `warn!` fallback. Both keep returning `team.id`. The only
+    // observable difference is the log LEVEL, so a capturing subscriber asserts it.
+    thread_local! {
+        static RESOLVE_LOG_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ResolveLogWriter;
+    impl std::io::Write for ResolveLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ResolveLogWriter {
+        type Writer = ResolveLogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            ResolveLogWriter
+        }
+    }
+
+    fn install_resolve_capture() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            // ONE process-global capturing subscriber (rebuilds the interest
+            // cache) routing to a thread-local buffer, so parallel tests never
+            // observe each other's events.
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ResolveLogWriter)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    fn resolve_team_with_project() -> Team {
+        Team {
+            id: "team-i2".into(),
+            name: "i2".into(),
+            workspace: "/tmp/i2".into(),
+            agents: vec![],
+            lead_agent_id: None,
+            project_id: Some("proj-a".into()),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_engagement_id_logs_error_on_non_notfound_db_failure() {
+        install_resolve_capture();
+        RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_resolve_error(crate::test_utils::EngagementResolveError::Other);
+        let repo: Arc<dyn ITeamRepository> = repo;
+
+        let resolved = TeamSession::resolve_engagement_id(&repo, "u1", &resolve_team_with_project()).await;
+
+        assert_eq!(resolved, "team-i2", "non-NotFound must still fall back to team.id");
+        let logs = RESOLVE_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).unwrap());
+        assert!(
+            logs.contains("falling back to team_id key"),
+            "the fallback must be logged: {logs}"
+        );
+        assert!(
+            logs.contains("ERROR"),
+            "a genuine DB failure must be escalated to ERROR: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_engagement_id_logs_warn_on_notfound() {
+        install_resolve_capture();
+        RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_resolve_error(crate::test_utils::EngagementResolveError::NotFound);
+        let repo: Arc<dyn ITeamRepository> = repo;
+
+        let resolved = TeamSession::resolve_engagement_id(&repo, "u1", &resolve_team_with_project()).await;
+
+        assert_eq!(resolved, "team-i2", "NotFound must fall back to team.id");
+        let logs = RESOLVE_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).unwrap());
+        assert!(
+            logs.contains("falling back to team_id key"),
+            "the fallback must be logged: {logs}"
+        );
+        assert!(
+            !logs.contains("ERROR"),
+            "the expected NotFound must stay a warn, not error: {logs}"
+        );
     }
 }

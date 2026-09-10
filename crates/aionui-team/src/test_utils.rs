@@ -3,12 +3,24 @@ use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 use std::sync::Mutex;
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum EngagementResolveError {
+    /// Mirrors the trait default for test doubles that never wired engagement
+    /// CRUD: `find_or_create_engagement` reports the team/project as absent.
+    #[default]
+    NotFound,
+    /// A genuine repository failure (anything other than `NotFound`).
+    Other,
+}
+
 #[derive(Default)]
 pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
     pub tasks: Vec<TeamTaskRow>,
     pub fail_message_writes: bool,
     pub fail_task_lists: bool,
+    /// Error kind returned by `find_or_create_engagement`.
+    pub engagement_resolve_error: EngagementResolveError,
 }
 
 pub struct MockTeamRepo {
@@ -33,6 +45,10 @@ impl MockTeamRepo {
     ) {
         *self.peek_snapshot_tx.lock().unwrap() = Some(snapshot_tx);
         *self.peek_release_rx.lock().unwrap() = Some(release_rx);
+    }
+
+    pub fn set_engagement_resolve_error(&self, kind: EngagementResolveError) {
+        self.state.lock().unwrap().engagement_resolve_error = kind;
     }
 }
 
@@ -74,6 +90,22 @@ impl ITeamRepository for MockTeamRepo {
     }
     async fn delete_team(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
         Ok(())
+    }
+
+    // Engagement resolution is configurable so the session resolver's
+    // error-kind handling can be tested; the `NotFound` default reproduces the
+    // unimplemented trait behavior legacy single-project tests depend on.
+    async fn find_or_create_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        _workspace: &str,
+    ) -> Result<aionui_db::models::TeamEngagementRow, DbError> {
+        Err(match self.state.lock().unwrap().engagement_resolve_error {
+            EngagementResolveError::NotFound => DbError::NotFound("engagement not found".to_owned()),
+            EngagementResolveError::Other => DbError::Init("forced engagement failure".to_owned()),
+        })
     }
 
     // ── Mailbox ─────────────────────────────────────────────────────
