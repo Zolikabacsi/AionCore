@@ -2,7 +2,7 @@ use aionui_common::{generate_id, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamEngagementRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamEngagementMemberRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
@@ -1037,6 +1037,86 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(engagement_id)
         .bind(user_id)
         .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    // ── Engagement members ───────────────────────────────────────────
+
+    async fn upsert_engagement_member(&self, row: &TeamEngagementMemberRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_engagement_members \
+                 (engagement_id, team_id, template_slot, slot_id, conversation_id, role, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT (engagement_id, template_slot) DO UPDATE SET \
+                 team_id = excluded.team_id, \
+                 slot_id = excluded.slot_id, \
+                 conversation_id = excluded.conversation_id, \
+                 role = excluded.role, \
+                 status = excluded.status, \
+                 updated_at = excluded.updated_at",
+        )
+        .bind(&row.engagement_id)
+        .bind(&row.team_id)
+        .bind(&row.template_slot)
+        .bind(&row.slot_id)
+        .bind(&row.conversation_id)
+        .bind(&row.role)
+        .bind(row.status.as_deref())
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_engagement_members(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<TeamEngagementMemberRow>, DbError> {
+        // The EXISTS guard scopes the read to the engagement's owning user
+        // (data isolation), mirroring `list_tasks_by_engagement`.
+        let rows = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members \
+             WHERE engagement_id = ?1 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2) \
+             ORDER BY created_at ASC",
+        )
+        .bind(engagement_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn get_engagement_member_by_slot(
+        &self,
+        engagement_id: &str,
+        slot_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        // Resolve by runtime `slot_id` (NOT `template_slot`); internal helper,
+        // so it is intentionally NOT ownership-checked.
+        let row = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members WHERE engagement_id = ? AND slot_id = ?",
+        )
+        .bind(engagement_id)
+        .bind(slot_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn get_engagement_member_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        // Internal resolve-by-key helper; intentionally NOT ownership-checked.
+        let row = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members WHERE conversation_id = ?",
+        )
+        .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
