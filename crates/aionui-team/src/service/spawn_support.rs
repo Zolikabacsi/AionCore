@@ -233,12 +233,12 @@ impl TeamSessionService {
     /// (`TeamSession::spawn_agent`) wire that up separately so a slow
     /// `warmup` never stalls other spawns against the same team.
     pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
-        // Same engagement-keyed membership lock as `add_agent`/`remove_agent` so
-        // a concurrent spawn and manual add can't race the `teams.agents` RMW.
-        let engagement = self.engagement_key(&req.user_id, &req.team_id).await?;
+        // `add_agent_locks` guards the shared `teams.agents` roster RMW, so it is
+        // intentionally team-keyed (not per-engagement) and must match every other
+        // membership mutation path (add_agent/remove_agent/...).
         let lock = self
             .add_agent_locks
-            .entry(engagement)
+            .entry(req.team_id.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;

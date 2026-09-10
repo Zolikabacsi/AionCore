@@ -169,6 +169,12 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing membership mutations with session startup so
     /// callers cannot read-modify-write the `agents` JSON or rebuild a runtime
     /// session from a stale roster snapshot.
+    ///
+    /// Intentionally keyed by `team_id` (NOT engagement): the roster lives on the
+    /// shared `teams.agents` template row, so membership RMW is a team-scoped
+    /// operation even though `sessions` moved to engagement scope. Two
+    /// engagements of one team must still serialize on one lock or they lose
+    /// updates to the same row.
     add_agent_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
@@ -924,13 +930,9 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
-        // Engagement-keyed membership lock: resolve the active engagement from
-        // the team's project binding first, then hold that engagement's lock for
-        // the read (and the lazy project-bind backfill below).
-        let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(engagement)
+            .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1084,7 +1086,7 @@ impl TeamSessionService {
         let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(engagement.clone())
+            .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1141,7 +1143,7 @@ impl TeamSessionService {
         let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(engagement.clone())
+            .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let (removed, session, removal_lease) = {
@@ -1302,7 +1304,7 @@ impl TeamSessionService {
         let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(engagement.clone())
+            .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1386,7 +1388,7 @@ impl TeamSessionService {
         let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(engagement.clone())
+            .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1543,7 +1545,7 @@ impl TeamSessionService {
 
         let membership_lock = self
             .add_agent_locks
-            .entry(engagement.clone())
+            .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let membership_guard = membership_lock.lock().await;
@@ -1705,7 +1707,7 @@ impl TeamSessionService {
             session: session.clone(),
             slow_monitor_handle,
         };
-        self.sessions.insert(engagement.clone(), entry);
+        self.sessions.insert(session.engagement_id().to_owned(), entry);
         drop(membership_guard);
         drop(ensure_guard);
 
@@ -1741,7 +1743,7 @@ impl TeamSessionService {
                     |p| p.error = Some(failure.public_reason.clone()),
                 );
                 session.stop();
-                self.sessions.remove(&engagement);
+                self.sessions.remove(session.engagement_id());
                 return Err(TeamError::MemberRuntimeFailed {
                     team_id: team_id.to_owned(),
                     slot_id: leader.slot_id.clone(),
@@ -1751,7 +1753,7 @@ impl TeamSessionService {
             }
             AttachOutcome::SessionStopped => {
                 session.stop();
-                self.sessions.remove(&engagement);
+                self.sessions.remove(session.engagement_id());
                 return Err(TeamError::InvalidRequest(
                     "team session stopped during leader warmup".to_owned(),
                 ));
@@ -1910,7 +1912,7 @@ impl TeamSessionService {
 
         let membership_lock = self
             .add_agent_locks
-            .entry(engagement_key.to_owned())
+            .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
@@ -2319,7 +2321,7 @@ impl TeamSessionService {
     pub(crate) async fn refresh_member_runtime_status(&self, expected: &TeamSession) {
         let membership_lock = self
             .add_agent_locks
-            .entry(expected.engagement_id().to_owned())
+            .entry(expected.team_id().to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
@@ -2573,9 +2575,11 @@ impl TeamSessionService {
             .filter(|entry| entry.session.team_id() == team_id)
             .map(|entry| entry.key().clone())
             .collect();
+        // `sessions`/`ensure_session_locks` are engagement-keyed; `add_agent_locks`
+        // stays team-keyed (roster RMW is team-scoped), so drop it once by team id.
+        self.add_agent_locks.remove(team_id);
         for key in &keys {
             self.stop_session_unchecked(key);
-            self.add_agent_locks.remove(key);
             self.ensure_session_locks.remove(key);
         }
         keys
