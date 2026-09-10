@@ -972,6 +972,34 @@ impl TeamSessionService {
                 .await;
         }
 
+        // A project-bound team's runtime lives in its engagement-member
+        // conversations, which are NOT in `team.agents` and were not deleted above.
+        // Enumerate this team's (user-scoped) engagements, delete their member
+        // conversations, then drop the member + engagement rows so a removed team
+        // leaves no engagement leak. Legacy / no-project teams have no member rows
+        // and their single default engagement (id == team_id, from the 045 backfill)
+        // is correctly removed with the team. All deletes are user- AND team-scoped
+        // and best-effort (a non-engagement-aware repo double returns `NotFound`,
+        // which must not block deletion).
+        let engagements = self.repo.list_engagements(user_id, team_id).await.unwrap_or_default();
+        for engagement in &engagements {
+            let members = self
+                .repo
+                .list_engagement_members(user_id, &engagement.id)
+                .await
+                .unwrap_or_default();
+            for member in &members {
+                let _ = self
+                    .conversation_port
+                    .delete_team_conversation(user_id, &member.conversation_id)
+                    .await;
+            }
+        }
+        // Member rows before engagement rows: FK
+        // `team_engagement_members.engagement_id -> team_engagements.id`.
+        let _ = self.repo.delete_engagement_members_by_team(user_id, team_id).await;
+        let _ = self.repo.delete_engagements_by_team(user_id, team_id).await;
+
         self.repo.delete_mailbox_by_team(user_id, team_id).await?;
         self.repo.delete_tasks_by_team(user_id, team_id).await?;
         self.repo.delete_team(user_id, team_id).await?;
@@ -993,14 +1021,36 @@ impl TeamSessionService {
     /// and `stop_team_processes` (archive, which keeps them). Best-effort: a
     /// stuck kill is bounded by a 3s timeout, mirroring the delete path.
     async fn stop_team_runtime_and_agents(&self, team_id: &str, team: &Team, reason: AgentKillReason) {
+        // Build the kill list from BOTH identity spaces:
+        //   1. the `teams.agents` TEMPLATE conversations (legacy / no-project
+        //      teams run on these; they are also the live roster there), and
+        //   2. every live session's scheduler roster, which for a PROJECT-BOUND
+        //      team carries the engagement-member runtime conversations — the
+        //      processes actually running, distinct from the template.
+        // Template ids are added first and in template order (d115 relies on it);
+        // roster ids are appended only if not already present. For a legacy team
+        // the roster equals the template, so the appended set is empty and the
+        // behavior is byte-identical to before.
+        let mut kill_ids: Vec<String> = team.agents.iter().map(|agent| agent.conversation_id.clone()).collect();
+        for entry in self.sessions.iter() {
+            if entry.session.team_id() != team_id {
+                continue;
+            }
+            for agent in entry.session.scheduler().list_agents().await {
+                if !kill_ids.contains(&agent.conversation_id) {
+                    kill_ids.push(agent.conversation_id);
+                }
+            }
+        }
+
         // Stop every engagement's live session for this team and drop its
-        // membership/ensure lock entries (maps are engagement-keyed now).
+        // membership/ensure lock entries (maps are engagement-keyed now) AFTER the
+        // roster has been captured above.
         self.stop_sessions_for_team(team_id);
 
-        let kill_futures: Vec<_> = team
-            .agents
+        let kill_futures: Vec<_> = kill_ids
             .iter()
-            .map(|agent| self.task_manager.kill_and_wait(&agent.conversation_id, Some(reason)))
+            .map(|conversation_id| self.task_manager.kill_and_wait(conversation_id, Some(reason)))
             .collect();
 
         let _ = tokio::time::timeout(
@@ -2306,12 +2356,13 @@ impl TeamSessionService {
                 option.id == option_id && (option.category.as_deref() == Some("mode") || option.id == "mode")
             });
         if is_global_mode
-            && let Some(starting_member) = team
-                .agents
-                .iter()
+            && let Some(starting_member) = self
+                .global_mode_roster(team_id, &team)
+                .await
+                .into_iter()
                 .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
         {
-            return Err(Self::member_runtime_starting_error(team_id, starting_member));
+            return Err(Self::member_runtime_starting_error(team_id, &starting_member));
         }
         // Matches the frontend's own model-option lookup (category first, then a
         // literal `model` id), so both sides agree on which option is the model.
@@ -2368,6 +2419,20 @@ impl TeamSessionService {
             .find(|entry| entry.session.team_id() == team_id)
             .and_then(|entry| entry.session.work_coordinator().slot_snapshot(slot_id))
             .is_some_and(|snapshot| matches!(snapshot.runtime_constraint, RuntimeConstraint::Starting { .. }))
+    }
+
+    /// The roster the global-mode "another member is starting" guard must scan.
+    /// For a project-bound team the runtime coordinator is keyed by the
+    /// engagement-member `slot_id`s, so the guard has to check the LIVE session
+    /// roster, not the `teams.agents` template (whose slot ids never match the
+    /// coordinator → the refusal would silently no-op). With no live session the
+    /// coordinator is empty anyway, so falling back to the template is
+    /// byte-identical to the old template-only check.
+    async fn global_mode_roster(&self, team_id: &str, team: &Team) -> Vec<TeamAgent> {
+        match self.published_session(team_id) {
+            Ok(session) => session.scheduler().list_agents().await,
+            Err(_) => team.agents.clone(),
+        }
     }
 
     fn member_runtime_starting_error(team_id: &str, member: &TeamAgent) -> TeamError {
@@ -3547,12 +3612,18 @@ impl TeamSessionService {
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
-        if let Some(starting_member) = team
-            .agents
-            .iter()
+        // Route the "another member is starting" guard through the LIVE engagement
+        // roster (see `global_mode_roster`): a project-bound team's coordinator is
+        // keyed by engagement slot ids, so checking the `teams.agents` template
+        // silently no-ops the refusal. Legacy / no-session teams fall back to the
+        // template, byte-identical to before.
+        if let Some(starting_member) = self
+            .global_mode_roster(team_id, &team)
+            .await
+            .into_iter()
             .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
         {
-            return Err(Self::member_runtime_starting_error(team_id, starting_member));
+            return Err(Self::member_runtime_starting_error(team_id, &starting_member));
         }
         let provisioner = self.provisioner();
         self.repo
@@ -5737,6 +5808,154 @@ mod tests {
         assert!(
             conv_repo.get_extra(&teammate_template_conv).is_some(),
             "the template's original member conversation is never the removal target"
+        );
+
+        svc.stop_sessions_for_user(user);
+    }
+
+    /// Final-review fix (CRITICAL): `remove_team` must tear down the PROJECT-BOUND
+    /// runtime — the engagement-member conversations AND the `team_engagements` /
+    /// `team_engagement_members` rows — not just the `teams.agents` template. A
+    /// legacy/no-project team keeps its old behavior (covered by `d115`).
+    ///
+    /// RED before the fix: only the template conversation is deleted and no
+    /// engagement/member row is removed, so `member.conversation_id` still resolves
+    /// and the engagement rows survive the team's deletion (a leak).
+    #[tokio::test]
+    async fn remove_team_tears_down_engagement_member_runtime_and_rows() {
+        use aionui_db::{SqliteTeamRepository, UpdateTeamParams, init_database_memory};
+
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+        let (svc, conv_repo) = setup_with_team_repo_and_conversation_repo(repo.clone());
+        let user = "user-test";
+
+        let created = svc.create_team(user, two_agent_team_request("Teardown")).await.unwrap();
+        let team_id = created.id.clone();
+        let template_slot = created.assistants[1].slot_id.clone();
+        let template_conv = created.assistants[1].conversation_id.clone();
+
+        repo.update_team(
+            user,
+            &team_id,
+            &UpdateTeamParams {
+                project_id: Some("proj-a".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let engagement = repo
+            .find_or_create_engagement(user, &team_id, "proj-a", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+        let member = repo
+            .list_engagement_members(user, &engagement)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.template_slot == template_slot)
+            .expect("engagement materialized the teammate");
+        assert_ne!(member.conversation_id, template_conv);
+        assert!(
+            conv_repo.get_extra(&member.conversation_id).is_some(),
+            "engagement-member conversation is live before removal"
+        );
+
+        svc.remove_team(user, &team_id).await.unwrap();
+
+        assert!(
+            conv_repo.get_extra(&member.conversation_id).is_none(),
+            "engagement-member conversation is deleted by remove_team, not just the template"
+        );
+        assert!(
+            repo.list_engagement_members(user, &engagement)
+                .await
+                .unwrap()
+                .is_empty(),
+            "member rows are deleted with the team"
+        );
+        assert!(
+            repo.list_engagements(user, &team_id).await.unwrap().is_empty(),
+            "engagement rows are deleted with the team"
+        );
+        assert!(svc.get_team(user, &team_id).await.is_err(), "the team row is gone");
+
+        svc.stop_sessions_for_user(user);
+    }
+
+    /// Final-review fix (IMPORTANT): the `set_session_mode` global-mode "another
+    /// member is starting" guard must resolve member identity through the LIVE
+    /// engagement roster, not the `teams.agents` template — otherwise, for a
+    /// project-bound team the refusal silently no-ops (the coordinator is keyed by
+    /// engagement slot ids, which the template slot ids never match).
+    ///
+    /// RED before the fix: the guard scans only template slot ids, misses the
+    /// engagement runtime slot carrying `Starting`, and the mode switch proceeds.
+    #[tokio::test]
+    async fn set_session_mode_refuses_while_engagement_member_runtime_is_starting() {
+        use aionui_db::{SqliteTeamRepository, UpdateTeamParams, init_database_memory};
+
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+        let (svc, _conv_repo) = setup_with_team_repo_and_conversation_repo(repo.clone());
+        let user = "user-test";
+
+        let created = svc
+            .create_team(user, two_agent_team_request("Mode Guard"))
+            .await
+            .unwrap();
+        let team_id = created.id.clone();
+        let template_slot = created.assistants[1].slot_id.clone();
+
+        repo.update_team(
+            user,
+            &team_id,
+            &UpdateTeamParams {
+                project_id: Some("proj-a".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let engagement = repo
+            .find_or_create_engagement(user, &team_id, "proj-a", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+        let member_slot = repo
+            .list_engagement_members(user, &engagement)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.template_slot == template_slot)
+            .expect("engagement materialized the teammate")
+            .slot_id;
+        assert_ne!(
+            member_slot, template_slot,
+            "runtime slot is the engagement slot, not the template"
+        );
+
+        let session = Arc::clone(
+            &svc.sessions
+                .get(&engagement)
+                .expect("session keyed by engagement")
+                .session,
+        );
+        session
+            .work_coordinator()
+            .set_runtime_constraint(&member_slot, RuntimeConstraint::Starting { operation_id: 1 });
+
+        let error = svc
+            .set_session_mode(user, &team_id, "plan")
+            .await
+            .expect_err("global-mode switch must refuse while an engagement member runtime is starting");
+        assert!(
+            matches!(&error, TeamError::MemberRuntimeStarting { slot_id, .. } if slot_id == &member_slot),
+            "the refusal must name the engagement runtime slot, got {error:?}"
         );
 
         svc.stop_sessions_for_user(user);
