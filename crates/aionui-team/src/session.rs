@@ -13,7 +13,7 @@ use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::DbError;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -222,6 +222,55 @@ impl TeamSession {
         }
     }
 
+    /// Build the runtime member roster the scheduler drives: overlay each
+    /// engagement's materialized member rows (fresh `slot_id` /
+    /// `conversation_id`) on top of the `teams.agents` template, taking
+    /// name/role/backend/model/assistant_id/cli_path/conversation_type from the
+    /// template and overriding only the two runtime ids.
+    ///
+    /// Non-breaking fallback: when the engagement has no materialized members —
+    /// a legacy team (`engagement_id == team_id`, never engaged) or a repo
+    /// double that doesn't implement `list_engagement_members` — the template
+    /// agents are returned unchanged so runtime behavior stays byte-identical
+    /// to pre-Phase-2b. A genuine DB read error also falls back (never gate the
+    /// runtime on member reads), logged for diagnosability since a silent
+    /// fallback would mis-route member messages.
+    async fn engagement_member_agents(
+        repo: &Arc<dyn ITeamRepository>,
+        user_id: &str,
+        engagement_id: &str,
+        template_agents: &[TeamAgent],
+    ) -> Vec<TeamAgent> {
+        let members = match repo.list_engagement_members(user_id, engagement_id).await {
+            Ok(m) if !m.is_empty() => m,
+            Ok(_) => return template_agents.to_vec(),
+            Err(err) => {
+                debug!(
+                    engagement_id,
+                    error = %err,
+                    "engagement member read unavailable; falling back to template agents"
+                );
+                return template_agents.to_vec();
+            }
+        };
+        let by_slot: std::collections::HashMap<&str, _> =
+            members.iter().map(|m| (m.template_slot.as_str(), m)).collect();
+        template_agents
+            .iter()
+            .map(|agent| match by_slot.get(agent.slot_id.as_str()) {
+                Some(member) => {
+                    let mut merged = agent.clone();
+                    merged.slot_id = member.slot_id.clone();
+                    merged.conversation_id = member.conversation_id.clone();
+                    merged
+                }
+                // Template slot not present in this engagement's members: keep
+                // the template row so the member is never dropped from runtime.
+                None => agent.clone(),
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_prompt_dump(
         team: Team,
@@ -237,6 +286,12 @@ impl TeamSession {
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
         let engagement_id = Self::resolve_engagement_id(&repo, &user_id, &team).await;
+        // Runtime member roster: engagement-materialized members when present,
+        // otherwise the `teams.agents` template (legacy fallback). The scheduler
+        // drives THIS list, so every downstream `get_agent`/`list_agents` consumer
+        // (send, projection, wake, MCP, runtime-status events) carries the
+        // engagement's own `slot_id`/`conversation_id`.
+        let member_agents = Self::engagement_member_agents(&repo, &user_id, &engagement_id, &team.agents).await;
         // Single emitter shared by mailbox, task board, and the run manager so
         // all team events reuse the same team-scoped subscription/delivery.
         let emitter = Arc::new(TeamEventEmitter::new(
@@ -265,7 +320,7 @@ impl TeamSession {
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
             user_id.clone(),
-            &team.agents,
+            &member_agents,
             mailbox.clone(),
             task_board.clone(),
             broadcaster.clone(),

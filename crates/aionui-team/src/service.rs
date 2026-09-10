@@ -1631,6 +1631,47 @@ impl TeamSessionService {
             |_| {},
         );
 
+        // Guarantee a project-bound team's engagement members exist before the
+        // session's scheduler is built from them (`engagement_member_agents`).
+        // Materialization is normally done at bind time via `ensure_engagement`,
+        // but a team created project-bound (or restored before its first bind
+        // call) reaches session start without member rows; without this the
+        // session would silently fall back to the shared template roster and
+        // mis-route member messages. Best-effort: repo doubles whose
+        // `find_or_create_engagement` / `ensure_engagement_members` are
+        // unimplemented fall through to the same template fallback, so legacy
+        // behavior is preserved. Ownership is already enforced by the owned
+        // team row read above.
+        if let Some(project_id) = team.project_id.as_deref() {
+            match self
+                .repo
+                .find_or_create_engagement(&user_id, team_id, project_id, &team.workspace)
+                .await
+            {
+                Ok(row) => {
+                    if let Err(err) = self
+                        .provisioner()
+                        .ensure_engagement_members(&user_id, &row, &team)
+                        .await
+                    {
+                        tracing::warn!(
+                            team_id,
+                            engagement_id = %row.id,
+                            error = %err,
+                            "failed to ensure engagement members at session start; runtime falls back to template roster"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        team_id,
+                        error = %err,
+                        "failed to resolve engagement at session start; runtime falls back to template roster"
+                    );
+                }
+            }
+        }
+
         let session = match TeamSession::start_with_prompt_dump(
             team,
             self.repo.clone(),

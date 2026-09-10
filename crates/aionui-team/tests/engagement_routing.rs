@@ -408,3 +408,89 @@ async fn legacy_no_project_team_resolves_to_team_id() {
 
     session.stop();
 }
+
+/// Task 3b — runtime isolation: for a project-bound team whose members are
+/// materialized in engagement `E`, the session's scheduler roster carries `E`'s
+/// runtime `slot_id`/`conversation_id`, NOT the shared template's. This proves
+/// the runtime no longer drives the `teams.agents` template identities.
+#[tokio::test]
+async fn session_scheduler_carries_engagement_runtime_member_ids() {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+    let user = "u1";
+    seed_team(&repo, "team-iso", user, Some("proj-a")).await;
+    let engagement = repo
+        .find_or_create_engagement(user, "team-iso", "proj-a", "/tmp/routing")
+        .await
+        .unwrap();
+
+    // Materialize this engagement's own member for the template `lead-1` slot,
+    // with a FRESH runtime slot/conversation id (what the provisioner does).
+    repo.upsert_engagement_member(&aionui_db::models::TeamEngagementMemberRow {
+        engagement_id: engagement.id.clone(),
+        team_id: "team-iso".into(),
+        template_slot: "lead-1".into(),
+        slot_id: "rt-lead".into(),
+        conversation_id: "rt-conv".into(),
+        role: "lead".into(),
+        status: None,
+        created_at: now_ms(),
+        updated_at: now_ms(),
+    })
+    .await
+    .unwrap();
+
+    let session = start_session(repo.clone(), team_domain("team-iso", Some("proj-a")), user).await;
+    assert_eq!(
+        session.engagement_id(),
+        engagement.id,
+        "session keys to the materialized engagement"
+    );
+
+    let roster = session.scheduler().list_agents().await;
+    assert_eq!(roster.len(), 1, "single-member template roster preserved");
+    let lead = &roster[0];
+    assert_eq!(
+        lead.slot_id, "rt-lead",
+        "scheduler carries the engagement runtime slot_id"
+    );
+    assert_eq!(
+        lead.conversation_id, "rt-conv",
+        "scheduler carries the engagement runtime conversation_id"
+    );
+    // Distinct from the template — proves isolation, not just a value copy.
+    assert_ne!(lead.slot_id, "lead-1", "runtime slot differs from template");
+    assert_ne!(
+        lead.conversation_id, "conv-lead",
+        "runtime conversation differs from template"
+    );
+    // Template-defined identity (name/role) is preserved across the merge.
+    assert_eq!(lead.name, "Lead");
+    assert_eq!(lead.role, TeammateRole::Lead);
+
+    session.stop();
+}
+
+/// Task 3b — non-breaking fallback: a legacy team with no materialized members
+/// still drives the scheduler from the `teams.agents` template (byte-identical
+/// to pre-Phase-2b runtime behavior).
+#[tokio::test]
+async fn session_scheduler_falls_back_to_template_for_legacy_team() {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+    let user = "u1";
+    seed_team(&repo, "team-legacy-rt", user, None).await;
+
+    let session = start_session(repo.clone(), team_domain("team-legacy-rt", None), user).await;
+    assert_eq!(session.engagement_id(), "team-legacy-rt");
+
+    let roster = session.scheduler().list_agents().await;
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0].slot_id, "lead-1", "legacy team keeps the template slot_id");
+    assert_eq!(
+        roster[0].conversation_id, "conv-lead",
+        "legacy team keeps the template conversation_id"
+    );
+
+    session.stop();
+}
