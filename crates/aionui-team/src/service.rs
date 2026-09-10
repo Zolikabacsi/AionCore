@@ -475,7 +475,9 @@ impl TeamSessionService {
 
     /// Resolve a team workspace into `(project_id, folder_id)`. Best-effort:
     /// missing service / empty workspace / bad URI / resolve error → `(None, None)`,
-    /// logged at `warn`. Never affects team create/read.
+    /// logged at `warn`. Never affects team create/read. LEGACY: only seeds the
+    /// team's default/active-project marker; runtime member routing is per
+    /// engagement, never via a single-team-project rebind of shared conversations.
     async fn resolve_binding_best_effort(&self, user_id: &str, workspace: &str) -> (Option<String>, Option<String>) {
         let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
         let Some(project_service) = project_service else {
@@ -1037,6 +1039,13 @@ impl TeamSessionService {
         Ok(())
     }
 
+    /// Switch the team's project by moving its ACTIVE engagement: persist the new
+    /// default/active project on the team row (read by `resolve_engagement_id`),
+    /// tear down the previously-active engagement's runtime, and
+    /// `ensure_engagement` the new project's engagement (which materializes its
+    /// OWN member conversations in the new workspace). The shared template member
+    /// conversations and any previously-active engagement's members are left
+    /// untouched — a project change is an engagement switch, not a rebind.
     pub async fn update_team_project(
         &self,
         user_id: &str,
@@ -1048,12 +1057,14 @@ impl TeamSessionService {
         // Resolve the new project's workspace folder.
         let (new_workspace, new_folder_id) = self.resolve_project_workspace(user_id, project_id).await?;
 
-        // Tear down the live runtime so agents pick up the new workspace/project
-        // on the next session start.
+        // Tear down the PREVIOUSLY-active engagement's runtime BEFORE the flip
+        // (the session map is engagement-keyed; stop_sessions_for_team sweeps every
+        // engagement session for this team) so the next session start resolves and
+        // drives the new engagement.
         self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::RuntimeRestart)
             .await;
 
-        // Persist the new binding on the team row.
+        // Persist the new default/active-project marker on the team row.
         self.repo
             .update_team(
                 user_id,
@@ -1067,17 +1078,13 @@ impl TeamSessionService {
             )
             .await?;
 
-        // Update each member conversation's workspace and project binding.
-        for agent in &team.agents {
-            self.conversation_port
-                .update_conversation_project_binding(
-                    &agent.conversation_id,
-                    Some(project_id.to_owned()),
-                    Some(new_folder_id.clone()),
-                    Some(new_workspace.clone()),
-                )
-                .await?;
-        }
+        // Switch the team's ACTIVE engagement to the new project by creating/using
+        // that project's engagement with its OWN member conversations bound to the
+        // new workspace. This replaces the deprecated single-team-project rebind
+        // that mutated each shared template member conversation's project binding;
+        // per-engagement members are independent, so a project change must never
+        // retroactively touch a previously-active engagement's members.
+        self.ensure_engagement(user_id, team_id, project_id).await?;
 
         self.broadcast_team_list_changed(user_id, team_id, "updated");
 
@@ -6133,6 +6140,147 @@ mod tests {
             conv_repo.get_extra(&teammate_template_conv).unwrap()["mock_acp_session_id"],
             serde_json::Value::Null,
             "the template's original conversation is never the clear target"
+        );
+
+        svc.stop_sessions_for_user(user);
+    }
+
+    /// Task 4 — deprecate the single-team-project REBIND. `update_team_project`
+    /// must switch the team's ACTIVE engagement by creating/using the new
+    /// project's engagement (with its OWN member conversations in that
+    /// project's workspace), NOT by mutating the shared template member
+    /// conversations or a previously-active engagement's members. Real
+    /// `SqliteTeamRepository` (engagement ids/members) + real
+    /// `SqliteProjectStore`/`ProjectService` (project→workspace resolution).
+    #[tokio::test]
+    async fn update_team_project_switches_engagement_without_rebinding_shared_members() {
+        use aionui_db::{IProjectStore, SqliteProjectStore, SqliteTeamRepository, init_database_memory};
+
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let repo = Arc::new(SqliteTeamRepository::new(pool.clone()));
+
+        // Project tables carry a users(id) FK; seed the owner as in production.
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES ('user-switch', 'local', 'user-switch', 'hash', 'active', 0, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (svc, conv_repo) = setup_with_team_repo_and_conversation_repo(repo.clone());
+        let user = "user-switch";
+
+        // Create the team BEFORE injecting the project service so the create-time
+        // bind side-branch is a no-op and the team starts unbound.
+        let created = svc
+            .create_team(user, single_agent_team_request("Switcher"))
+            .await
+            .unwrap();
+        let team_id = created.id.clone();
+        let template_conv = created.assistants[0].conversation_id.clone();
+        let template_workspace_before = conv_repo
+            .get_extra(&template_conv)
+            .and_then(|e| {
+                e.get("workspace")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .expect("template conversation has a workspace");
+
+        let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(pool.clone()));
+        let project_service = Arc::new(aionui_project::ProjectService::new(
+            project_store,
+            std::env::temp_dir().join(format!("aionui-team-switch-root-{}", aionui_common::generate_id())),
+        ));
+        svc.with_project_service(project_service.clone());
+
+        let dir_a = std::env::temp_dir().join(format!("aionui-team-switch-a-{}", aionui_common::generate_id()));
+        let dir_b = std::env::temp_dir().join(format!("aionui-team-switch-b-{}", aionui_common::generate_id()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let project_a = project_service
+            .create_standard(user, aionui_project::canonical::to_file_uri(&dir_a).unwrap())
+            .await
+            .unwrap()
+            .project
+            .project_id;
+        let project_b = project_service
+            .create_standard(user, aionui_project::canonical::to_file_uri(&dir_b).unwrap())
+            .await
+            .unwrap()
+            .project
+            .project_id;
+
+        // 1) Switch the team to project A through the real entry point.
+        svc.update_team_project(user, &team_id, &project_a).await.unwrap();
+        let eng_a = repo
+            .find_or_create_engagement(user, &team_id, &project_a, &dir_a.to_string_lossy())
+            .await
+            .unwrap()
+            .id;
+        let members_a = repo.list_engagement_members(user, &eng_a).await.unwrap();
+        assert_eq!(members_a.len(), 1, "switching to A materializes A's engagement members");
+        assert_ne!(
+            members_a[0].conversation_id, template_conv,
+            "engagement member is a fresh conversation, not the shared template"
+        );
+        assert_eq!(
+            conv_repo.get_extra(&members_a[0].conversation_id).unwrap()["workspace"],
+            dir_a.to_string_lossy().as_ref(),
+            "A's member conversation is bound to A's workspace"
+        );
+        let a_conv = members_a[0].conversation_id.clone();
+        let a_workspace_before = conv_repo.get_extra(&a_conv).unwrap()["workspace"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // 2) Switch the team to project B.
+        svc.update_team_project(user, &team_id, &project_b).await.unwrap();
+        let eng_b = repo
+            .find_or_create_engagement(user, &team_id, &project_b, &dir_b.to_string_lossy())
+            .await
+            .unwrap()
+            .id;
+        let members_b = repo.list_engagement_members(user, &eng_b).await.unwrap();
+        assert_eq!(members_b.len(), 1, "switching to B materializes B's engagement members");
+        let b_conv = members_b[0].conversation_id.clone();
+        assert_ne!(b_conv, a_conv, "B's engagement uses its OWN member conversation id");
+        assert_ne!(
+            b_conv, template_conv,
+            "B's member is not the shared template conversation"
+        );
+        assert_eq!(
+            conv_repo.get_extra(&b_conv).unwrap()["workspace"],
+            dir_b.to_string_lossy().as_ref(),
+            "B's member conversation is bound to B's workspace"
+        );
+
+        // Task 5 invariant: switching projects must NOT retroactively mutate the
+        // previously-active engagement's members/conversations.
+        let members_a_after = repo.list_engagement_members(user, &eng_a).await.unwrap();
+        assert_eq!(members_a_after.len(), 1, "A still has exactly its own member");
+        assert_eq!(
+            members_a_after[0].conversation_id, a_conv,
+            "A's member conversation id is unchanged by the switch to B"
+        );
+        assert_eq!(
+            conv_repo.get_extra(&a_conv).unwrap()["workspace"],
+            a_workspace_before.as_str(),
+            "A's member conversation workspace was NOT rebound to B"
+        );
+
+        // The deprecated rebind mutated the shared template member conversation;
+        // the per-engagement switch must leave it untouched.
+        assert_eq!(
+            conv_repo.get_extra(&template_conv).and_then(|e| e
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)),
+            Some(template_workspace_before),
+            "the shared template conversation workspace must not be rebound by a project switch"
         );
 
         svc.stop_sessions_for_user(user);
