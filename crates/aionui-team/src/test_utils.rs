@@ -2003,6 +2003,37 @@ pub(crate) mod workspace_harness {
         )
     }
 
+    /// Same wiring as [`setup_with_team_repo`] but also hands back the fake
+    /// conversation repo so destructive-path tests can assert which member
+    /// conversations a management op deleted / left intact.
+    pub(crate) fn setup_with_team_repo_and_conversation_repo(
+        team_repo: Arc<dyn ITeamRepository>,
+    ) -> (Arc<TeamSessionService>, Arc<MockConversationRepo>) {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster;
+        let conv_repo = Arc::new(MockConversationRepo::new());
+        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+        let svc = TeamSessionService::new(
+            team_repo,
+            Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            conversation_port,
+            projection_store,
+            broadcaster_dyn,
+            task_manager,
+            Arc::new(NoopTurnPort),
+            Arc::new(NoopCancellationPort),
+            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        );
+        (svc, conv_repo)
+    }
+
     pub(crate) async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
         repo.update_team(
             "user1",
