@@ -146,6 +146,14 @@ struct MemberRuntimeReconcileWork {
     owner: Option<AttachLease>,
 }
 
+/// Outcome of the shared engagement-member lookup: `Fallback` means resolve the
+/// management op through the `teams.agents` template (legacy / no-project team or a
+/// member-read error); `Match` carries the ACTIVE engagement's member row.
+enum ActiveMember {
+    Fallback,
+    Match(aionui_db::models::TeamEngagementMemberRow),
+}
+
 pub struct TeamSessionService {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -1089,33 +1097,86 @@ impl TeamSessionService {
         // no-project team) OR a member-read failure (test doubles that do not
         // implement it, genuine DB error) falls back to the template lookup, so a
         // management op never breaks where the template lookup used to succeed.
+        match self
+            .active_engagement_member(user_id, engagement, slot_id, |member, key| member.slot_id == key)
+            .await?
+        {
+            ActiveMember::Fallback => {
+                let agent = self.template_runtime_agent(team, slot_id).await?;
+                Ok((agent, None))
+            }
+            ActiveMember::Match(member) => {
+                let agent = self.template_runtime_agent(team, &member.template_slot).await?;
+                let mut merged = agent;
+                merged.slot_id = member.slot_id.clone();
+                merged.conversation_id = member.conversation_id.clone();
+                Ok((merged, Some(member)))
+            }
+        }
+    }
+
+    /// Slot-keyed counterpart of [`resolve_runtime_agent`] for callers that hold a
+    /// runtime `conversation_id` (the config-option readers) instead of a `slot_id`.
+    /// Identical engagement-member semantics and the same no-template-fall-through
+    /// safety guard: a materialized engagement whose members do not carry this
+    /// conversation is never resolved against the template.
+    async fn resolve_runtime_agent_by_conversation(
+        &self,
+        user_id: &str,
+        team: &Team,
+        engagement: &str,
+        conversation_id: &str,
+    ) -> Result<(TeamAgent, Option<aionui_db::models::TeamEngagementMemberRow>), TeamError> {
+        match self
+            .active_engagement_member(user_id, engagement, conversation_id, |member, key| {
+                member.conversation_id == key
+            })
+            .await?
+        {
+            ActiveMember::Fallback => {
+                let agent = self
+                    .template_runtime_agent_by_conversation(team, conversation_id)
+                    .await?;
+                Ok((agent, None))
+            }
+            ActiveMember::Match(member) => {
+                let agent = self.template_runtime_agent(team, &member.template_slot).await?;
+                let mut merged = agent;
+                merged.slot_id = member.slot_id.clone();
+                merged.conversation_id = member.conversation_id.clone();
+                Ok((merged, Some(member)))
+            }
+        }
+    }
+
+    /// Shared member-list decision for both `resolve_runtime_agent` entry points.
+    /// `Ok(Fallback)` means "resolve via the template" (empty roster or a read
+    /// error); `Ok(Match)` yields the engagement member; a materialized roster that
+    /// does not contain `key` is `AgentNotFound` and must NOT fall through to the
+    /// template — that could destroy / act on the wrong conversation.
+    async fn active_engagement_member(
+        &self,
+        user_id: &str,
+        engagement: &str,
+        key: &str,
+        matches: impl Fn(&aionui_db::models::TeamEngagementMemberRow, &str) -> bool,
+    ) -> Result<ActiveMember, TeamError> {
         let members = match self.repo.list_engagement_members(user_id, engagement).await {
             Ok(m) if !m.is_empty() => m,
-            Ok(_) => {
-                let agent = self.template_runtime_agent(team, slot_id).await?;
-                return Ok((agent, None));
-            }
+            Ok(_) => return Ok(ActiveMember::Fallback),
             Err(err) => {
                 warn!(
                     engagement,
                     error = %err,
                     "engagement member read failed during management op; falling back to template roster"
                 );
-                let agent = self.template_runtime_agent(team, slot_id).await?;
-                return Ok((agent, None));
+                return Ok(ActiveMember::Fallback);
             }
         };
-        if let Some(member) = members.iter().find(|m| m.slot_id == slot_id) {
-            let agent = self.template_runtime_agent(team, &member.template_slot).await?;
-            let mut merged = agent;
-            merged.slot_id = member.slot_id.clone();
-            merged.conversation_id = member.conversation_id.clone();
-            return Ok((merged, Some(member.clone())));
+        match members.into_iter().find(|m| matches(m, key)) {
+            Some(member) => Ok(ActiveMember::Match(member)),
+            None => Err(TeamError::AgentNotFound(key.to_owned())),
         }
-        // Materialized engagement whose members do not contain this runtime slot:
-        // it belongs to no member of THIS engagement (possibly another's). Never
-        // fall through to the template — that could destroy the wrong conversation.
-        Err(TeamError::AgentNotFound(slot_id.to_owned()))
     }
 
     async fn template_runtime_agent(&self, team: &Team, slot_id: &str) -> Result<TeamAgent, TeamError> {
@@ -1124,6 +1185,18 @@ impl TeamSessionService {
             .find(|a| a.slot_id == slot_id)
             .cloned()
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))
+    }
+
+    async fn template_runtime_agent_by_conversation(
+        &self,
+        team: &Team,
+        conversation_id: &str,
+    ) -> Result<TeamAgent, TeamError> {
+        team.agents
+            .iter()
+            .find(|a| a.conversation_id == conversation_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))
     }
 
     pub async fn add_agent(
@@ -2070,6 +2143,9 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
+        // ponytail: removal-during-reconcile race is guarded by this team-keyed
+        // `add_agent_lock`; a dedicated multi-engagement regression test lands with
+        // the Task 5 cross-engagement suite (deliberately deferred, not forgotten).
         // Race closure (Phase 2b 3c): this lock is the team-keyed `add_agent_locks`
         // entry `add`/`remove`/`rename` take. `reserve` already ran under it, and
         // `remove_agent` marks the member Removing under it, so `reserve` joins the
@@ -2177,13 +2253,17 @@ impl TeamSessionService {
         let row = self.load_owned_team_row(user_id, team_id).await?;
 
         let team = Team::from_row(&row)?;
-        let member = team
-            .agents
-            .iter()
-            .find(|agent| agent.conversation_id == conversation_id)
-            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        // Resolve the caller's runtime conversation through the ACTIVE engagement's
+        // members so a project-bound team reads its own member (whose runtime
+        // conversation the UI carries) rather than 404-ing on the template. Legacy /
+        // no-member teams fall back to the template row, byte-identical to before.
+        let engagement = TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await;
+        let member = self
+            .resolve_runtime_agent_by_conversation(user_id, &team, &engagement, conversation_id)
+            .await?
+            .0;
         if self.member_runtime_is_starting(team_id, &member.slot_id) {
-            return Err(Self::member_runtime_starting_error(team_id, member));
+            return Err(Self::member_runtime_starting_error(team_id, &member));
         }
 
         self.conversation_port.get_config_options(conversation_id).await
@@ -2199,13 +2279,18 @@ impl TeamSessionService {
     ) -> Result<SetConfigOptionResponse, TeamError> {
         let row = self.load_owned_team_row(user_id, team_id).await?;
         let team = Team::from_row(&row)?;
-        let member = team
-            .agents
-            .iter()
-            .find(|agent| agent.conversation_id == conversation_id)
-            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        // Resolve the caller's runtime conversation through the ACTIVE engagement's
+        // members (same switch as the config-option reader): a project-bound team
+        // writes its own member conversation, and the model persist that follows is
+        // keyed by the engagement runtime slot. Legacy / no-member teams fall back to
+        // the template row, byte-identical to before.
+        let engagement = TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await;
+        let member = self
+            .resolve_runtime_agent_by_conversation(user_id, &team, &engagement, conversation_id)
+            .await?
+            .0;
         if self.member_runtime_is_starting(team_id, &member.slot_id) {
-            return Err(Self::member_runtime_starting_error(team_id, member));
+            return Err(Self::member_runtime_starting_error(team_id, &member));
         }
 
         let options = self.conversation_port.get_config_options(conversation_id).await?;
@@ -3013,11 +3098,14 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         let engagement = TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await;
-        let requested_agent = team
-            .agents
-            .iter()
-            .find(|agent| agent.slot_id == slot_id)
-            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        // Resolve the runtime identity through the ACTIVE engagement's members so a
+        // project-bound team (whose UI carries engagement runtime slot ids) restarts
+        // its own member instead of 404-ing on the template. Legacy / no-member teams
+        // fall back to the template slot, byte-identical to before.
+        let requested_agent = self
+            .resolve_runtime_agent(user_id, &team, &engagement, slot_id)
+            .await?
+            .0;
         if allow_queued {
             self.ensure_session_inner(team_id, Some(user_id)).await?;
         }
@@ -5870,6 +5958,181 @@ mod tests {
         assert!(
             b_after.iter().all(|m| m.slot_id != added.slot_id),
             "new member must not leak into engagement B"
+        );
+
+        svc.stop_sessions_for_user(user);
+    }
+
+    /// Task 3c (finding #2): `update_agent_model` against the ACTIVE engagement's
+    /// RUNTIME slot must persist the confirmed model to that engagement member's
+    /// OWN conversation, never the shared template's conversation. Uses a real
+    /// `SqliteTeamRepository` so the member is minted with a fresh runtime
+    /// conversation distinct from the template's, and the fake conversation port to
+    /// observe which conversation `persist_confirmed_model` patched. Fails if the
+    /// code persisted the template conversation instead.
+    #[tokio::test]
+    async fn update_agent_model_persists_to_active_engagement_member_conversation() {
+        use aionui_db::{SqliteTeamRepository, UpdateTeamParams, init_database_memory};
+
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+        let (svc, conv_repo) = setup_with_team_repo_and_conversation_repo(repo.clone());
+        let user = "user-test";
+
+        let created = svc
+            .create_team(user, two_agent_team_request("Model Persist"))
+            .await
+            .unwrap();
+        let team_id = created.id.clone();
+        let teammate_template_slot = created.assistants[1].slot_id.clone();
+        let teammate_template_conv = created.assistants[1].conversation_id.clone();
+
+        repo.update_team(
+            user,
+            &team_id,
+            &UpdateTeamParams {
+                project_id: Some("proj-a".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let engagement = repo
+            .find_or_create_engagement(user, &team_id, "proj-a", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+        let member = repo
+            .list_engagement_members(user, &engagement)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.template_slot == teammate_template_slot)
+            .expect("engagement A materialized the teammate");
+        assert_ne!(
+            member.conversation_id, teammate_template_conv,
+            "member has its own runtime conversation"
+        );
+
+        svc.update_agent_model(user, &team_id, &member.slot_id, "gpt-5.6-sol")
+            .await
+            .unwrap();
+
+        let member_model = conv_repo.get_extra(&member.conversation_id).unwrap()["current_model_id"].clone();
+        assert_eq!(
+            member_model,
+            serde_json::Value::String("gpt-5.6-sol".into()),
+            "confirmed model persisted to the ACTIVE engagement member conversation"
+        );
+        let template_model = conv_repo.get_extra(&teammate_template_conv).unwrap()["current_model_id"].clone();
+        assert_ne!(
+            template_model,
+            serde_json::Value::String("gpt-5.6-sol".into()),
+            "the template conversation must NOT be the persist target"
+        );
+
+        svc.stop_sessions_for_user(user);
+    }
+
+    /// Task 3c (finding #3): context reset against the ACTIVE engagement's RUNTIME
+    /// slot must clear/kills that member's OWN conversation and leave a
+    /// concurrently-running engagement's member conversation intact (and never the
+    /// template's). Mirrors `remove_agent_destroys_only_active_engagement_member_conversation`;
+    /// observable via the fake port's ACP resume anchor (`mock_acp_session_id`).
+    #[tokio::test]
+    async fn clear_agent_context_resets_only_active_engagement_member_conversation() {
+        use aionui_db::{SqliteTeamRepository, UpdateTeamParams, init_database_memory};
+
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+        let (svc, conv_repo) = setup_with_team_repo_and_conversation_repo(repo.clone());
+        let user = "user-test";
+
+        let created = svc
+            .create_team(user, two_agent_team_request("Clear Isolation"))
+            .await
+            .unwrap();
+        let team_id = created.id.clone();
+        let teammate_template_slot = created.assistants[1].slot_id.clone();
+        let teammate_template_conv = created.assistants[1].conversation_id.clone();
+
+        let bind = |project: &'static str| {
+            let repo = repo.clone();
+            let team_id = team_id.clone();
+            async move {
+                repo.update_team(
+                    user,
+                    &team_id,
+                    &UpdateTeamParams {
+                        project_id: Some(project.to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        bind("proj-a").await;
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let eng_a = repo
+            .find_or_create_engagement(user, &team_id, "proj-a", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+        bind("proj-b").await;
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let eng_b = repo
+            .find_or_create_engagement(user, &team_id, "proj-b", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+
+        let member_of = |engagement: &str| {
+            let repo = repo.clone();
+            let engagement = engagement.to_owned();
+            let template_slot = teammate_template_slot.clone();
+            async move {
+                repo.list_engagement_members(user, &engagement)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.template_slot == template_slot)
+                    .expect("engagement materialized the teammate")
+            }
+        };
+        let member_a = member_of(&eng_a).await;
+        let member_b = member_of(&eng_b).await;
+        assert_ne!(member_a.conversation_id, member_b.conversation_id);
+
+        // Re-engage A (active) and bring its member runtime up to Ready so the
+        // reset's restart gate is satisfied, then clear via the engagement-A runtime slot.
+        bind("proj-a").await;
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&eng_a).unwrap().session);
+        mark_member_runtime_ready(&session, &member_a.slot_id);
+
+        let outcome = svc
+            .clear_agent_context(user, &team_id, &member_a.slot_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome.reset_status, TeamContextResetStatus::Completed);
+
+        assert_eq!(
+            conv_repo.get_extra(&member_a.conversation_id).unwrap()["mock_acp_session_id"],
+            serde_json::Value::Null,
+            "ACTIVE engagement member's resume anchor was cleared"
+        );
+        assert_ne!(
+            conv_repo.get_extra(&member_b.conversation_id).unwrap()["mock_acp_session_id"],
+            serde_json::Value::Null,
+            "concurrently-running engagement's member conversation must survive intact"
+        );
+        assert_ne!(
+            conv_repo.get_extra(&teammate_template_conv).unwrap()["mock_acp_session_id"],
+            serde_json::Value::Null,
+            "the template's original conversation is never the clear target"
         );
 
         svc.stop_sessions_for_user(user);
