@@ -423,4 +423,27 @@ pub trait ITeamRepository: Send + Sync {
             "get_engagement_member_by_conversation not implemented".to_string(),
         ))
     }
+
+    /// Deletes every member row belonging to a team's engagements. Called by
+    /// `remove_team` BEFORE `delete_engagements_by_team` (the FK ceiling
+    /// `team_engagement_members.engagement_id -> team_engagements.id`), so a
+    /// removed team leaves no member-row leak. Scoped to `user_id` + `team_id`
+    /// (data isolation); a legacy team has no member rows and deletes cleanly.
+    /// Default `NotFound` so non-SQLite doubles that don't exercise teardown are
+    /// unaffected; `remove_team` treats the error as best-effort.
+    async fn delete_engagement_members_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
+        Err(DbError::NotFound(
+            "delete_engagement_members_by_team not implemented".to_string(),
+        ))
+    }
+
+    /// Deletes every engagement row bound to a team. Called by `remove_team`
+    /// AFTER `delete_engagement_members_by_team`. A legacy team's single default
+    /// engagement (id == team_id, minted by the 045 backfill) is removed with the
+    /// team, which is correct. Scoped to `user_id` + `team_id` (data isolation).
+    async fn delete_engagements_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
+        Err(DbError::NotFound(
+            "delete_engagements_by_team not implemented".to_string(),
+        ))
+    }
 }

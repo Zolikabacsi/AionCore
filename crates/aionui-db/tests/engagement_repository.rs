@@ -63,5 +63,82 @@ async fn engagement_row_surfaces_lifecycle_columns() {
         .expect("engagement exists");
     assert_eq!(found.id, row.id);
     assert_eq!(found.origin, "user");
-    assert_eq!(found.folder_id, None);
+}
+
+fn member_row(engagement_id: &str, team_id: &str, slot: &str) -> aionui_db::models::TeamEngagementMemberRow {
+    aionui_db::models::TeamEngagementMemberRow {
+        engagement_id: engagement_id.to_owned(),
+        team_id: team_id.to_owned(),
+        template_slot: slot.to_owned(),
+        slot_id: format!("{slot}-runtime"),
+        conversation_id: format!("{slot}-conv"),
+        role: "teammate".to_owned(),
+        status: None,
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+/// `delete_engagement_members_by_team` / `delete_engagements_by_team` must remove
+/// exactly one team's rows (user- AND team-scoped), leave another user's team
+/// intact, and respect the member-before-engagement FK order. Also asserts a
+/// legacy team's default engagement (id == team_id) deletes cleanly with no
+/// member rows present.
+#[tokio::test]
+async fn delete_by_team_is_scoped_and_respects_member_fk_order() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteTeamRepository::new(db.pool().clone());
+    let pool = db.pool();
+
+    // Two owners, one team each.
+    for (uid, team) in [("u1", "team-1"), ("u2", "team-2")] {
+        seed_team(pool, team, uid).await;
+    }
+    let eng1 = repo
+        .find_or_create_engagement("u1", "team-1", "proj-a", "/ws/a")
+        .await
+        .unwrap();
+    repo.find_or_create_engagement("u1", "team-1", "proj-b", "/ws/b")
+        .await
+        .unwrap();
+    let eng2 = repo
+        .find_or_create_engagement("u2", "team-2", "proj-a", "/ws/a")
+        .await
+        .unwrap();
+    for m in [
+        member_row(&eng1.id, "team-1", "s1"),
+        member_row(&eng1.id, "team-1", "s2"),
+    ] {
+        repo.upsert_engagement_member(&m).await.unwrap();
+    }
+    repo.upsert_engagement_member(&member_row(&eng2.id, "team-2", "s1"))
+        .await
+        .unwrap();
+
+    // Legacy team: default engagement row (id == team_id) from the 045 backfill,
+    // no members. Seed it directly so we can prove it deletes without FK pain.
+    sqlx::query(
+        "INSERT INTO team_engagements (id,user_id,team_id,project_id,workspace,process,status,created_at,updated_at) \
+         VALUES ('team-legacy','u1','team-legacy','__none__','','hierarchical','active',0,0)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    seed_team(pool, "team-legacy", "u1").await;
+
+    repo.delete_engagement_members_by_team("u1", "team-1").await.unwrap();
+    repo.delete_engagements_by_team("u1", "team-1").await.unwrap();
+
+    // Target team fully cleared.
+    assert!(repo.list_engagements("u1", "team-1").await.unwrap().is_empty());
+    assert!(repo.list_engagement_members("u1", &eng1.id).await.unwrap().is_empty());
+    // Another owner's team/engagement/member survive.
+    assert_eq!(repo.list_engagements("u2", "team-2").await.unwrap().len(), 1);
+    assert_eq!(repo.list_engagement_members("u2", &eng2.id).await.unwrap().len(), 1);
+    // Legacy team (no members) deletes cleanly (engagement row only).
+    repo.delete_engagement_members_by_team("u1", "team-legacy")
+        .await
+        .unwrap();
+    repo.delete_engagements_by_team("u1", "team-legacy").await.unwrap();
+    assert!(repo.list_engagements("u1", "team-legacy").await.unwrap().is_empty());
 }

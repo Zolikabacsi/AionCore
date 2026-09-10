@@ -1121,4 +1121,32 @@ impl ITeamRepository for SqliteTeamRepository {
         .await?;
         Ok(row)
     }
+
+    async fn delete_engagement_members_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        // Members carry no user_id; the EXISTS guard scopes the delete to rows
+        // whose team is owned by `user_id` (data isolation), mirroring
+        // `delete_mailbox_by_team` / `delete_tasks_by_team`. Must run BEFORE
+        // `delete_engagements_by_team` (FK to `team_engagements.id`).
+        sqlx::query(
+            "DELETE FROM team_engagement_members \
+             WHERE team_id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_engagement_members.team_id AND t.user_id = ?)",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_engagements_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        // `team_engagements` owns a `user_id` column, so delete directly by
+        // (user_id, team_id) — fully scoped, no cross-team or cross-user reach.
+        sqlx::query("DELETE FROM team_engagements WHERE user_id = ? AND team_id = ?")
+            .bind(user_id)
+            .bind(team_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
