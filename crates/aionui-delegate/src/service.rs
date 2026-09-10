@@ -77,6 +77,7 @@ pub struct DelegateService {
     pub conversation_service: ConversationService,
     pub(crate) conversation_repo: Arc<dyn IConversationRepository>,
     pub(crate) settings_repo: Arc<dyn ISettingsRepository>,
+    #[allow(dead_code)]
     pub(crate) broadcaster: Arc<dyn EventBroadcaster>,
     pub(crate) task_manager: Arc<dyn IWorkerTaskManager>,
 }
@@ -370,8 +371,7 @@ impl DelegateService {
                         message: composed,
                         depth,
                         expires_at_ms: now_ms() + QUEUE_TTL_MS,
-                    })
-                    .map_err(|e| e)?;
+                    })?;
                 self.persist_envelope(
                     &envelope_id,
                     user_id,
@@ -690,10 +690,10 @@ impl DelegateService {
             .await
             .map_err(|e| DelegateError::TransportUnavailable { reason: e.to_string() })?;
         for r in rows {
-            if let Ok(id) = r.try_get::<String, _>("target_assistant_id") {
-                if id == target_assistant_id {
-                    return Ok(Some(id));
-                }
+            if let Ok(id) = r.try_get::<String, _>("target_assistant_id")
+                && id == target_assistant_id
+            {
+                return Ok(Some(id));
             }
         }
         Ok(None)
@@ -730,6 +730,7 @@ impl DelegateService {
         extract_assistant_id_from_extra_value(&extra)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn persist_envelope(
         &self,
         envelope_id: &str,
