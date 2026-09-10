@@ -1585,9 +1585,15 @@ impl TeamSessionService {
         let mut team = Team::from_row(&row)?;
         self.reconcile_legacy_team_models(&user_id, team_id, &engagement, &mut team)
             .await?;
-        let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
+        // The attach/reconcile/broadcast roster MUST be the same merged view the
+        // scheduler drives (engagement-materialized runtime slot/conversation ids,
+        // falling back to the template for legacy/no-member teams). Reading it from
+        // the live scheduler — not `team.agents` — keeps the registry, scheduler,
+        // and status broadcasts keyed on engagement runtime ids consistently, so a
+        // project-bound team never attaches/binds/duplicates the shared template.
         if let Some(session) = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session)) {
+            let agents_snapshot = session.scheduler().list_agents().await;
             let work = self
                 .reserve_member_runtime_reconciliation(&session, &agents_snapshot)
                 .await?;
@@ -1605,6 +1611,7 @@ impl TeamSessionService {
         let ensure_guard = lock.lock().await;
 
         if let Some(session) = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session)) {
+            let agents_snapshot = session.scheduler().list_agents().await;
             let work = self
                 .reserve_member_runtime_reconciliation(&session, &agents_snapshot)
                 .await?;
@@ -1717,8 +1724,12 @@ impl TeamSessionService {
 
         // Leader-only warmup: only the lead slot is attached at first start.
         // Teammates stay dormant (Absent in the registry) until a delivery
-        // lazily wakes them (spec 5.1).
-        let Some(leader) = agents_snapshot
+        // lazily wakes them (spec 5.1). Read the roster from the session's
+        // scheduler (the merged engagement view), never the `team.agents`
+        // template, so the leader is attached and bound under the engagement's
+        // runtime `slot_id`/`conversation_id`.
+        let member_roster = session.scheduler().list_agents().await;
+        let Some(leader) = member_roster
             .iter()
             .find(|agent| agent.role == TeammateRole::Lead)
             .cloned()
@@ -1803,7 +1814,7 @@ impl TeamSessionService {
 
         // Teammates start dormant; the leader's Ready was already broadcast by
         // its successful attach.
-        for agent in agents_snapshot.iter().filter(|a| a.role != TeammateRole::Lead) {
+        for agent in member_roster.iter().filter(|a| a.role != TeammateRole::Lead) {
             self.broadcast_agent_runtime_status(&user_id, team_id, agent, TeamAgentRuntimeStatus::Dormant, None);
         }
 
@@ -1824,7 +1835,7 @@ impl TeamSessionService {
         }
 
         self.broadcast_session_status(&user_id, team_id, TeamSessionStatus::Ready, None, |p| {
-            p.server_count = Some(agents_snapshot.len());
+            p.server_count = Some(member_roster.len());
         });
 
         Ok(())
@@ -1957,11 +1968,16 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
-        let current_agents = match self.repo.get_team(user_id, team_id).await? {
-            Some(row) => Team::from_row(&row)?.agents,
-            None => return Err(TeamError::TeamNotFound(team_id.to_owned())),
-        };
-        let current_slots = current_agents
+        // Team-existence guard: if the team row was deleted while attaching,
+        // abort. The per-member membership check below keys on the LIVE runtime
+        // roster (the scheduler's merged engagement view), NOT the `teams.agents`
+        // template — reconcile work agents carry engagement runtime slot ids that
+        // would never match the template slots.
+        if self.repo.get_team(user_id, team_id).await?.is_none() {
+            return Err(TeamError::TeamNotFound(team_id.to_owned()));
+        }
+        let live_roster = session.scheduler().list_agents().await;
+        let current_slots = live_roster
             .iter()
             .map(|agent| agent.slot_id.as_str())
             .collect::<HashSet<_>>();
@@ -2013,7 +2029,7 @@ impl TeamSessionService {
         }
 
         self.broadcast_session_status(user_id, team_id, TeamSessionStatus::Ready, None, |payload| {
-            payload.server_count = Some(current_agents.len());
+            payload.server_count = Some(live_roster.len());
         });
         Ok(())
     }
@@ -5322,6 +5338,94 @@ mod tests {
         // The raw team id is never a key (that is the collision being removed).
         assert!(!svc.sessions.contains_key(&team_id), "no session keyed by team_id");
         assert_eq!(svc.session_count_for_test(), 2, "two engagement sessions coexist");
+
+        svc.stop_sessions_for_user(user);
+    }
+
+    /// Task 3b — the `ensure_session` SERVICE boundary is the integration point:
+    /// a project-bound team with NO pre-seeded members must have its engagement
+    /// members materialized and its scheduler (and the attach/reconcile/broadcast
+    /// roster) driven by the engagement's runtime `slot_id`/`conversation_id`,
+    /// never the shared `teams.agents` template. A second `ensure_session` runs the
+    /// reconcile path and must NOT duplicate the template identity into the merged
+    /// scheduler. Real `SqliteTeamRepository` so engagement ids/members are minted.
+    #[tokio::test]
+    async fn ensure_session_drives_scheduler_from_engagement_members() {
+        use aionui_db::{SqliteTeamRepository, UpdateTeamParams, init_database_memory};
+
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+        let svc = setup_with_team_repo(repo.clone());
+        let user = "user-test";
+
+        let created = svc
+            .create_team(user, single_agent_team_request("Roster Isolation"))
+            .await
+            .unwrap();
+        let team_id = created.id.clone();
+        let template_slot = created.assistants[0].slot_id.clone();
+        let template_conv = created.assistants[0].conversation_id.clone();
+
+        // Bind to a project without pre-materializing members.
+        repo.update_team(
+            user,
+            &team_id,
+            &UpdateTeamParams {
+                project_id: Some("proj-a".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.ensure_session(user, &team_id).await.unwrap();
+
+        let engagement = repo
+            .find_or_create_engagement(user, &team_id, "proj-a", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+
+        // Materialization happened at the boundary (no members were seeded first).
+        let members = repo.list_engagement_members(user, &engagement).await.unwrap();
+        assert_eq!(members.len(), 1, "member materialized at ensure_session boundary");
+        assert_ne!(
+            members[0].slot_id, template_slot,
+            "materialized member carries a fresh runtime slot"
+        );
+        assert_ne!(
+            members[0].conversation_id, template_conv,
+            "materialized member carries a fresh runtime conversation"
+        );
+
+        let session = svc
+            .sessions
+            .get(&engagement)
+            .map(|entry| Arc::clone(&entry.session))
+            .expect("session keyed by engagement");
+        let roster = session.scheduler().list_agents().await;
+        assert_eq!(roster.len(), 1, "single-member roster preserved");
+        assert_eq!(
+            roster[0].slot_id, members[0].slot_id,
+            "scheduler carries the engagement runtime slot"
+        );
+        assert_eq!(
+            roster[0].conversation_id, members[0].conversation_id,
+            "scheduler carries the engagement runtime conversation"
+        );
+        assert_ne!(
+            roster[0].slot_id, template_slot,
+            "no template identity in the scheduler"
+        );
+
+        // Second ensure_session exercises the reconcile path. The template identity
+        // must not be (re)injected; the roster stays the single engagement member.
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let roster2 = session.scheduler().list_agents().await;
+        assert_eq!(roster2.len(), 1, "reconcile did not add a template-identity duplicate");
+        assert!(
+            roster2.iter().all(|a| a.slot_id != template_slot),
+            "no template slot leaked into the scheduler after reconcile"
+        );
 
         svc.stop_sessions_for_user(user);
     }

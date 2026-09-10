@@ -13,7 +13,7 @@ use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::DbError;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -245,10 +245,10 @@ impl TeamSession {
             Ok(m) if !m.is_empty() => m,
             Ok(_) => return template_agents.to_vec(),
             Err(err) => {
-                debug!(
+                warn!(
                     engagement_id,
                     error = %err,
-                    "engagement member read unavailable; falling back to template agents"
+                    "engagement member read failed; falling back to template agents"
                 );
                 return template_agents.to_vec();
             }
