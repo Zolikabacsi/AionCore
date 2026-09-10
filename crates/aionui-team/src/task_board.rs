@@ -85,6 +85,10 @@ impl TaskBoard {
         blocked_by: &[String],
     ) -> Result<TeamTask, TeamError> {
         for dep_id in blocked_by {
+            // `create_task` is engagement-gated upstream: the dep loop below
+            // (via `find_task`) rejects a dependency outside this engagement,
+            // so the `blocks` edge we append can only ever point at an
+            // in-engagement task.
             let dep = self.find_task(team_id, dep_id).await?;
             if dep.is_none() {
                 return Err(TeamError::BlockedTaskNotFound(dep_id.clone()));
@@ -127,6 +131,11 @@ impl TaskBoard {
         Ok(task)
     }
 
+    /// Updates a task. When the board is pinned to an engagement, the
+    /// `find_task` gate below rejects any task outside that engagement with
+    /// `TaskNotFound` before the repo mutation runs, so the update is
+    /// engagement-scoped even though the repo call stays `team_id`-scoped
+    /// (task ids are globally unique — the read-gate is the invariant).
     pub async fn update_task(&self, team_id: &str, task_id: &str, update: &TaskUpdate) -> Result<TeamTask, TeamError> {
         let existing = self
             .find_task(team_id, task_id)
@@ -172,6 +181,18 @@ impl TaskBoard {
         Ok(tasks)
     }
 
+    /// Unblocks every downstream task listed in `completed_row.blocks`.
+    ///
+    /// Engagement scoping (defense-in-depth): task ids are globally unique, so
+    /// the board's engagement read-gate (`find_task`) is the actual invariant.
+    /// The completing task reached here only through an engagement-gated
+    /// `find_task` (see [`TaskBoard::update_task`]), and every id in `blocks`
+    /// was appended by [`TaskBoard::create_task`] after its dependency loop
+    /// validated that dep via the same gate — so `blocks` is in-engagement by
+    /// construction. We still re-check each downstream id through `find_task`
+    /// before mutating it, so a hand-crafted cross-engagement edge can never
+    /// unblock a task outside this engagement. No-engagement boards (unit
+    /// tests) keep the legacy team-wide find, so behavior is unchanged.
     async fn check_unblocks(
         &self,
         team_id: &str,
@@ -180,6 +201,16 @@ impl TaskBoard {
     ) -> Result<(), TeamError> {
         let blocks: Vec<String> = serde_json::from_str(&completed_row.blocks)?;
         for downstream_id in &blocks {
+            // Engagement gate: skip downstream tasks that are not visible to
+            // this board's engagement (out-of-engagement rows read as `None`).
+            if self.find_task(team_id, downstream_id).await?.is_none() {
+                debug!(
+                    completed = completed_task_id,
+                    skipped = %downstream_id,
+                    "skipping out-of-engagement downstream task on unblock"
+                );
+                continue;
+            }
             self.repo
                 .remove_from_blocked_by(&self.user_id, team_id, downstream_id, completed_task_id)
                 .await?;

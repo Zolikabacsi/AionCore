@@ -12,15 +12,18 @@
 use std::sync::Arc;
 
 use aionui_common::now_ms;
+use aionui_db::models::{TeamRow, TeamTaskRow};
 use aionui_db::{ITeamRepository, SqliteTeamRepository, init_database_memory};
-use aionui_team::{TaskBoard, TaskStatus, TaskUpdate};
+use aionui_team::{TaskBoard, TaskStatus, TaskUpdate, TeamError};
 
-async fn setup() -> (TaskBoard, aionui_db::Database) {
+const USER: &str = "system_default_user";
+
+async fn repo_with_team() -> (Arc<SqliteTeamRepository>, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
-    repo.create_team(&aionui_db::models::TeamRow {
+    repo.create_team(&TeamRow {
         id: "t1".to_owned(),
-        user_id: "system_default_user".to_owned(),
+        user_id: USER.to_owned(),
         name: "t1".to_owned(),
         workspace: String::new(),
         workspace_mode: "shared".to_owned(),
@@ -35,7 +38,32 @@ async fn setup() -> (TaskBoard, aionui_db::Database) {
     })
     .await
     .unwrap();
+    (repo, db)
+}
+
+async fn setup() -> (TaskBoard, aionui_db::Database) {
+    let (repo, db) = repo_with_team().await;
     (TaskBoard::new(repo as Arc<dyn ITeamRepository>), db)
+}
+
+/// Builds a raw task row so a test can plant a dependency edge that the
+/// engagement-gated `create_task` path could never produce.
+fn task_row(id: &str, engagement: Option<&str>, blocked_by: &[String], blocks: &[String]) -> TeamTaskRow {
+    let now = now_ms();
+    TeamTaskRow {
+        id: id.to_owned(),
+        team_id: "t1".to_owned(),
+        subject: id.to_owned(),
+        description: None,
+        status: "pending".to_owned(),
+        owner: None,
+        blocked_by: serde_json::to_string(blocked_by).unwrap(),
+        blocks: serde_json::to_string(blocks).unwrap(),
+        metadata: None,
+        created_at: now,
+        updated_at: now,
+        engagement_id: engagement.map(str::to_owned),
+    }
 }
 
 // -- TK: Create tasks ---------------------------------------------------------
@@ -336,4 +364,89 @@ async fn dc4_blocked_by_blocks_bidirectional_consistency() {
     let b_found = tasks.iter().find(|t| t.id == b.id).unwrap();
     assert!(a_found.blocks.contains(&b.id));
     assert!(b_found.blocked_by.contains(&a.id));
+}
+
+// -- Engagement-scoped mutations (Phase 2b Task 3d, defense-in-depth) ---------
+
+/// A board pinned to engagement E1 must reject an update to a task that belongs
+/// to a sibling engagement E2 of the same team (read-gate -> TaskNotFound),
+/// and must leave that task byte-identical.
+#[tokio::test]
+async fn engagement_update_rejects_cross_engagement_task() {
+    let (repo, _db) = repo_with_team().await;
+    let e1 = repo
+        .find_or_create_engagement(USER, "t1", "proj-a", "/ws/a")
+        .await
+        .unwrap();
+    let e2 = repo
+        .find_or_create_engagement(USER, "t1", "proj-b", "/ws/b")
+        .await
+        .unwrap();
+
+    let board1 = TaskBoard::new(repo.clone() as Arc<dyn ITeamRepository>).with_engagement(e1.id.as_str());
+    let task = board1.create_task("t1", "InE1", None, None, &[]).await.unwrap();
+
+    let board2 = TaskBoard::new(repo.clone() as Arc<dyn ITeamRepository>).with_engagement(e2.id.as_str());
+    let result = board2
+        .update_task(
+            "t1",
+            &task.id,
+            &TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(TeamError::TaskNotFound(_))),
+        "cross-engagement update must be rejected"
+    );
+
+    let still = repo
+        .find_task_by_engagement(USER, &e1.id, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.status, "pending", "E1 task must be unmutated");
+}
+
+/// Completing a task must not unblock a downstream task that lives in a
+/// different engagement. The edge (C.blocks -> D) is hand-planted because the
+/// engagement-gated `create_task` dependency loop could never build it.
+#[tokio::test]
+async fn engagement_unblock_skips_cross_engagement_downstream() {
+    let (repo, _db) = repo_with_team().await;
+    let e1 = repo
+        .find_or_create_engagement(USER, "t1", "proj-a", "/ws/a")
+        .await
+        .unwrap();
+    let e2 = repo
+        .find_or_create_engagement(USER, "t1", "proj-b", "/ws/b")
+        .await
+        .unwrap();
+
+    let c = task_row("C", Some(&e1.id), &[], &["D".to_owned()]);
+    let d = task_row("D", Some(&e2.id), &["C".to_owned()], &[]);
+    repo.create_task(USER, &c).await.unwrap();
+    repo.create_task(USER, &d).await.unwrap();
+
+    let board1 = TaskBoard::new(repo.clone() as Arc<dyn ITeamRepository>).with_engagement(e1.id.as_str());
+    board1
+        .update_task(
+            "t1",
+            "C",
+            &TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // C is done, but D belongs to E2 -> its blocked_by must be untouched.
+    let d_after = repo.find_task_by_engagement(USER, &e2.id, "D").await.unwrap().unwrap();
+    assert_eq!(
+        d_after.blocked_by, r#"["C"]"#,
+        "cross-engagement downstream must not be unblocked"
+    );
 }
