@@ -924,9 +924,13 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
+        // Engagement-keyed membership lock: resolve the active engagement from
+        // the team's project binding first, then hold that engagement's lock for
+        // the read (and the lazy project-bind backfill below).
+        let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(engagement)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -967,8 +971,6 @@ impl TeamSessionService {
         // the live aggregate), so it never blocks deletion.
         self.remove_team_order_row(user_id, team_id).await;
 
-        self.add_agent_locks.remove(team_id);
-
         info!(team_id = %team_id, "Team removed");
         self.broadcast_team_removed(user_id, team_id);
         Ok(())
@@ -979,7 +981,9 @@ impl TeamSessionService {
     /// and `stop_team_processes` (archive, which keeps them). Best-effort: a
     /// stuck kill is bounded by a 3s timeout, mirroring the delete path.
     async fn stop_team_runtime_and_agents(&self, team_id: &str, team: &Team, reason: AgentKillReason) {
-        self.stop_session_unchecked(team_id);
+        // Stop every engagement's live session for this team and drop its
+        // membership/ensure lock entries (maps are engagement-keyed now).
+        self.stop_sessions_for_team(team_id);
 
         let kill_futures: Vec<_> = team
             .agents
@@ -1077,9 +1081,10 @@ impl TeamSessionService {
         team_id: &str,
         req: AddAgentRequest,
     ) -> Result<TeamAgentResponse, TeamError> {
+        let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(engagement.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1088,7 +1093,7 @@ impl TeamSessionService {
         let mut team = Team::from_row(&row)?;
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
-        if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
+        if let Some(session) = self.sessions.get(&engagement).map(|e| Arc::clone(&e.session)) {
             let reservation = session.reserve_dynamic_member_attach(&agent);
             session.add_manual_agent(&agent).await?;
             let service = self
@@ -1133,9 +1138,10 @@ impl TeamSessionService {
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(engagement.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let (removed, session, removal_lease) = {
@@ -1150,7 +1156,7 @@ impl TeamSessionService {
             if removed.role == crate::types::TeammateRole::Lead {
                 return Err(TeamError::InvalidRequest("cannot remove the team lead".into()));
             }
-            let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+            let session = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session));
             let removal = session
                 .as_ref()
                 .map(|session| session.member_runtimes().begin_remove(slot_id));
@@ -1219,7 +1225,7 @@ impl TeamSessionService {
             return Err(error.into());
         }
 
-        let published_session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let published_session = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session));
         let active_session = if let Some(current) = published_session {
             let current_removal_lease = if session.as_ref().is_some_and(|captured| Arc::ptr_eq(captured, &current)) {
                 removal_lease
@@ -1293,9 +1299,10 @@ impl TeamSessionService {
     }
 
     pub async fn rename_agent(&self, user_id: &str, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
+        let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(engagement.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1337,7 +1344,7 @@ impl TeamSessionService {
             )
             .await?;
 
-        if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {
+        if let Some(session) = self.sessions.get(&engagement).map(|e| Arc::clone(&e.session)) {
             let _ = session.rename_agent(slot_id, name).await;
         }
 
@@ -1376,9 +1383,10 @@ impl TeamSessionService {
         model: &str,
         trigger: ModelPersistTrigger,
     ) -> Result<(), TeamError> {
+        let engagement = self.engagement_key(user_id, team_id).await?;
         let lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(engagement.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
@@ -1418,7 +1426,7 @@ impl TeamSessionService {
             )
             .await?;
 
-        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+        if let Some(session) = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session)) {
             session.update_agent_model(slot_id, model).await?;
         }
         info!(
@@ -1436,6 +1444,7 @@ impl TeamSessionService {
         &self,
         user_id: &str,
         team_id: &str,
+        engagement_key: &str,
         team: &mut Team,
     ) -> Result<(), TeamError> {
         let mut roster_changed = false;
@@ -1481,7 +1490,11 @@ impl TeamSessionService {
                 )
                 .await?;
         }
-        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+        if let Some(session) = self
+            .sessions
+            .get(engagement_key)
+            .map(|entry| Arc::clone(&entry.session))
+        {
             for (slot_id, model) in &repaired {
                 session.update_agent_model(slot_id, model).await?;
             }
@@ -1516,9 +1529,21 @@ impl TeamSessionService {
     }
 
     async fn ensure_session_inner(&self, team_id: &str, requested_user_id: Option<&str>) -> Result<(), TeamError> {
+        // Runtime maps are keyed by the team's ACTIVE engagement (not team_id) so
+        // two projects' sessions of one team do not collide. This cheap pre-read
+        // only derives that key so the membership lock can be engagement-keyed;
+        // the authoritative roster is still read under the lock below.
+        let engagement = match self.repo.get_team_for_restore(team_id).await.ok().flatten() {
+            Some(row) => match Team::from_row(&row) {
+                Ok(team) => TeamSession::resolve_engagement_id(&self.repo, &row.user_id, &team).await,
+                Err(_) => team_id.to_owned(),
+            },
+            None => team_id.to_owned(),
+        };
+
         let membership_lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(engagement.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let membership_guard = membership_lock.lock().await;
@@ -1556,34 +1581,35 @@ impl TeamSessionService {
         };
         let user_id = row.user_id.clone();
         let mut team = Team::from_row(&row)?;
-        self.reconcile_legacy_team_models(&user_id, team_id, &mut team).await?;
+        self.reconcile_legacy_team_models(&user_id, team_id, &engagement, &mut team)
+            .await?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
 
-        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+        if let Some(session) = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session)) {
             let work = self
                 .reserve_member_runtime_reconciliation(&session, &agents_snapshot)
                 .await?;
             drop(membership_guard);
             return self
-                .complete_member_runtime_reconciliation(team_id, &user_id, session, work)
+                .complete_member_runtime_reconciliation(team_id, &engagement, &user_id, session, work)
                 .await;
         }
 
         let lock = self
             .ensure_session_locks
-            .entry(team_id.to_owned())
+            .entry(engagement.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let ensure_guard = lock.lock().await;
 
-        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+        if let Some(session) = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session)) {
             let work = self
                 .reserve_member_runtime_reconciliation(&session, &agents_snapshot)
                 .await?;
             drop(membership_guard);
             drop(ensure_guard);
             return self
-                .complete_member_runtime_reconciliation(team_id, &user_id, session, work)
+                .complete_member_runtime_reconciliation(team_id, &engagement, &user_id, session, work)
                 .await;
         }
 
@@ -1679,7 +1705,7 @@ impl TeamSessionService {
             session: session.clone(),
             slow_monitor_handle,
         };
-        self.sessions.insert(team_id.to_owned(), entry);
+        self.sessions.insert(engagement.clone(), entry);
         drop(membership_guard);
         drop(ensure_guard);
 
@@ -1715,7 +1741,7 @@ impl TeamSessionService {
                     |p| p.error = Some(failure.public_reason.clone()),
                 );
                 session.stop();
-                self.sessions.remove(team_id);
+                self.sessions.remove(&engagement);
                 return Err(TeamError::MemberRuntimeFailed {
                     team_id: team_id.to_owned(),
                     slot_id: leader.slot_id.clone(),
@@ -1725,7 +1751,7 @@ impl TeamSessionService {
             }
             AttachOutcome::SessionStopped => {
                 session.stop();
-                self.sessions.remove(team_id);
+                self.sessions.remove(&engagement);
                 return Err(TeamError::InvalidRequest(
                     "team session stopped during leader warmup".to_owned(),
                 ));
@@ -1842,6 +1868,7 @@ impl TeamSessionService {
     async fn complete_member_runtime_reconciliation(
         &self,
         team_id: &str,
+        engagement_key: &str,
         user_id: &str,
         session: Arc<TeamSession>,
         work: Vec<MemberRuntimeReconcileWork>,
@@ -1883,7 +1910,7 @@ impl TeamSessionService {
 
         let membership_lock = self
             .add_agent_locks
-            .entry(team_id.to_owned())
+            .entry(engagement_key.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
@@ -1897,7 +1924,7 @@ impl TeamSessionService {
             .collect::<HashSet<_>>();
         let current_session = self
             .sessions
-            .get(team_id)
+            .get(engagement_key)
             .ok_or_else(|| TeamError::SessionNotFound(team_id.to_owned()))?;
         if !Arc::ptr_eq(&current_session.session, &session) {
             return Err(TeamError::SessionNotFound(team_id.to_owned()));
@@ -1955,13 +1982,13 @@ impl TeamSessionService {
     ) {
         let lock = self
             .ensure_session_locks
-            .entry(captured_session.team_id().to_owned())
+            .entry(captured_session.engagement_id().to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
         if self
             .sessions
-            .get(captured_session.team_id())
+            .get(captured_session.engagement_id())
             .is_some_and(|entry| !std::ptr::eq(entry.session.as_ref(), captured_session))
         {
             return;
@@ -2072,8 +2099,11 @@ impl TeamSessionService {
     }
 
     fn member_runtime_is_starting(&self, team_id: &str, slot_id: &str) -> bool {
+        // Engagement-keyed map: scan by team (team_id-only check; the starting
+        // member belongs to the team's single active session).
         self.sessions
-            .get(team_id)
+            .iter()
+            .find(|entry| entry.session.team_id() == team_id)
             .and_then(|entry| entry.session.work_coordinator().slot_snapshot(slot_id))
             .is_some_and(|snapshot| matches!(snapshot.runtime_constraint, RuntimeConstraint::Starting { .. }))
     }
@@ -2221,12 +2251,17 @@ impl TeamSessionService {
     }
 
     pub async fn get_session_user_id(&self, team_id: &str) -> Option<String> {
-        self.sessions.get(team_id).map(|e| e.session.user_id().to_owned())
+        // Engagement-keyed map: resolve by team via scan. A team's engagements
+        // share one owner, so any match returns the right user.
+        self.sessions
+            .iter()
+            .find(|entry| entry.session.team_id() == team_id)
+            .map(|e| e.session.user_id().to_owned())
     }
 
     pub(crate) fn capture_published_session(&self, expected: &TeamSession) -> Option<Arc<TeamSession>> {
         self.sessions
-            .get(expected.team_id())
+            .get(expected.engagement_id())
             .and_then(|entry| std::ptr::eq(entry.session.as_ref(), expected).then(|| Arc::clone(&entry.session)))
     }
 
@@ -2238,7 +2273,7 @@ impl TeamSessionService {
         expected: &TeamSession,
         action: impl FnOnce(&TeamSession) -> R,
     ) -> Option<R> {
-        let entry = self.sessions.get(expected.team_id())?;
+        let entry = self.sessions.get(expected.engagement_id())?;
         std::ptr::eq(entry.session.as_ref(), expected).then(|| action(&entry.session))
     }
 
@@ -2284,7 +2319,7 @@ impl TeamSessionService {
     pub(crate) async fn refresh_member_runtime_status(&self, expected: &TeamSession) {
         let membership_lock = self
             .add_agent_locks
-            .entry(expected.team_id().to_owned())
+            .entry(expected.engagement_id().to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
@@ -2342,8 +2377,9 @@ impl TeamSessionService {
     }
 
     pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let engagement = TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await;
+        let session = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session));
         let Some(session) = session else {
             return Ok(TeamRunStateResponse {
                 session_generation: None,
@@ -2369,7 +2405,13 @@ impl TeamSessionService {
     }
 
     pub fn get_session_scheduler(&self, team_id: &str) -> Option<Arc<crate::scheduler::TeammateManager>> {
-        self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
+        // Engagement-keyed map: resolve by team via scan (team_id-only API; no
+        // user/project context to compute the engagement key from). Single-active
+        // behavior: one live session per team.
+        self.sessions
+            .iter()
+            .find(|entry| entry.session.team_id() == team_id)
+            .map(|e| e.session.scheduler().clone())
     }
 
     pub async fn resolve_team_tool_context(
@@ -2483,30 +2525,60 @@ impl TeamSessionService {
     }
 
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
-        self.stop_session_unchecked(team_id);
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let engagement = TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await;
+        self.stop_session_unchecked(&engagement);
         Ok(())
     }
 
     pub fn stop_sessions_for_user(&self, user_id: &str) -> usize {
-        let team_ids: Vec<String> = self
+        let keys: Vec<String> = self
             .sessions
             .iter()
             .filter(|entry| entry.session.user_id() == user_id)
             .map(|entry| entry.key().clone())
             .collect();
-        let stopped = team_ids.len();
-        for team_id in team_ids {
-            self.stop_session_unchecked(&team_id);
+        let stopped = keys.len();
+        for key in keys {
+            self.stop_session_unchecked(&key);
         }
         stopped
     }
 
-    fn stop_session_unchecked(&self, team_id: &str) {
-        if let Some((_, entry)) = self.sessions.remove(team_id) {
+    fn stop_session_unchecked(&self, engagement_key: &str) {
+        if let Some((_, entry)) = self.sessions.remove(engagement_key) {
             entry.slow_monitor_handle.abort();
             entry.session.stop();
         }
+    }
+
+    /// Resolve the runtime-map key for a team's ACTIVE engagement from its
+    /// project binding, using the same logic a `TeamSession` stamps on its own
+    /// writes: `team.project_id == None → team_id` (legacy sentinel), else the
+    /// find-or-create engagement id. Prefer `session.engagement_id()` wherever a
+    /// session is already loaded (avoids re-resolving / re-creating the row).
+    async fn engagement_key(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        Ok(TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await)
+    }
+
+    /// Stop every live session belonging to `team_id` (across all its
+    /// engagements now that the map is engagement-keyed) and drop the
+    /// engagement's membership/ensure lock entries so deletion does not leak
+    /// map entries. Returns the engagement keys touched.
+    fn stop_sessions_for_team(&self, team_id: &str) -> Vec<String> {
+        let keys: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.session.team_id() == team_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in &keys {
+            self.stop_session_unchecked(key);
+            self.add_agent_locks.remove(key);
+            self.ensure_session_locks.remove(key);
+        }
+        keys
     }
 
     pub async fn cleanup_idle_team_runtime_tasks(
@@ -2525,8 +2597,9 @@ impl TeamSessionService {
         let mut cleanup_teams = Vec::new();
 
         for entry in self.sessions.iter() {
-            let team_id = entry.key().clone();
+            let engagement_key = entry.key().clone();
             let session = Arc::clone(&entry.session);
+            let team_id = session.team_id().to_owned();
             let agents = session.scheduler().list_agents().await;
             let matched_idle_count = agents
                 .iter()
@@ -2572,10 +2645,10 @@ impl TeamSessionService {
                 continue;
             }
 
-            cleanup_teams.push((team_id, agents, matched_idle_count));
+            cleanup_teams.push((engagement_key, team_id, agents, matched_idle_count));
         }
 
-        for (team_id, agents, matched_idle_count) in cleanup_teams {
+        for (engagement_key, team_id, agents, matched_idle_count) in cleanup_teams {
             info!(
                 team_id,
                 matched_idle_count,
@@ -2583,7 +2656,7 @@ impl TeamSessionService {
                 "team idle cleanup stopping idle team session"
             );
             info!(team_id, reason = "idle_cleanup", "broadcasting team session stopped");
-            if let Some(entry) = self.sessions.get(&team_id) {
+            if let Some(entry) = self.sessions.get(&engagement_key) {
                 self.broadcast_session_status(
                     entry.session.user_id(),
                     &team_id,
@@ -2592,7 +2665,7 @@ impl TeamSessionService {
                     |_| {},
                 );
             }
-            self.stop_session_unchecked(&team_id);
+            self.stop_session_unchecked(&engagement_key);
             for agent in agents {
                 self.task_manager
                     .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::IdleTimeout))
@@ -2653,8 +2726,12 @@ impl TeamSessionService {
     }
 
     fn published_session(&self, team_id: &str) -> Result<Arc<TeamSession>, TeamError> {
+        // Engagement-keyed map: resolve by team via scan. The send/MCP paths that
+        // only carry `team_id` operate on the team's single active session
+        // (per-engagement routing needs the Phase-5 project selector).
         self.sessions
-            .get(team_id)
+            .iter()
+            .find(|entry| entry.session.team_id() == team_id)
             .map(|entry| Arc::clone(&entry.session))
             .ok_or_else(|| TeamError::SessionNotFound(team_id.to_owned()))
     }
@@ -2717,13 +2794,7 @@ impl TeamSessionService {
     pub async fn attach_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         let agent = session.scheduler().get_agent(slot_id).await?;
         let service = self
             .self_ref
@@ -2769,6 +2840,7 @@ impl TeamSessionService {
         allow_queued: bool,
     ) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
+        let engagement = TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await;
         let requested_agent = team
             .agents
             .iter()
@@ -2778,9 +2850,12 @@ impl TeamSessionService {
             self.ensure_session_inner(team_id, Some(user_id)).await?;
         }
         let session = {
-            let entry = self.sessions.get(team_id).ok_or_else(|| TeamError::RuntimeNotReady {
-                conversation_id: requested_agent.conversation_id.clone(),
-            })?;
+            let entry = self
+                .sessions
+                .get(&engagement)
+                .ok_or_else(|| TeamError::RuntimeNotReady {
+                    conversation_id: requested_agent.conversation_id.clone(),
+                })?;
             Arc::clone(&entry.session)
         };
         let agent = session.scheduler().get_agent(slot_id).await?;
@@ -2909,13 +2984,14 @@ impl TeamSessionService {
         slot_id: &str,
     ) -> Result<TeamContextResetResponse, TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
+        let engagement = TeamSession::resolve_engagement_id(&self.repo, user_id, &team).await;
         let agent = team
             .agents
             .iter()
             .find(|agent| agent.slot_id == slot_id)
             .cloned()
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
-        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let session = self.sessions.get(&engagement).map(|entry| Arc::clone(&entry.session));
         let capability = self
             .context_reset_capability_for_session(user_id, &agent, session.as_deref())
             .await?;
@@ -3168,13 +3244,7 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         session.cancel_run(team_run_id, target_slot_id, reason).await
     }
 
@@ -3188,13 +3258,7 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         session.cancel_child_turn(team_run_id, slot_id, reason).await
     }
 
@@ -3208,13 +3272,7 @@ impl TeamSessionService {
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         session.pause_slot_work(team_run_id, slot_id, reason).await
     }
 
@@ -3278,13 +3336,7 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         session
             .send_agent_message_from_agent(from_slot_id, to_slot_id, content, files)
             .await
@@ -3311,13 +3363,7 @@ impl TeamSessionService {
         target_slot_id: &str,
         reason: Option<String>,
     ) -> Result<(), TeamError> {
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
+        let session = self.published_session(team_id)?;
         session.shutdown_agent(caller_slot_id, target_slot_id, reason).await
     }
 
@@ -3327,14 +3373,8 @@ impl TeamSessionService {
         source_slot_id: &str,
         source: WorkSource,
     ) -> Result<(), TeamError> {
-        let entry = self
-            .sessions
-            .get(team_id)
-            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        entry
-            .session
-            .wake_leader_after_recovery_message(source_slot_id, source)
-            .await
+        let session = self.published_session(team_id)?;
+        session.wake_leader_after_recovery_message(source_slot_id, source).await
     }
 }
 
@@ -3380,7 +3420,7 @@ mod tests {
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
         setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster,
-        setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager,
+        setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager, setup_with_team_repo,
         single_agent_team_request,
     };
     use crate::types::MailboxMessageType;
@@ -4513,7 +4553,7 @@ mod tests {
         svc.ensure_session("user-test", &created.id).await.unwrap();
 
         let result = svc
-            .complete_member_runtime_reconciliation(&created.id, "user-test", old, Vec::new())
+            .complete_member_runtime_reconciliation(&created.id, &created.id, "user-test", old, Vec::new())
             .await;
         assert!(matches!(result, Err(crate::TeamError::SessionNotFound(_))));
     }
@@ -5163,5 +5203,81 @@ mod tests {
             .expect_err("team config options must reject cross-user access");
 
         assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
+    }
+
+    /// The `sessions` runtime map is keyed by the team's ACTIVE engagement, not
+    /// team_id: two engagements (distinct projects) of ONE team coexist under
+    /// distinct keys, and no entry is ever placed under the raw team id. Uses a
+    /// real `SqliteTeamRepository` so `find_or_create_engagement` mints distinct
+    /// engagement ids (the mock repos cannot, which is why they fall back to
+    /// `team_id`).
+    #[tokio::test]
+    async fn session_map_is_keyed_by_engagement_not_team() {
+        use aionui_db::{SqliteTeamRepository, UpdateTeamParams, init_database_memory};
+
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+        let svc = setup_with_team_repo(repo.clone());
+        let user = "user-test";
+
+        let created = svc
+            .create_team(user, single_agent_team_request("Engaged"))
+            .await
+            .unwrap();
+        let team_id = created.id.clone();
+
+        // Bind the team to project A, then start its session.
+        repo.update_team(
+            user,
+            &team_id,
+            &UpdateTeamParams {
+                project_id: Some("proj-a".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let eng_a = repo
+            .find_or_create_engagement(user, &team_id, "proj-a", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+
+        // Re-bind to project B and start that engagement's session too.
+        repo.update_team(
+            user,
+            &team_id,
+            &UpdateTeamParams {
+                project_id: Some("proj-b".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.ensure_session(user, &team_id).await.unwrap();
+        let eng_b = repo
+            .find_or_create_engagement(user, &team_id, "proj-b", &created.workspace)
+            .await
+            .unwrap()
+            .id;
+
+        assert_ne!(eng_a, eng_b, "distinct projects mint distinct engagements");
+        assert_ne!(eng_a, team_id);
+        assert_ne!(eng_b, team_id);
+        // Both engagements are representable independently in the session map.
+        assert!(
+            svc.sessions.contains_key(&eng_a),
+            "engagement A session keyed by its id"
+        );
+        assert!(
+            svc.sessions.contains_key(&eng_b),
+            "engagement B session keyed by its id"
+        );
+        // The raw team id is never a key (that is the collision being removed).
+        assert!(!svc.sessions.contains_key(&team_id), "no session keyed by team_id");
+        assert_eq!(svc.session_count_for_test(), 2, "two engagement sessions coexist");
+
+        svc.stop_sessions_for_user(user);
     }
 }

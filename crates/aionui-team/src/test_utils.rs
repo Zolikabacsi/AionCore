@@ -1973,6 +1973,36 @@ pub(crate) mod workspace_harness {
         (svc, team_repo, task_manager, conv_repo, broadcaster)
     }
 
+    /// Build a [`TeamSessionService`] backed by a caller-supplied team repository
+    /// (e.g. a real `SqliteTeamRepository`, so `find_or_create_engagement` mints
+    /// distinct engagement ids for project-bound teams) wired to the same no-op
+    /// ports as the mock harness. Leader attach is driven by the fake conversation
+    /// port, so `ensure_session` succeeds without spawning real agent processes.
+    pub(crate) fn setup_with_team_repo(team_repo: Arc<dyn ITeamRepository>) -> Arc<TeamSessionService> {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster;
+        let conv_repo = Arc::new(MockConversationRepo::new());
+        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo));
+        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+        TeamSessionService::new(
+            team_repo,
+            Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            conversation_port,
+            projection_store,
+            broadcaster_dyn,
+            task_manager,
+            Arc::new(NoopTurnPort),
+            Arc::new(NoopCancellationPort),
+            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        )
+    }
+
     pub(crate) async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
         repo.update_team(
             "user1",

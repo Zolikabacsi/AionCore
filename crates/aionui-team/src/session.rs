@@ -188,7 +188,7 @@ impl TeamSession {
     ///
     /// Falls back to `team.id` if the repository can't resolve an engagement
     /// (test doubles whose `find_or_create_engagement` is unimplemented).
-    async fn resolve_engagement_id(repo: &Arc<dyn ITeamRepository>, user_id: &str, team: &Team) -> String {
+    pub(crate) async fn resolve_engagement_id(repo: &Arc<dyn ITeamRepository>, user_id: &str, team: &Team) -> String {
         let Some(project_id) = team.project_id.clone() else {
             return team.id.clone();
         };
