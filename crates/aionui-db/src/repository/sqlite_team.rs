@@ -22,6 +22,7 @@ impl ITeamRepository for SqliteTeamRepository {
     // ── Team CRUD ────────────────────────────────────────────────────
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -39,8 +40,28 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.updated_at)
         .bind(&row.project_id)
         .bind(&row.folder_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // Every team owns a default (sentinel) engagement row with id == team_id and
+        // the reserved project, mirroring migration 045's backfill shape. Engagement-
+        // scoped runtime reads (peek_unread_by_engagement, list_*_by_engagement) are
+        // gated on `EXISTS(team_engagements …)`; without this row a newly created
+        // no-project team could never see its own mailbox/task rows.
+        sqlx::query(
+            "INSERT OR IGNORE INTO team_engagements \
+             (id, user_id, team_id, project_id, workspace, process, status, created_at, updated_at) \
+             VALUES (?, ?, ?, COALESCE(?, '__none__'), ?, 'hierarchical', 'active', ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.id)
+        .bind(&row.project_id)
+        .bind(&row.workspace)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
