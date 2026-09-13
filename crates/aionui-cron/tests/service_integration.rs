@@ -235,6 +235,18 @@ impl StubConvRepo {
 
 #[async_trait::async_trait]
 impl IConversationRepository for StubConvRepo {
+    async fn raw_query(
+        &self,
+        _sql: &str,
+        _params: Vec<String>,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>, aionui_db::DbError> {
+        unimplemented!("raw_query is not used by the cron service integration tests")
+    }
+
+    async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, aionui_db::DbError> {
+        unimplemented!("raw_execute is not used by the cron service integration tests")
+    }
+
     async fn get(
         &self,
         user_id: &str,

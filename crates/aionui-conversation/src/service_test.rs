@@ -265,6 +265,16 @@ async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> V
 
 #[async_trait::async_trait]
 impl IConversationRepository for MockRepo {
+    async fn raw_query(
+        &self,
+        _sql: &str,
+        _params: Vec<String>,
+    ) -> Result<Vec<sqlx::sqlite::SqliteRow>, aionui_db::DbError> {
+        unimplemented!("raw_query unused by these tests")
+    }
+    async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, aionui_db::DbError> {
+        unimplemented!("raw_execute unused by these tests")
+    }
     async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, aionui_db::DbError> {
         let rows = self.rows.lock().unwrap();
         Ok(rows.iter().find(|r| r.user_id == user_id && r.id == id).cloned())

@@ -3154,6 +3154,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for RecordingRepo {
+        async fn raw_query(&self, _sql: &str, _params: Vec<String>) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
+            unimplemented!("raw_query unused by these tests")
+        }
+        async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, DbError> {
+            unimplemented!("raw_execute unused by these tests")
+        }
         async fn get(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
             Ok(self.conversation.lock().unwrap().clone())
         }
