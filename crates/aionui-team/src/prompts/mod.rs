@@ -197,6 +197,9 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            expected_output: None,
+            result: None,
+            input_context: None,
         }
     }
 

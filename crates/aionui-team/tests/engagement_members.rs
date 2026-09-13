@@ -623,7 +623,11 @@ async fn concurrent_engagement_sessions_share_no_mail_or_board_state() {
     );
 
     // Task on P1's board.
-    let task1 = sess1.scheduler().create_task("p1 ship", None, None, &[]).await.unwrap();
+    let task1 = sess1
+        .scheduler()
+        .create_task("p1 ship", None, None, &[], None)
+        .await
+        .unwrap();
     let stored = h
         .repo
         .find_task_by_id(user, &team.id, &task1.id)

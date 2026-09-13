@@ -83,6 +83,7 @@ impl TaskBoard {
         description: Option<&str>,
         owner: Option<&str>,
         blocked_by: &[String],
+        expected_output: Option<&str>,
     ) -> Result<TeamTask, TeamError> {
         for dep_id in blocked_by {
             // `create_task` is engagement-gated upstream: the dep loop below
@@ -112,6 +113,9 @@ impl TaskBoard {
             created_at: now,
             updated_at: now,
             engagement_id: self.engagement_id.clone(),
+            expected_output: expected_output.map(str::to_owned),
+            result: None,
+            input_context: None,
         };
 
         self.repo.create_task(&self.user_id, &row).await?;
@@ -286,7 +290,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let (board, bc) = board_with_events(repo);
 
-        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        let task = board.create_task("t1", "Build", None, None, &[], None).await.unwrap();
 
         let changes = task_changes(&bc);
         assert_eq!(changes.len(), 1);
@@ -300,7 +304,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let (board, bc) = board_with_events(repo);
 
-        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        let task = board.create_task("t1", "Build", None, None, &[], None).await.unwrap();
         board
             .update_task(
                 "t1",
@@ -327,9 +331,9 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let (board, bc) = board_with_events(repo);
 
-        let a = board.create_task("t1", "A", None, None, &[]).await.unwrap();
+        let a = board.create_task("t1", "A", None, None, &[], None).await.unwrap();
         let b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&a.id))
+            .create_task("t1", "B", None, None, std::slice::from_ref(&a.id), None)
             .await
             .unwrap();
 
@@ -362,7 +366,7 @@ mod tests {
     async fn no_emitter_does_not_panic_and_emits_nothing() {
         let repo = Arc::new(MockTeamRepo::new());
         let board = TaskBoard::new(repo);
-        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        let task = board.create_task("t1", "Build", None, None, &[], None).await.unwrap();
         board
             .update_task(
                 "t1",
@@ -380,7 +384,10 @@ mod tests {
     // -- Helper ---------------------------------------------------------------
 
     async fn create_simple_task(board: &TaskBoard, team_id: &str, subject: &str) -> TeamTask {
-        board.create_task(team_id, subject, None, None, &[]).await.unwrap()
+        board
+            .create_task(team_id, subject, None, None, &[], None)
+            .await
+            .unwrap()
     }
 
     // -- Tests ----------------------------------------------------------------
@@ -403,7 +410,7 @@ mod tests {
         let board = TaskBoard::new(repo);
 
         let task = board
-            .create_task("t1", "Design API", Some("REST endpoints"), Some("a1"), &[])
+            .create_task("t1", "Design API", Some("REST endpoints"), Some("a1"), &[], None)
             .await
             .unwrap();
         assert_eq!(task.description.as_deref(), Some("REST endpoints"));
@@ -417,7 +424,7 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "Task A").await;
         let task_b = board
-            .create_task("t1", "Task B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "Task B", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
 
@@ -437,7 +444,9 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let board = TaskBoard::new(repo);
 
-        let result = board.create_task("t1", "X", None, None, &["nonexistent".into()]).await;
+        let result = board
+            .create_task("t1", "X", None, None, &["nonexistent".into()], None)
+            .await;
         assert!(matches!(result, Err(TeamError::BlockedTaskNotFound(_))));
     }
 
@@ -499,7 +508,7 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
 
@@ -529,11 +538,11 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
         let task_c = board
-            .create_task("t1", "C", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "C", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
 
@@ -564,7 +573,7 @@ mod tests {
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_x = create_simple_task(&board, "t1", "X").await;
         let task_b = board
-            .create_task("t1", "B", None, None, &[task_a.id.clone(), task_x.id.clone()])
+            .create_task("t1", "B", None, None, &[task_a.id.clone(), task_x.id.clone()], None)
             .await
             .unwrap();
 

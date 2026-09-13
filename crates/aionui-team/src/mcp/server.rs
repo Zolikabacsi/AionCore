@@ -1177,6 +1177,7 @@ async fn exec_task_create(
             input.description.as_deref(),
             input.owner.as_deref(),
             &input.blocked_by.unwrap_or_default(),
+            None,
         )
         .await
         .map_err(|e| ToolCallError::from_message(e.to_string()))?;
@@ -1600,6 +1601,9 @@ mod tests {
             metadata: None,
             created_at: 1,
             updated_at: 1,
+            expected_output: None,
+            result: None,
+            input_context: None,
         }
     }
 

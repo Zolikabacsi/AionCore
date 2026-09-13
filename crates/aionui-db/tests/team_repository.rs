@@ -82,6 +82,9 @@ fn make_task(id: &str, team_id: &str, subject: &str) -> TeamTaskRow {
         created_at: now,
         updated_at: now,
         engagement_id: None,
+        expected_output: None,
+        result: None,
+        input_context: None,
     }
 }
 

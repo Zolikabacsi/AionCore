@@ -775,6 +775,12 @@ pub struct TeamTaskResponse {
     pub blocks: Vec<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_context: Option<String>,
 }
 
 /// Discriminates a unified activity item.

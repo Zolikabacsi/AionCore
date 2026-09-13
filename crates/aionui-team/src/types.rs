@@ -282,6 +282,12 @@ pub struct TeamTask {
     pub metadata: Option<serde_json::Value>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +384,9 @@ impl TeamTask {
             metadata,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            expected_output: row.expected_output.clone(),
+            result: row.result.clone(),
+            input_context: row.input_context.clone(),
         })
     }
 }
@@ -878,6 +887,9 @@ mod tests {
             created_at: 1000,
             updated_at: 2000,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::InProgress);
@@ -901,6 +913,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -924,6 +939,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -944,6 +962,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         assert!(TeamTask::from_row(&row).is_err());
     }

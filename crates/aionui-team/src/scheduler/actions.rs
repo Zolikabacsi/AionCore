@@ -9,9 +9,10 @@ impl TeammateManager {
         description: Option<&str>,
         owner: Option<&str>,
         blocked_by: &[String],
+        expected_output: Option<&str>,
     ) -> Result<crate::types::TeamTask, TeamError> {
         self.task_board
-            .create_task(&self.team_id, subject, description, owner, blocked_by)
+            .create_task(&self.team_id, subject, description, owner, blocked_by, expected_output)
             .await
     }
 

@@ -99,7 +99,7 @@ async fn aw1_wake_idle_agent_transitions_to_working_with_payload() {
     let h = setup_team(&agents);
 
     h.task_board
-        .create_task("team-1", "Task A", None, Some("w1"), &[])
+        .create_task("team-1", "Task A", None, Some("w1"), &[], None)
         .await
         .unwrap();
 

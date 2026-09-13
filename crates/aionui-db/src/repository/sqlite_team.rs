@@ -476,8 +476,9 @@ impl ITeamRepository for SqliteTeamRepository {
         let result = sqlx::query(
             "INSERT INTO team_tasks \
                 (id, team_id, subject, description, status, owner, \
-                 blocked_by, blocks, metadata, created_at, updated_at, engagement_id) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                 blocked_by, blocks, metadata, created_at, updated_at, engagement_id, \
+                 expected_output, result, input_context) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
         )
         .bind(&row.id)
@@ -492,6 +493,9 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.created_at)
         .bind(row.updated_at)
         .bind(row.engagement_id.as_deref())
+        .bind(row.expected_output.as_deref())
+        .bind(row.result.as_deref())
+        .bind(row.input_context.as_deref())
         .bind(&row.team_id)
         .bind(user_id)
         .execute(&self.pool)

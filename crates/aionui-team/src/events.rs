@@ -522,6 +522,9 @@ mod tests {
                 blocks: vec![],
                 created_at: 1,
                 updated_at: 1,
+                expected_output: None,
+                result: None,
+                input_context: None,
             },
             TeamTaskChange::Created,
         );

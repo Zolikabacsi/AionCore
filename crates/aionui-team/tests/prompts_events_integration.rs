@@ -470,6 +470,9 @@ fn wp2_wake_payload_includes_task_list() {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            expected_output: None,
+            result: None,
+            input_context: None,
         },
         TeamTask {
             id: "bbbbbbbb-1111-2222-3333-444444444444".into(),
@@ -483,6 +486,9 @@ fn wp2_wake_payload_includes_task_list() {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            expected_output: None,
+            result: None,
+            input_context: None,
         },
     ];
     let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]));

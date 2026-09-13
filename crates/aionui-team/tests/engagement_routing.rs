@@ -204,7 +204,7 @@ async fn session_task_and_mail_carry_active_engagement() {
 
     let task = session
         .scheduler()
-        .create_task("Ship it", None, None, &[])
+        .create_task("Ship it", None, None, &[], None)
         .await
         .unwrap();
     let mail = session
@@ -260,8 +260,16 @@ async fn two_projects_key_to_distinct_engagements() {
     assert_eq!(sess_b.engagement_id(), eng_b);
     assert_ne!(sess_a.engagement_id(), sess_b.engagement_id());
 
-    let task_a = sess_a.scheduler().create_task("A task", None, None, &[]).await.unwrap();
-    let task_b = sess_b.scheduler().create_task("B task", None, None, &[]).await.unwrap();
+    let task_a = sess_a
+        .scheduler()
+        .create_task("A task", None, None, &[], None)
+        .await
+        .unwrap();
+    let task_b = sess_b
+        .scheduler()
+        .create_task("B task", None, None, &[], None)
+        .await
+        .unwrap();
     sess_a
         .mailbox()
         .write(
@@ -336,8 +344,16 @@ async fn two_projects_do_not_observe_each_others_mail_or_tasks() {
         .write("team-m", "lead-1", "user", MailboxMessageType::Message, "b mail", None)
         .await
         .unwrap();
-    let task_a = sess_a.scheduler().create_task("A task", None, None, &[]).await.unwrap();
-    let task_b = sess_b.scheduler().create_task("B task", None, None, &[]).await.unwrap();
+    let task_a = sess_a
+        .scheduler()
+        .create_task("A task", None, None, &[], None)
+        .await
+        .unwrap();
+    let task_b = sess_b
+        .scheduler()
+        .create_task("B task", None, None, &[], None)
+        .await
+        .unwrap();
 
     // Each session's READ path sees exactly one mail (its own engagement).
     let unread_a = sess_a.mailbox().peek_unread("team-m", "lead-1").await.unwrap();
@@ -396,7 +412,7 @@ async fn legacy_no_project_team_resolves_to_team_id() {
 
     let task = session
         .scheduler()
-        .create_task("legacy", None, None, &[])
+        .create_task("legacy", None, None, &[], None)
         .await
         .unwrap();
     let stored = repo

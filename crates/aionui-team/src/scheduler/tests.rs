@@ -622,7 +622,10 @@ async fn wake_payload_includes_tasks_and_unread() {
         broadcaster,
     );
 
-    task_board.create_task("t1", "Task A", None, None, &[]).await.unwrap();
+    task_board
+        .create_task("t1", "Task A", None, None, &[], None)
+        .await
+        .unwrap();
 
     mailbox
         .write(

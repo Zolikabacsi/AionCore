@@ -8860,6 +8860,9 @@ fn activity_task_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::mod
         created_at,
         updated_at: created_at,
         engagement_id: None,
+        expected_output: None,
+        result: None,
+        input_context: None,
     }
 }
 
