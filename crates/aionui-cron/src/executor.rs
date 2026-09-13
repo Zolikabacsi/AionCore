@@ -2488,6 +2488,16 @@ mod tests {
 
         #[async_trait::async_trait]
         impl IConversationRepository for StubConvRepo {
+            async fn raw_query(
+                &self,
+                _sql: &str,
+                _params: Vec<String>,
+            ) -> Result<Vec<sqlx::sqlite::SqliteRow>, aionui_db::DbError> {
+                unimplemented!("raw_query unused by these tests")
+            }
+            async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, aionui_db::DbError> {
+                unimplemented!("raw_execute unused by these tests")
+            }
             async fn get(
                 &self,
                 _user_id: &str,
@@ -2944,6 +2954,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for ExistingConversationRepo {
+        async fn raw_query(
+            &self,
+            _sql: &str,
+            _params: Vec<String>,
+        ) -> Result<Vec<sqlx::sqlite::SqliteRow>, aionui_db::DbError> {
+            unimplemented!("raw_query unused by these tests")
+        }
+        async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, aionui_db::DbError> {
+            unimplemented!("raw_execute unused by these tests")
+        }
         async fn get(
             &self,
             _user_id: &str,
@@ -3183,6 +3203,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for MissingWorkspaceConversationRepo {
+        async fn raw_query(
+            &self,
+            _sql: &str,
+            _params: Vec<String>,
+        ) -> Result<Vec<sqlx::sqlite::SqliteRow>, aionui_db::DbError> {
+            unimplemented!("raw_query unused by these tests")
+        }
+        async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, aionui_db::DbError> {
+            unimplemented!("raw_execute unused by these tests")
+        }
         async fn get(
             &self,
             _user_id: &str,

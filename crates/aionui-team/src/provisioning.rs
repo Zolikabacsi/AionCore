@@ -5,8 +5,8 @@ use aionui_api_types::{
     AddAgentRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SetConfigOptionRequest, SetConfigOptionResponse,
     TeamAgentInput, TeamMcpSelection, TeamToolTransport, assistant_mcp_binding_fingerprint,
 };
-use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
-use aionui_db::models::{AgentMetadataRow, TeamRow};
+use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id, now_ms};
+use aionui_db::models::{AgentMetadataRow, TeamEngagementMemberRow, TeamEngagementRow, TeamRow};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -296,6 +296,7 @@ impl TeamAgentProvisioner {
                 shared_workspace,
                 None,
                 Some(&leader_mcp_selection),
+                None,
             )
             .await?;
 
@@ -352,6 +353,7 @@ impl TeamAgentProvisioner {
                     Some(&team_workspace),
                     None,
                     Some(&mcp_selection),
+                    None,
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -724,6 +726,7 @@ impl TeamAgentProvisioner {
                 input.workspace.as_deref(),
                 input.session_mode.as_deref(),
                 mcp_selection,
+                None,
             )
             .await?;
         Ok(TeamAgent {
@@ -740,6 +743,68 @@ impl TeamAgentProvisioner {
         })
     }
 
+    /// Materialize this engagement's OWN member conversations, one per template
+    /// slot in `team.agents`. `teams.agents` stays the template (name/role/model
+    /// metadata + the stable `template_slot`); each engagement gets an isolated
+    /// `slot_id`/`conversation_id` set bound to `engagement.workspace`.
+    ///
+    /// Idempotent: a template slot already present in `team_engagement_members`
+    /// for this engagement is skipped, so re-ensuring never duplicates.
+    pub(crate) async fn ensure_engagement_members(
+        &self,
+        user_id: &str,
+        engagement: &TeamEngagementRow,
+        team: &Team,
+    ) -> Result<(), TeamError> {
+        let existing = self.repo.list_engagement_members(user_id, &engagement.id).await?;
+        let materialized: std::collections::HashSet<&str> =
+            existing.iter().map(|member| member.template_slot.as_str()).collect();
+
+        for agent in &team.agents {
+            if materialized.contains(agent.slot_id.as_str()) {
+                continue;
+            }
+            // Fresh runtime slot id per materialized member. `slot_id` is NOT the
+            // UNIQUE key, and `get_engagement_member_by_slot` returns the FIRST
+            // row on a >1 match without erroring, so each slot id must be unique.
+            let slot_id = generate_id();
+            let mcp_selection = self
+                .resolve_assistant_mcp_selection(user_id, agent.assistant_id.as_deref())
+                .await?;
+            let conversation = self
+                .create_team_conversation_for_agent(
+                    user_id,
+                    &engagement.team_id,
+                    &slot_id,
+                    agent.role,
+                    &agent.name,
+                    &agent.backend,
+                    &agent.model,
+                    agent.assistant_id.as_deref(),
+                    Some(&engagement.workspace),
+                    None,
+                    Some(&mcp_selection),
+                    Some(&engagement.id),
+                )
+                .await?;
+            let now = now_ms();
+            self.repo
+                .upsert_engagement_member(&TeamEngagementMemberRow {
+                    engagement_id: engagement.id.clone(),
+                    team_id: engagement.team_id.clone(),
+                    template_slot: agent.slot_id.clone(),
+                    slot_id,
+                    conversation_id: conversation.conversation_id,
+                    role: agent.role.to_string(),
+                    status: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_team_conversation_for_agent(
         &self,
@@ -754,6 +819,7 @@ impl TeamAgentProvisioner {
         workspace: Option<&str>,
         session_mode: Option<&str>,
         mcp_selection: Option<&TeamMcpSelection>,
+        engagement_id: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
@@ -769,6 +835,7 @@ impl TeamAgentProvisioner {
             cli_metadata.as_ref(),
             session_mode,
             mcp_selection,
+            engagement_id,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(user_id, model)
@@ -876,6 +943,7 @@ impl TeamAgentProvisioner {
         cli_metadata: Option<&AgentMetadataRow>,
         session_mode: Option<&str>,
         mcp_selection: Option<&TeamMcpSelection>,
+        engagement_id: Option<&str>,
     ) -> serde_json::Value {
         let session_mode = session_mode
             .map(str::trim)
@@ -889,6 +957,9 @@ impl TeamAgentProvisioner {
             "backend": backend,
             "session_mode": session_mode,
         });
+        if let Some(engagement_id) = engagement_id {
+            extra["engagementId"] = serde_json::Value::String(engagement_id.to_owned());
+        }
         if agent_type != AgentType::Aionrs {
             extra["current_model_id"] = serde_json::Value::String(model.to_owned());
         }
@@ -1006,15 +1077,37 @@ mod tests {
         mcp_snapshot: Option<McpRuntimeSnapshot>,
         mcp_error: Option<&'static str>,
         persisted_extra: Arc<Mutex<serde_json::Value>>,
+        /// When true, `create_team_conversation` mints a fresh id and succeeds
+        /// (recording the extra it was handed) instead of aborting. Existing
+        /// tests leave this false → unchanged behavior.
+        create_ok: bool,
+        created: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     }
 
     #[async_trait]
     impl TeamConversationProvisioningPort for RecordingProvisioningPort {
         async fn create_team_conversation(
             &self,
-            _request: TeamConversationCreateRequest,
+            request: TeamConversationCreateRequest,
         ) -> Result<TeamConversationCreateResult, TeamError> {
             self.events.lock().unwrap().push("create");
+            if self.create_ok {
+                let conversation_id = generate_id();
+                let workspace = request
+                    .extra
+                    .get("workspace")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.created
+                    .lock()
+                    .unwrap()
+                    .push((conversation_id.clone(), request.extra));
+                return Ok(TeamConversationCreateResult {
+                    conversation_id,
+                    workspace,
+                });
+            }
             Err(TeamError::InvalidRequest("unused".into()))
         }
 
@@ -1441,6 +1534,8 @@ mod tests {
                 mcp_snapshot,
                 mcp_error,
                 persisted_extra,
+                create_ok: false,
+                created: Arc::new(Mutex::new(Vec::new())),
             }),
             Arc::new(TestCapabilityPort),
         )
@@ -1788,6 +1883,7 @@ mod tests {
             None,
             None,
             Some(&selection),
+            None,
         );
 
         // Final snapshot inputs are explicit; no request-only fields leak in.
@@ -1813,6 +1909,7 @@ mod tests {
             None,
             Some("/ws"),
             AgentType::Acp,
+            None,
             None,
             None,
             None,
@@ -1891,5 +1988,140 @@ mod tests {
         assert_eq!(patch["mcp_servers"], serde_json::json!([]));
         assert_eq!(patch["mcp_statuses"], serde_json::json!([]));
         assert_eq!(patch["assistant_mcp_fingerprint"], "[]");
+    }
+
+    /// A team engaged in project A vs project B materializes two DISTINCT member
+    /// conversation sets (one per template slot), each bound to its engagement's
+    /// workspace and stamped with that engagement's id; re-ensuring the same
+    /// engagement is idempotent (no new rows/conversations). Uses the real
+    /// `SqliteTeamRepository` so engagement/member reads resolve for real.
+    #[tokio::test]
+    async fn ensure_engagement_members_materializes_distinct_sets_per_engagement_and_is_idempotent() {
+        use aionui_db::models::TeamRow;
+        use aionui_db::{ITeamRepository, SqliteTeamRepository, init_database_memory};
+        let now = aionui_common::now_ms();
+
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+        let user = "u1";
+        let team_id = "team-2b";
+
+        let template = vec![TeamAgent {
+            slot_id: "lead-1".into(),
+            name: "Lead".into(),
+            role: TeammateRole::Lead,
+            conversation_id: "tpl-conv".into(),
+            backend: "aionrs".into(),
+            model: "test-model".into(),
+            assistant_id: None,
+            status: None,
+            conversation_type: None,
+            cli_path: None,
+        }];
+        repo.create_team(&TeamRow {
+            id: team_id.into(),
+            user_id: user.into(),
+            name: "T".into(),
+            workspace: "/tmp/tpl".into(),
+            workspace_mode: "shared".into(),
+            agents: serde_json::to_string(&template).unwrap(),
+            lead_agent_id: Some("lead-1".into()),
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            created_at: now,
+            updated_at: now,
+            project_id: None,
+            folder_id: None,
+        })
+        .await
+        .unwrap();
+        let team = Team {
+            id: team_id.into(),
+            name: "T".into(),
+            workspace: "/tmp/tpl".into(),
+            agents: template,
+            lead_agent_id: Some("lead-1".into()),
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let created: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let provisioner = TeamAgentProvisioner::new(
+            repo.clone(),
+            Arc::new(UnusedAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyProviderRepo),
+            Arc::new(RecordingProvisioningPort {
+                events: Arc::new(Mutex::new(Vec::new())),
+                patches: Arc::new(Mutex::new(Vec::new())),
+                mcp_snapshot: None,
+                mcp_error: None,
+                persisted_extra: Arc::new(Mutex::new(serde_json::json!({}))),
+                create_ok: true,
+                created: Arc::clone(&created),
+            }),
+            Arc::new(TestCapabilityPort),
+        );
+
+        let eng_a = repo
+            .find_or_create_engagement(user, team_id, "proj-a", "/ws/a")
+            .await
+            .unwrap();
+        let eng_b = repo
+            .find_or_create_engagement(user, team_id, "proj-b", "/ws/b")
+            .await
+            .unwrap();
+        assert_ne!(eng_a.id, eng_b.id);
+
+        provisioner
+            .ensure_engagement_members(user, &eng_a, &team)
+            .await
+            .unwrap();
+        provisioner
+            .ensure_engagement_members(user, &eng_b, &team)
+            .await
+            .unwrap();
+
+        let members_a = repo.list_engagement_members(user, &eng_a.id).await.unwrap();
+        let members_b = repo.list_engagement_members(user, &eng_b.id).await.unwrap();
+        assert_eq!(members_a.len(), 1, "one member per template slot");
+        assert_eq!(members_b.len(), 1);
+        assert_eq!(members_a[0].template_slot, "lead-1");
+        assert_eq!(members_b[0].template_slot, "lead-1");
+        assert_ne!(
+            members_a[0].conversation_id, members_b[0].conversation_id,
+            "each engagement owns a distinct member conversation"
+        );
+        assert_ne!(
+            members_a[0].slot_id, members_b[0].slot_id,
+            "each engagement owns a distinct runtime slot id"
+        );
+
+        {
+            let created = created.lock().unwrap();
+            assert_eq!(created.len(), 2, "exactly two conversations minted");
+            assert_eq!(
+                created[0].1["workspace"], "/ws/a",
+                "member A bound to engagement A workspace"
+            );
+            assert_eq!(
+                created[1].1["workspace"], "/ws/b",
+                "member B bound to engagement B workspace"
+            );
+            assert_eq!(created[0].1["engagementId"], eng_a.id, "A extra carries engagementId");
+            assert_eq!(created[1].1["engagementId"], eng_b.id, "B extra carries engagementId");
+            assert_eq!(created[0].1["teamId"], team_id, "A extra still carries teamId");
+        }
+
+        // Idempotent: re-ensuring engagement A creates no new rows or conversations.
+        provisioner
+            .ensure_engagement_members(user, &eng_a, &team)
+            .await
+            .unwrap();
+        let members_a2 = repo.list_engagement_members(user, &eng_a.id).await.unwrap();
+        assert_eq!(members_a2.len(), 1);
+        assert_eq!(members_a2[0].conversation_id, members_a[0].conversation_id);
+        assert_eq!(created.lock().unwrap().len(), 2, "no third conversation on repeat");
     }
 }

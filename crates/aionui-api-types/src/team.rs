@@ -1289,6 +1289,7 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            project_id: None,
             assistants: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
                 assistant_name: "Lead".into(),
@@ -1328,6 +1329,7 @@ mod tests {
             id: "team-2".into(),
             name: "Beta".into(),
             workspace: String::new(),
+            project_id: None,
             assistants: vec![],
             leader_assistant_id: None,
             created_at: 1700000000000,
@@ -1441,6 +1443,7 @@ mod tests {
             id: "team-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            project_id: None,
             assistants: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),

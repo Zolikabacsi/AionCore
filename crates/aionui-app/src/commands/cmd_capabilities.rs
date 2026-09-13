@@ -136,6 +136,22 @@ fn data() -> Value {
                     "read_only": true,
                     "scoped_to_conversation_snapshot": true
                 }
+            },
+            {
+                "name": "delegate",
+                "mode": "cross-agent-delegation",
+                "description": "Delegate work to another of this user's agents: list delegation targets, dispatch a task, or ask a question, each returning a delivery status.",
+                "contract": "agent-facing-delegate-cli",
+                "contract_command": "delegate capabilities",
+                "invocation": "aioncore delegate capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["delegate capabilities"],
+                "safety": {
+                    "can_write": true,
+                    "runtime_token_required_for_context_and_call": true,
+                    "does_not_accept_identity_authority_from_stdin": true,
+                    "per_user_feature_switch": "targets, dispatch and ask answer feature_disabled while the user has delegation switched off; capabilities stays available because it reads no conversation data"
+                }
             }
         ],
         "non_agent_subcommands": [
@@ -190,7 +206,8 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::commands::{
-        config_capabilities, diagnose_capabilities, session_capabilities, skills_capabilities, team_capabilities,
+        config_capabilities, delegate_capabilities, diagnose_capabilities, session_capabilities, skills_capabilities,
+        team_capabilities,
     };
 
     /// `capabilities` is its own entrypoint — `data()` declares it under
@@ -273,6 +290,7 @@ mod tests {
             ("team", team_capabilities::data()),
             ("session", session_capabilities::data()),
             ("skills", skills_capabilities::data()),
+            ("delegate", delegate_capabilities::data()),
         ] {
             let entry = domains
                 .iter()

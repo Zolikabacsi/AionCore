@@ -161,6 +161,11 @@ pub struct Team {
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
+    /// The team's DEFAULT/active project: it marks which engagement the session
+    /// treats as active (see `resolve_engagement_id`). Not an authoritative
+    /// single binding — the shared `agents` member conversations must never be
+    /// mutated to "follow" this value; per-engagement members own their own
+    /// project binding. Per-request project selection is a later UI concern.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     pub created_at: TimestampMs,

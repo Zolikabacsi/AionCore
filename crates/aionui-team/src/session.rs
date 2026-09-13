@@ -10,9 +10,10 @@ use aionui_api_types::{
     TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
+use aionui_db::DbError;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -187,7 +188,7 @@ impl TeamSession {
     ///
     /// Falls back to `team.id` if the repository can't resolve an engagement
     /// (test doubles whose `find_or_create_engagement` is unimplemented).
-    async fn resolve_engagement_id(repo: &Arc<dyn ITeamRepository>, user_id: &str, team: &Team) -> String {
+    pub(crate) async fn resolve_engagement_id(repo: &Arc<dyn ITeamRepository>, user_id: &str, team: &Team) -> String {
         let Some(project_id) = team.project_id.clone() else {
             return team.id.clone();
         };
@@ -197,15 +198,77 @@ impl TeamSession {
         {
             Ok(engagement) => engagement.id,
             Err(err) => {
-                warn!(
-                    team_id = %team.id,
-                    project_id,
-                    error = %err,
-                    "team engagement resolution failed; falling back to team_id key"
-                );
+                // `NotFound` is the expected result for test doubles whose
+                // `find_or_create_engagement` is unimplemented (and for the
+                // legacy no-engagement case): a safe, low-severity fallback. Any
+                // other error is a genuine DB failure that silently mis-stamps
+                // every write this session makes, so escalate it. (I2)
+                match err {
+                    DbError::NotFound(_) => warn!(
+                        team_id = %team.id,
+                        project_id,
+                        error = %err,
+                        "team engagement resolution failed; falling back to team_id key"
+                    ),
+                    other => error!(
+                        team_id = %team.id,
+                        project_id,
+                        error = %other,
+                        "team engagement resolution failed; falling back to team_id key"
+                    ),
+                }
                 team.id.clone()
             }
         }
+    }
+
+    /// Build the runtime member roster the scheduler drives: overlay each
+    /// engagement's materialized member rows (fresh `slot_id` /
+    /// `conversation_id`) on top of the `teams.agents` template, taking
+    /// name/role/backend/model/assistant_id/cli_path/conversation_type from the
+    /// template and overriding only the two runtime ids.
+    ///
+    /// Non-breaking fallback: when the engagement has no materialized members —
+    /// a legacy team (`engagement_id == team_id`, never engaged) or a repo
+    /// double that doesn't implement `list_engagement_members` — the template
+    /// agents are returned unchanged so runtime behavior stays byte-identical
+    /// to pre-Phase-2b. A genuine DB read error also falls back (never gate the
+    /// runtime on member reads), logged for diagnosability since a silent
+    /// fallback would mis-route member messages.
+    async fn engagement_member_agents(
+        repo: &Arc<dyn ITeamRepository>,
+        user_id: &str,
+        engagement_id: &str,
+        template_agents: &[TeamAgent],
+    ) -> Vec<TeamAgent> {
+        let members = match repo.list_engagement_members(user_id, engagement_id).await {
+            Ok(m) if !m.is_empty() => m,
+            Ok(_) => return template_agents.to_vec(),
+            Err(err) => {
+                warn!(
+                    engagement_id,
+                    error = %err,
+                    "engagement member read failed; falling back to template agents"
+                );
+                return template_agents.to_vec();
+            }
+        };
+        let by_slot: std::collections::HashMap<&str, _> =
+            members.iter().map(|m| (m.template_slot.as_str(), m)).collect();
+        template_agents
+            .iter()
+            .map(|agent| match by_slot.get(agent.slot_id.as_str()) {
+                Some(member) => {
+                    let mut merged = agent.clone();
+                    merged.slot_id = member.slot_id.clone();
+                    merged.conversation_id = member.conversation_id.clone();
+                    merged
+                }
+                // Template slot not present in this engagement's members: keep
+                // the template row so the member is never dropped from runtime.
+                None => agent.clone(),
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -223,6 +286,12 @@ impl TeamSession {
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
         let engagement_id = Self::resolve_engagement_id(&repo, &user_id, &team).await;
+        // Runtime member roster: engagement-materialized members when present,
+        // otherwise the `teams.agents` template (legacy fallback). The scheduler
+        // drives THIS list, so every downstream `get_agent`/`list_agents` consumer
+        // (send, projection, wake, MCP, runtime-status events) carries the
+        // engagement's own `slot_id`/`conversation_id`.
+        let member_agents = Self::engagement_member_agents(&repo, &user_id, &engagement_id, &team.agents).await;
         // Single emitter shared by mailbox, task board, and the run manager so
         // all team events reuse the same team-scoped subscription/delivery.
         let emitter = Arc::new(TeamEventEmitter::new(
@@ -251,7 +320,7 @@ impl TeamSession {
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
             user_id.clone(),
-            &team.agents,
+            &member_agents,
             mailbox.clone(),
             task_board.clone(),
             broadcaster.clone(),
@@ -4508,5 +4577,105 @@ mod tests {
             recorder.names()
         );
         session.stop();
+    }
+
+    // ── I2: resolve_engagement_id error-kind handling ──────────────────────
+    //
+    // A genuine (non-`NotFound`) repository failure must be escalated to `error!`
+    // (a DB fault silently mis-stamping every session write is a contract
+    // violation), while the expected `NotFound` from unimplemented test doubles
+    // stays a `warn!` fallback. Both keep returning `team.id`. The only
+    // observable difference is the log LEVEL, so a capturing subscriber asserts it.
+    thread_local! {
+        static RESOLVE_LOG_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ResolveLogWriter;
+    impl std::io::Write for ResolveLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ResolveLogWriter {
+        type Writer = ResolveLogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            ResolveLogWriter
+        }
+    }
+
+    fn install_resolve_capture() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            // ONE process-global capturing subscriber (rebuilds the interest
+            // cache) routing to a thread-local buffer, so parallel tests never
+            // observe each other's events.
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ResolveLogWriter)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    fn resolve_team_with_project() -> Team {
+        Team {
+            id: "team-i2".into(),
+            name: "i2".into(),
+            workspace: "/tmp/i2".into(),
+            agents: vec![],
+            lead_agent_id: None,
+            project_id: Some("proj-a".into()),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_engagement_id_logs_error_on_non_notfound_db_failure() {
+        install_resolve_capture();
+        RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_resolve_error(crate::test_utils::EngagementResolveError::Other);
+        let repo: Arc<dyn ITeamRepository> = repo;
+
+        let resolved = TeamSession::resolve_engagement_id(&repo, "u1", &resolve_team_with_project()).await;
+
+        assert_eq!(resolved, "team-i2", "non-NotFound must still fall back to team.id");
+        let logs = RESOLVE_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).unwrap());
+        assert!(
+            logs.contains("falling back to team_id key"),
+            "the fallback must be logged: {logs}"
+        );
+        assert!(
+            logs.contains("ERROR"),
+            "a genuine DB failure must be escalated to ERROR: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_engagement_id_logs_warn_on_notfound() {
+        install_resolve_capture();
+        RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_resolve_error(crate::test_utils::EngagementResolveError::NotFound);
+        let repo: Arc<dyn ITeamRepository> = repo;
+
+        let resolved = TeamSession::resolve_engagement_id(&repo, "u1", &resolve_team_with_project()).await;
+
+        assert_eq!(resolved, "team-i2", "NotFound must fall back to team.id");
+        let logs = RESOLVE_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).unwrap());
+        assert!(
+            logs.contains("falling back to team_id key"),
+            "the fallback must be logged: {logs}"
+        );
+        assert!(
+            !logs.contains("ERROR"),
+            "the expected NotFound must stay a warn, not error: {logs}"
+        );
     }
 }

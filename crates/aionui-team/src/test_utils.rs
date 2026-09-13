@@ -3,12 +3,24 @@ use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 use std::sync::Mutex;
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum EngagementResolveError {
+    /// Mirrors the trait default for test doubles that never wired engagement
+    /// CRUD: `find_or_create_engagement` reports the team/project as absent.
+    #[default]
+    NotFound,
+    /// A genuine repository failure (anything other than `NotFound`).
+    Other,
+}
+
 #[derive(Default)]
 pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
     pub tasks: Vec<TeamTaskRow>,
     pub fail_message_writes: bool,
     pub fail_task_lists: bool,
+    /// Error kind returned by `find_or_create_engagement`.
+    pub engagement_resolve_error: EngagementResolveError,
 }
 
 pub struct MockTeamRepo {
@@ -33,6 +45,10 @@ impl MockTeamRepo {
     ) {
         *self.peek_snapshot_tx.lock().unwrap() = Some(snapshot_tx);
         *self.peek_release_rx.lock().unwrap() = Some(release_rx);
+    }
+
+    pub fn set_engagement_resolve_error(&self, kind: EngagementResolveError) {
+        self.state.lock().unwrap().engagement_resolve_error = kind;
     }
 }
 
@@ -74,6 +90,22 @@ impl ITeamRepository for MockTeamRepo {
     }
     async fn delete_team(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
         Ok(())
+    }
+
+    // Engagement resolution is configurable so the session resolver's
+    // error-kind handling can be tested; the `NotFound` default reproduces the
+    // unimplemented trait behavior legacy single-project tests depend on.
+    async fn find_or_create_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        _workspace: &str,
+    ) -> Result<aionui_db::models::TeamEngagementRow, DbError> {
+        Err(match self.state.lock().unwrap().engagement_resolve_error {
+            EngagementResolveError::NotFound => DbError::NotFound("engagement not found".to_owned()),
+            EngagementResolveError::Other => DbError::Init("forced engagement failure".to_owned()),
+        })
     }
 
     // ── Mailbox ─────────────────────────────────────────────────────
@@ -1939,6 +1971,67 @@ pub(crate) mod workspace_harness {
             Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
         );
         (svc, team_repo, task_manager, conv_repo, broadcaster)
+    }
+
+    /// Build a [`TeamSessionService`] backed by a caller-supplied team repository
+    /// (e.g. a real `SqliteTeamRepository`, so `find_or_create_engagement` mints
+    /// distinct engagement ids for project-bound teams) wired to the same no-op
+    /// ports as the mock harness. Leader attach is driven by the fake conversation
+    /// port, so `ensure_session` succeeds without spawning real agent processes.
+    pub(crate) fn setup_with_team_repo(team_repo: Arc<dyn ITeamRepository>) -> Arc<TeamSessionService> {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster;
+        let conv_repo = Arc::new(MockConversationRepo::new());
+        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo));
+        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+        TeamSessionService::new(
+            team_repo,
+            Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            conversation_port,
+            projection_store,
+            broadcaster_dyn,
+            task_manager,
+            Arc::new(NoopTurnPort),
+            Arc::new(NoopCancellationPort),
+            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        )
+    }
+
+    /// Same wiring as [`setup_with_team_repo`] but also hands back the fake
+    /// conversation repo so destructive-path tests can assert which member
+    /// conversations a management op deleted / left intact.
+    pub(crate) fn setup_with_team_repo_and_conversation_repo(
+        team_repo: Arc<dyn ITeamRepository>,
+    ) -> (Arc<TeamSessionService>, Arc<MockConversationRepo>) {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster;
+        let conv_repo = Arc::new(MockConversationRepo::new());
+        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+        let svc = TeamSessionService::new(
+            team_repo,
+            Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            conversation_port,
+            projection_store,
+            broadcaster_dyn,
+            task_manager,
+            Arc::new(NoopTurnPort),
+            Arc::new(NoopCancellationPort),
+            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        );
+        (svc, conv_repo)
     }
 
     pub(crate) async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {

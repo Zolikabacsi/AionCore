@@ -1,6 +1,6 @@
 ---
 name: delegate
-description: Cross-agent delegation - dispatch a task to or ask another agent by name, with reply routing back to your conversation. Use this when the user asks for cross-squad work or when your role explicitly calls for hierarchical delegation.
+description: Cross-agent delegation - dispatch a task to or ask another agent by name; replies route back to your conversation. Use for cross-squad work or when your role calls for hierarchical delegation.
 ---
 
 # Cross-Agent Delegation Skill

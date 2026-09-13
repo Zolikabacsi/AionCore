@@ -1635,9 +1635,10 @@ async fn context_reset_returns_structured_success_and_projects_a_semantic_notice
         .expect("restore valid mock workspace before context reset");
     sqlx::query(
         "INSERT INTO mailbox \
-         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
-         VALUES ('context-reset-unread', ?, ?, 'lead-slot', 'message', 'preserve me', NULL, NULL, 0, 100)",
+         (id, team_id, engagement_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('context-reset-unread', ?, ?, ?, 'lead-slot', 'message', 'preserve me', NULL, NULL, 0, 100)",
     )
+    .bind(team_id)
     .bind(team_id)
     .bind(worker_slot_id)
     .execute(services.database.pool())

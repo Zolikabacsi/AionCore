@@ -2,7 +2,7 @@ use aionui_common::{generate_id, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamEngagementRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamEngagementMemberRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
@@ -22,6 +22,7 @@ impl ITeamRepository for SqliteTeamRepository {
     // ── Team CRUD ────────────────────────────────────────────────────
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -39,8 +40,28 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.updated_at)
         .bind(&row.project_id)
         .bind(&row.folder_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // Every team owns a default (sentinel) engagement row with id == team_id and
+        // the reserved project, mirroring migration 045's backfill shape. Engagement-
+        // scoped runtime reads (peek_unread_by_engagement, list_*_by_engagement) are
+        // gated on `EXISTS(team_engagements …)`; without this row a newly created
+        // no-project team could never see its own mailbox/task rows.
+        sqlx::query(
+            "INSERT OR IGNORE INTO team_engagements \
+             (id, user_id, team_id, project_id, workspace, process, status, created_at, updated_at) \
+             VALUES (?, ?, ?, COALESCE(?, '__none__'), ?, 'hierarchical', 'active', ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.id)
+        .bind(&row.project_id)
+        .bind(&row.workspace)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1040,5 +1061,113 @@ impl ITeamRepository for SqliteTeamRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    // ── Engagement members ───────────────────────────────────────────
+
+    async fn upsert_engagement_member(&self, row: &TeamEngagementMemberRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_engagement_members \
+                 (engagement_id, team_id, template_slot, slot_id, conversation_id, role, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT (engagement_id, template_slot) DO UPDATE SET \
+                 team_id = excluded.team_id, \
+                 slot_id = excluded.slot_id, \
+                 conversation_id = excluded.conversation_id, \
+                 role = excluded.role, \
+                 status = excluded.status, \
+                 updated_at = excluded.updated_at",
+        )
+        .bind(&row.engagement_id)
+        .bind(&row.team_id)
+        .bind(&row.template_slot)
+        .bind(&row.slot_id)
+        .bind(&row.conversation_id)
+        .bind(&row.role)
+        .bind(row.status.as_deref())
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_engagement_members(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<TeamEngagementMemberRow>, DbError> {
+        // The EXISTS guard scopes the read to the engagement's owning user
+        // (data isolation), mirroring `list_tasks_by_engagement`.
+        let rows = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members \
+             WHERE engagement_id = ?1 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2) \
+             ORDER BY created_at ASC",
+        )
+        .bind(engagement_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn get_engagement_member_by_slot(
+        &self,
+        engagement_id: &str,
+        slot_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        // Resolve by runtime `slot_id` (NOT `template_slot`); internal helper,
+        // so it is intentionally NOT ownership-checked.
+        let row = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members WHERE engagement_id = ? AND slot_id = ?",
+        )
+        .bind(engagement_id)
+        .bind(slot_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn get_engagement_member_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        // Internal resolve-by-key helper; intentionally NOT ownership-checked.
+        let row = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members WHERE conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn delete_engagement_members_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        // Members carry no user_id; the EXISTS guard scopes the delete to rows
+        // whose team is owned by `user_id` (data isolation), mirroring
+        // `delete_mailbox_by_team` / `delete_tasks_by_team`. Must run BEFORE
+        // `delete_engagements_by_team` (FK to `team_engagements.id`).
+        sqlx::query(
+            "DELETE FROM team_engagement_members \
+             WHERE team_id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_engagement_members.team_id AND t.user_id = ?)",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_engagements_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        // `team_engagements` owns a `user_id` column, so delete directly by
+        // (user_id, team_id) — fully scoped, no cross-team or cross-user reach.
+        sqlx::query("DELETE FROM team_engagements WHERE user_id = ? AND team_id = ?")
+            .bind(user_id)
+            .bind(team_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

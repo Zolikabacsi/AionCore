@@ -99,6 +99,29 @@ pub struct TeamEngagementRow {
     pub reply_to: Option<String>,
 }
 
+/// Row mapping for the `team_engagement_members` table.
+///
+/// One member slot instance bound to a single engagement; the unique key is
+/// `(engagement_id, template_slot)`, so each template slot materializes at most
+/// once per engagement with its own isolated `slot_id` / `conversation_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamEngagementMemberRow {
+    pub engagement_id: String,
+    pub team_id: String,
+    /// Template-defined slot this row instantiates (unique per engagement).
+    pub template_slot: String,
+    /// Runtime slot instance id.
+    pub slot_id: String,
+    /// Conversation backing this member's runtime.
+    pub conversation_id: String,
+    /// Member role within the engagement.
+    pub role: String,
+    /// Optional member status.
+    pub status: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
