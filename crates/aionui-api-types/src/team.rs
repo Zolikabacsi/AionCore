@@ -1968,6 +1968,9 @@ mod tests {
             blocks: vec!["tk2".into()],
             created_at: 1,
             updated_at: 2,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let value = serde_json::to_value(&resp).unwrap();
         assert_eq!(value["status"], json!("in_progress"));
@@ -2012,6 +2015,9 @@ mod tests {
                 blocks: vec![],
                 created_at: 1,
                 updated_at: 1,
+                expected_output: None,
+                result: None,
+                input_context: None,
             },
             change: TeamTaskChange::Created,
         };
