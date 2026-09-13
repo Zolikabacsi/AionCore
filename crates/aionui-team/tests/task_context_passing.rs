@@ -40,8 +40,9 @@ use tokio::net::TcpStream;
 
 // Task 3 (context passing) uses these directly.
 use aionui_team::build_wake_payload;
+use aionui_team::task_board::compute_input_context;
 use aionui_team::types::TaskStatus;
-use aionui_team::{TaskBoard, TaskUpdate};
+use aionui_team::{TaskBoard, TaskUpdate, input_context_for_slot};
 use std::collections::HashSet;
 
 const USER: &str = "u-result";
@@ -480,13 +481,16 @@ async fn finalize_without_assistant_text_leaves_result_null() {
     h.session.stop();
 }
 
-// ── Task 3: materialize ready `input_context` + inject into the wake ─────────
+// ── Task 3 (FINAL-fix): live context passing at wake time ───────────────────
 //
-// Real `SqliteTeamRepository` + real `TaskBoard` pinned to an engagement. A
-// completed upstream task's captured `result` must flow into the downstream's
-// `input_context` when it transitions to ready, and the wake renderer must
-// surface it under a `## Upstream Results` section. No upstream → context stays
-// NULL and the wake output is byte-identical to the baseline.
+// Context passing is computed at WAKE time from the results a downstream's
+// completed upstream deps have captured, NOT stored at completion time. The
+// upstream's `result` is only persisted at its turn FINALIZE — strictly after
+// its completion tool call returns — so a value materialized during the
+// completion (`check_unblocks`) is always a snapshot taken while the result is
+// still NULL and can never be recomputed. These tests drive that exact
+// live ordering (complete → capture result → wake-build) against a real
+// engagement-pinned board / real `TeamSession`.
 
 const CTX_USER: &str = "u-ctx";
 const CTX_TEAM: &str = "t-ctx";
@@ -520,25 +524,31 @@ async fn ctx_board() -> (TaskBoard, Arc<SqliteTeamRepository>, aionui_db::Databa
     (board, repo, db)
 }
 
-/// Completing an upstream task with a captured result materializes that result
-/// into the now-ready downstream's `input_context`.
+/// A ready downstream whose upstream `result` is captured AFTER the upstream
+/// completes. Reproduces the real lifecycle: `update_task(Completed)` unblocks B
+/// while A's result is still NULL (so a completion-time materialize would record
+/// nothing), then the finalize-style `set_task_result` lands the result, and the
+/// wake-time compute is the first to actually observe it.
 #[tokio::test]
-async fn ready_downstream_materializes_upstream_result_into_input_context() {
+async fn wake_time_compute_observes_result_captured_after_completion() {
     let (board, repo, _db) = ctx_board().await;
-    let a = board.create_task(CTX_TEAM, "A", None, None, &[], None).await.unwrap();
+    let a = board
+        .create_task(CTX_TEAM, "A", None, Some("worker-1"), &[], None)
+        .await
+        .unwrap();
     let b = board
         .create_task(
             CTX_TEAM,
             "Implement B",
-            Some("the downstream task"),
-            None,
+            Some("should not appear in the brief anchor"),
+            Some("worker-1"),
             std::slice::from_ref(&a.id),
             None,
         )
         .await
         .unwrap();
 
-    repo.set_task_result(CTX_USER, &a.id, "A did X").await.unwrap();
+    // (1) A completes. This unblocks B but A.result is still NULL.
     board
         .update_task(
             CTX_TEAM,
@@ -550,19 +560,34 @@ async fn ready_downstream_materializes_upstream_result_into_input_context() {
         )
         .await
         .unwrap();
+    let tasks_after_complete = board.list_tasks(CTX_TEAM).await.unwrap();
+    let b_task = tasks_after_complete.iter().find(|t| t.id == b.id).unwrap();
+    assert!(b_task.blocked_by.is_empty(), "B is unblocked by A's completion");
+    assert!(
+        compute_input_context(b_task, &tasks_after_complete).is_none(),
+        "nothing to pass forward while the upstream result is still NULL"
+    );
 
-    let b_row = repo.find_task_by_id(CTX_USER, CTX_TEAM, &b.id).await.unwrap().unwrap();
-    let ctx = b_row
-        .input_context
-        .expect("ready downstream with a completed-result upstream gets an input_context");
-    assert!(ctx.contains("A did X"), "must carry the upstream result:\n{ctx}");
-    assert!(ctx.contains(&a.id), "must name the upstream dep id:\n{ctx}");
-    assert!(ctx.contains("[[UPSTREAM]]"), "must have an upstream section:\n{ctx}");
+    // (2) The turn finalizes and captures A's result — AFTER completion.
+    repo.set_task_result(CTX_USER, &a.id, "A did X").await.unwrap();
+
+    // (3) The wake computes fresh: it now sees the persisted result.
+    let tasks = board.list_tasks(CTX_TEAM).await.unwrap();
+    let b_task = tasks.iter().find(|t| t.id == b.id).unwrap();
+    let ctx = compute_input_context(b_task, &tasks).expect("live result reaches the wake context");
+    assert!(ctx.contains("A did X"), "carries the upstream result:\n{ctx}");
+    assert!(ctx.contains(&a.id), "names the upstream dep id:\n{ctx}");
+    assert!(ctx.contains("[[UPSTREAM]]"), "upstream section present:\n{ctx}");
+    assert!(
+        !ctx.contains("should not appear"),
+        "brief anchor is subject-only:\n{ctx}"
+    );
 }
 
-/// A >cap upstream result is bounded to `MAX_INPUT_CONTEXT_CHARS`.
+/// The cap bounds the live-computed context even when the result is captured
+/// late.
 #[tokio::test]
-async fn input_context_is_capped_at_max_chars() {
+async fn wake_time_compute_caps_captured_result() {
     let (board, repo, _db) = ctx_board().await;
     let a = board.create_task(CTX_TEAM, "A", None, None, &[], None).await.unwrap();
     let b = board
@@ -570,8 +595,6 @@ async fn input_context_is_capped_at_max_chars() {
         .await
         .unwrap();
 
-    let huge = "x".repeat(20_000);
-    repo.set_task_result(CTX_USER, &a.id, &huge).await.unwrap();
     board
         .update_task(
             CTX_TEAM,
@@ -583,30 +606,27 @@ async fn input_context_is_capped_at_max_chars() {
         )
         .await
         .unwrap();
+    let huge = "x".repeat(20_000);
+    repo.set_task_result(CTX_USER, &a.id, &huge).await.unwrap();
 
-    let ctx = repo
-        .find_task_by_id(CTX_USER, CTX_TEAM, &b.id)
-        .await
-        .unwrap()
-        .unwrap()
-        .input_context
-        .expect("cap path still records the (truncated) upstream result");
+    let tasks = board.list_tasks(CTX_TEAM).await.unwrap();
+    let b_task = tasks.iter().find(|t| t.id == b.id).unwrap();
+    let ctx = compute_input_context(b_task, &tasks).expect("capped but present");
     assert!(ctx.len() <= 8000, "must be capped at 8000 bytes, got {}", ctx.len());
     assert!(ctx.contains("[[UPSTREAM]]"), "capped context keeps the section:\n{ctx}");
 }
 
-/// A downstream that becomes ready with NO upstream result stays NULL (no
-/// context write) — hierarchical/legacy teams are unaffected.
+/// A downstream with no completed upstream result to carry stays without context,
+/// so its owner's wake is byte-identical to the no-upstream baseline.
 #[tokio::test]
-async fn ready_without_completed_upstream_result_leaves_input_context_null() {
-    let (board, repo, _db) = ctx_board().await;
+async fn downstream_without_upstream_result_gets_no_wake_context() {
+    let (board, _repo, _db) = ctx_board().await;
     let a = board.create_task(CTX_TEAM, "A", None, None, &[], None).await.unwrap();
-    let b = board
-        .create_task(CTX_TEAM, "B", None, None, std::slice::from_ref(&a.id), None)
+    let _b = board
+        .create_task(CTX_TEAM, "B", None, Some("worker-1"), std::slice::from_ref(&a.id), None)
         .await
         .unwrap();
 
-    // A completes WITHOUT a captured result (legacy / no-member turn).
     board
         .update_task(
             CTX_TEAM,
@@ -619,17 +639,93 @@ async fn ready_without_completed_upstream_result_leaves_input_context_null() {
         .await
         .unwrap();
 
-    let b_row = repo.find_task_by_id(CTX_USER, CTX_TEAM, &b.id).await.unwrap().unwrap();
-    let blocked_by: Vec<String> = serde_json::from_str(&b_row.blocked_by).unwrap();
-    assert!(blocked_by.is_empty(), "B is unblocked by A's completion");
+    let tasks = board.list_tasks(CTX_TEAM).await.unwrap();
     assert!(
-        b_row.input_context.is_none(),
-        "no upstream result → no context materialized, got {:?}",
-        b_row.input_context
+        input_context_for_slot(&tasks, "worker-1").is_none(),
+        "no upstream result → no wake context"
     );
 }
 
-// -- Wake renderer injection --------------------------------------------------
+/// The real lifecycle end to end: A completes via the MCP tool, A's turn
+/// finalizes and captures its result, then the downstream owner's wake carries
+/// `A`'s result under `## Upstream Results`. Uses the full `TeamSession`.
+#[tokio::test]
+async fn live_finalize_populates_downstream_wake_context_through_session() {
+    let h = Harness::new().await;
+    let cfg = h.session.mcp_stdio_config("worker-1");
+    let mut lead = mcp_connect(cfg.port, &cfg.token, "lead-1").await;
+    let ra = mcp_call_tool(
+        &mut lead,
+        1,
+        "team_task_create",
+        json!({ "subject": "Upstream A", "owner": "worker-1" }),
+    )
+    .await;
+    assert!(!is_mcp_error(&ra), "create A: {ra}");
+    let a_id = mcp_task_id(&ra);
+    let rb = mcp_call_tool(
+        &mut lead,
+        2,
+        "team_task_create",
+        json!({ "subject": "Downstream B", "owner": "worker-1", "blocked_by": [a_id] }),
+    )
+    .await;
+    assert!(!is_mcp_error(&rb), "create B: {rb}");
+    drop(lead);
+
+    // worker completes A through the real tool (B unblocked; A.result still NULL).
+    let mut worker = mcp_connect(cfg.port, &cfg.token, "worker-1").await;
+    let rc = mcp_call_tool(
+        &mut worker,
+        3,
+        "team_task_update",
+        json!({ "task_id": a_id, "status": "completed" }),
+    )
+    .await;
+    assert!(!is_mcp_error(&rc), "complete A: {rc}");
+
+    // finalize: captures A's result (Task 2), after which B's wake context is live.
+    h.port.set_text("conv-worker", "A did X");
+    h.session
+        .on_agent_finish("conv-worker", false)
+        .await
+        .expect("turn finalize");
+
+    let tasks = h.session.task_board().list_tasks(TEAM).await.unwrap();
+    let ctx = input_context_for_slot(&tasks, "worker-1").expect("A's result reaches B's wake context");
+    assert!(ctx.contains("A did X"), "wake context carries A's result:\n{ctx}");
+    assert!(ctx.contains("[[UPSTREAM]]"), "carries the upstream section:\n{ctx}");
+
+    let payload = build_wake_payload(
+        &wake_agent_slot("worker-1"),
+        &tasks,
+        &[],
+        &roster(&["worker-1", "lead-1"]),
+        Some(&ctx),
+    );
+    assert!(
+        payload.contains("## Upstream Results"),
+        "wake renders the section:\n{payload}"
+    );
+    assert!(payload.contains("A did X"), "wake carries A's result:\n{payload}");
+
+    h.session.stop();
+}
+
+fn wake_agent_slot(slot: &str) -> TeamAgent {
+    TeamAgent {
+        slot_id: slot.into(),
+        name: "Worker".into(),
+        role: TeammateRole::Teammate,
+        conversation_id: format!("conv-{slot}"),
+        backend: "acp".into(),
+        model: "claude".into(),
+        assistant_id: None,
+        status: None,
+        conversation_type: None,
+        cli_path: None,
+    }
+}
 
 fn wake_agent() -> TeamAgent {
     TeamAgent {

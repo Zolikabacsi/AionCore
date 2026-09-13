@@ -12,7 +12,7 @@ impl TeammateManager {
         let agent = self.get_agent(slot_id).await?;
         let tasks = self.task_board.list_tasks(&self.team_id).await?;
         let unread = self.mailbox.read_unread(&self.team_id, slot_id).await?;
-        let input_context = crate::prompts::input_context_for_slot(&tasks, &agent.slot_id).map(str::to_owned);
+        let input_context = crate::prompts::input_context_for_slot(&tasks, &agent.slot_id);
         Ok(WakePayload {
             agent,
             tasks,

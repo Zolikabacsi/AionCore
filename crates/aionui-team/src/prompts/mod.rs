@@ -110,12 +110,19 @@ pub fn build_teammate_prompt_for_transport(
     })
 }
 
-/// Picks the `input_context` for the task a slot is currently working: its
-/// in-progress task if any, else its first ready (unblocked) owned task. Returns
-/// that task's `input_context` (which may itself be `None`), or `None` when the
-/// slot has no current task — so a wake carries upstream results only for the
-/// member actually assigned the ready work.
-pub fn input_context_for_slot<'a>(tasks: &'a [TeamTask], slot_id: &str) -> Option<&'a str> {
+/// Picks the task a slot is currently working (its in-progress task if any, else
+/// its first ready unblocked owned task) and computes that task's
+/// `[[UPSTREAM]]` context live from the results its completed dependencies have
+/// captured so far. Returns `None` when the slot has no current task or that task
+/// has no completed upstream result to pass forward — so a wake carries a
+/// `## Upstream Results` section only for a member actually assigned ready work
+/// with upstream results available, and a no-upstream wake stays byte-identical.
+///
+/// Computed at wake time (not read from a stored column) because an upstream's
+/// `result` is only persisted at its turn finalize, after its completion tool
+/// call returns; the stored `input_context` is therefore treated as a cache the
+/// wake path ignores in favour of this freshest value.
+pub fn input_context_for_slot(tasks: &[TeamTask], slot_id: &str) -> Option<String> {
     let owned = |t: &TeamTask| t.owner.as_deref() == Some(slot_id);
     let current = tasks
         .iter()
@@ -125,7 +132,7 @@ pub fn input_context_for_slot<'a>(tasks: &'a [TeamTask], slot_id: &str) -> Optio
                 .iter()
                 .find(|t| owned(t) && t.status == crate::types::TaskStatus::Pending && t.blocked_by.is_empty())
         })?;
-    current.input_context.as_deref()
+    crate::task_board::compute_input_context(current, tasks)
 }
 
 pub fn build_wake_payload(

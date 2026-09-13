@@ -226,25 +226,6 @@ pub trait ITeamRepository: Send + Sync {
         ))
     }
 
-    /// Stamps the `input_context` column of a task (Phase 3a context passing:
-    /// the concat of a now-ready downstream's completed upstream results,
-    /// materialized when it transitions to ready). User-scoped: the row must
-    /// belong to `user_id`; returns `NotFound` otherwise. Task ids are globally
-    /// unique and the caller (task board) engagement-gates the row through its
-    /// `find_task` read-gate before reaching here, mirroring `set_task_result`.
-    /// Default stub so non-SQLite test doubles that never materialize context
-    /// can skip it.
-    async fn set_task_input_context(
-        &self,
-        _user_id: &str,
-        _task_id: &str,
-        _input_context: &str,
-    ) -> Result<(), DbError> {
-        Err(DbError::Init(
-            "set_task_input_context is not supported by this repository".into(),
-        ))
-    }
-
     // ── Engagements ──────────────────────────────────────────────────
     //
     // Declared with default "not implemented" bodies so non-SQLite test doubles

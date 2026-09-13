@@ -49,7 +49,7 @@ pub use ports::{
 };
 
 pub use prompt_dump::TeamPromptDumpConfig;
-pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
+pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload, input_context_for_slot};
 pub use provisioning::{
     TeamAgentProvisioner, TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationModelFacts,
     TeamConversationProvisioningPort, TeamMcpSnapshotResolution,
