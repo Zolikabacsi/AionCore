@@ -110,11 +110,30 @@ pub fn build_teammate_prompt_for_transport(
     })
 }
 
+/// Picks the `input_context` for the task a slot is currently working: its
+/// in-progress task if any, else its first ready (unblocked) owned task. Returns
+/// that task's `input_context` (which may itself be `None`), or `None` when the
+/// slot has no current task — so a wake carries upstream results only for the
+/// member actually assigned the ready work.
+pub fn input_context_for_slot<'a>(tasks: &'a [TeamTask], slot_id: &str) -> Option<&'a str> {
+    let owned = |t: &TeamTask| t.owner.as_deref() == Some(slot_id);
+    let current = tasks
+        .iter()
+        .find(|t| owned(t) && t.status == crate::types::TaskStatus::InProgress)
+        .or_else(|| {
+            tasks
+                .iter()
+                .find(|t| owned(t) && t.status == crate::types::TaskStatus::Pending && t.blocked_by.is_empty())
+        })?;
+    current.input_context.as_deref()
+}
+
 pub fn build_wake_payload(
     agent: &TeamAgent,
     tasks: &[TeamTask],
     unread_messages: &[MailboxMessage],
     current_slot_ids: &HashSet<String>,
+    input_context: Option<&str>,
 ) -> String {
     let mut payload = String::with_capacity(2048);
 
@@ -137,6 +156,15 @@ pub fn build_wake_payload(
         payload.push('\n');
     } else {
         payload.push_str("## New Messages\n\nNo new messages.\n\n");
+    }
+
+    // Upstream results carried forward along the task DAG (Phase 3a). Empty or
+    // absent → section omitted, so hierarchical/no-dependency wakes are
+    // byte-identical to the pre-context-passing baseline.
+    if let Some(ctx) = input_context.filter(|c| !c.trim().is_empty()) {
+        payload.push_str("## Upstream Results\n\n");
+        payload.push_str(ctx.trim_end());
+        payload.push_str("\n\n");
     }
 
     payload.push_str(&wake_summary::render_task_board_summary(agent, tasks, current_slot_ids));
@@ -382,7 +410,7 @@ mod tests {
     fn wake_payload_with_messages() {
         let agent = make_lead();
         let msgs = vec![make_message("w1", "Task A done", MailboxMessageType::Message)];
-        let payload = build_wake_payload(&agent, &[], &msgs, &roster(&["lead-1", "w1"]));
+        let payload = build_wake_payload(&agent, &[], &msgs, &roster(&["lead-1", "w1"]), None);
 
         assert!(payload.contains("New Messages"));
         assert!(payload.contains("`w1`"));
@@ -395,7 +423,7 @@ mod tests {
         let agent = make_lead();
         let mut msg = make_message("w1", "idle", MailboxMessageType::IdleNotification);
         msg.summary = Some("Finished feature X".into());
-        let payload = build_wake_payload(&agent, &[], &[msg], &roster(&["lead-1", "w1"]));
+        let payload = build_wake_payload(&agent, &[], &[msg], &roster(&["lead-1", "w1"]), None);
 
         assert!(payload.contains("[idle_notification]"));
         assert!(payload.contains("Summary: Finished feature X"));
@@ -405,7 +433,7 @@ mod tests {
     fn wake_payload_with_shutdown_request() {
         let agent = make_teammate("w1", "W");
         let msg = make_message("lead-1", "No longer needed", MailboxMessageType::ShutdownRequest);
-        let payload = build_wake_payload(&agent, &[], &[msg], &roster(&["lead-1", "w1"]));
+        let payload = build_wake_payload(&agent, &[], &[msg], &roster(&["lead-1", "w1"]), None);
 
         assert!(payload.contains("[shutdown_request]"));
         assert!(payload.contains("No longer needed"));
@@ -422,7 +450,7 @@ mod tests {
             ),
             make_task("bbbbbbbb-1234-5678-9abc-def012345678", "Test Y", TaskStatus::Pending),
         ];
-        let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "worker-1"]));
+        let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "worker-1"]), None);
 
         assert!(payload.contains("Current Task Board Summary"));
         assert!(payload.contains("Showing 2 of 2 tasks."));
@@ -438,7 +466,7 @@ mod tests {
         let agent = make_lead();
         let mut task = make_task("cccccccc-1234-5678-9abc-def012345678", "Deploy", TaskStatus::Pending);
         task.blocked_by = vec!["task-a".into(), "task-b".into()];
-        let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
+        let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]), None);
 
         assert!(payload.contains("task-a…"));
         assert!(payload.contains("task-b…"));
@@ -448,7 +476,7 @@ mod tests {
     #[test]
     fn wake_payload_empty() {
         let agent = make_lead();
-        let payload = build_wake_payload(&agent, &[], &[], &roster(&["lead-1"]));
+        let payload = build_wake_payload(&agent, &[], &[], &roster(&["lead-1"]), None);
 
         assert!(payload.contains("No new messages"));
         assert!(payload.contains("No tasks on the board"));
@@ -458,7 +486,7 @@ mod tests {
     #[test]
     fn wake_payload_contains_agent_identity() {
         let agent = make_teammate("w1", "Worker1");
-        let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]));
+        let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]), None);
 
         assert!(payload.contains("**Worker1**"));
         assert!(payload.contains("teammate"));
@@ -468,7 +496,7 @@ mod tests {
     fn wake_payload_short_task_id_no_truncation() {
         let agent = make_lead();
         let task = make_task("short", "Short ID Task", TaskStatus::Pending);
-        let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
+        let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]), None);
         assert!(payload.contains("short…"));
     }
 }

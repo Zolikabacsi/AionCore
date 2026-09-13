@@ -562,7 +562,9 @@ impl TeamSession {
                         .unwrap_or_default();
                     (command, false)
                 } else {
-                    let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                    let input_context = crate::prompts::input_context_for_slot(&tasks, &agent.slot_id);
+                    let wake_body =
+                        build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids, input_context);
                     let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                     let first_message = if needs_role_prompt {
                         let tool_transport = self.team_tool_transport_for_agent(&agent).await?;

@@ -5,12 +5,17 @@ use aionui_common::{generate_id, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_db::UpdateTaskParams;
 use aionui_db::models::TeamTaskRow;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::activity_mapping::task_to_response;
 use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
 use crate::types::{TaskStatus, TeamTask};
+
+/// Upper bound (bytes) on a materialized task `input_context`. Context passing
+/// is a naive newest-first concat of upstream results; see
+/// [`build_input_context`] for the cap's upgrade path.
+const MAX_INPUT_CONTEXT_CHARS: usize = 8000;
 
 pub struct TaskBoard {
     repo: Arc<dyn ITeamRepository>,
@@ -188,6 +193,72 @@ impl TaskBoard {
         Ok(())
     }
 
+    /// Task rows visible to this board's scope (engagement-pinned when set,
+    /// otherwise the whole team). Mirrors [`TaskBoard::find_task`]'s scoping.
+    async fn scoped_list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, TeamError> {
+        let rows = match &self.engagement_id {
+            Some(engagement) => self.repo.list_tasks_by_engagement(&self.user_id, engagement).await?,
+            None => self.repo.list_tasks(&self.user_id, team_id).await?,
+        };
+        Ok(rows)
+    }
+
+    /// Materializes a ready task's `input_context`: the concat of the results
+    /// captured by its completed upstream dependencies (bounded to
+    /// [`MAX_INPUT_CONTEXT_CHARS`]) plus a minimal brief anchor derived from the
+    /// task itself. Persists the result and returns it, or `Ok(None)` (writing
+    /// nothing) when the task is not ready, already has a context, or has no
+    /// completed upstream with a result — so a task with nothing to pass stays
+    /// NULL and its owner's wake is unchanged.
+    ///
+    /// Read-gated like [`update_task`](Self::update_task): `find_task` rejects
+    /// rows outside this board's engagement before any compute or write.
+    pub async fn materialize_input_context(&self, team_id: &str, task_id: &str) -> Result<Option<String>, TeamError> {
+        let row = self
+            .find_task(team_id, task_id)
+            .await?
+            .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
+
+        // Ready = pending with no remaining blockers. The completed dep was
+        // already removed from `blocked_by` by `check_unblocks` before this
+        // runs, so an empty list here is the ready signal.
+        let ready = row.status == TaskStatus::Pending.to_string()
+            && serde_json::from_str::<Vec<String>>(&row.blocked_by)
+                .map(|b| b.is_empty())
+                .unwrap_or(false);
+        if !ready || row.input_context.is_some() {
+            return Ok(None);
+        }
+
+        // A task's upstream deps are the rows whose `blocks` array lists it;
+        // only completed ones with a non-empty `result` feed context forward.
+        let all = self.scoped_list_tasks(team_id).await?;
+        let mut deps: Vec<&TeamTaskRow> = all
+            .iter()
+            .filter(|t| {
+                serde_json::from_str::<Vec<String>>(&t.blocks)
+                    .map(|b| b.iter().any(|id| id == task_id))
+                    .unwrap_or(false)
+            })
+            .filter(|t| {
+                t.status == TaskStatus::Completed.to_string()
+                    && t.result.as_deref().is_some_and(|r| !r.trim().is_empty())
+            })
+            .collect();
+        if deps.is_empty() {
+            return Ok(None);
+        }
+        // Oldest first; the cap keeps the newest on overflow.
+        deps.sort_by_key(|t| t.created_at);
+
+        let context = build_input_context(&row, &deps);
+        self.repo
+            .set_task_input_context(&self.user_id, task_id, &context)
+            .await?;
+        debug!(team_id, task_id, len = context.len(), "materialized task input_context");
+        Ok(Some(context))
+    }
+
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
         let rows = match &self.engagement_id {
             Some(engagement) => self.repo.list_tasks_by_engagement(&self.user_id, engagement).await?,
@@ -235,6 +306,20 @@ impl TaskBoard {
                 unblocked = %downstream_id,
                 "dependency unblocked"
             );
+            // Phase 3a context passing: when this downstream has just become
+            // ready, materialize its completed upstream results into
+            // `input_context` so the downstream owner's wake prompt can carry
+            // them. Best-effort: a context read/write must never abort the
+            // completing task's own unblock (the `?` above already handled the
+            // dependency-removal invariant this is downstream of).
+            if let Err(err) = self.materialize_input_context(team_id, downstream_id).await {
+                warn!(
+                    completed = completed_task_id,
+                    unblocked = %downstream_id,
+                    error = %err,
+                    "failed to materialize downstream input_context on ready"
+                );
+            }
             // Broadcast the downstream task's changed dependency set so the
             // activity board and the downstream-owner wake path both observe it
             // is now (potentially) actionable. Non-fatal: a missing row or parse
@@ -248,6 +333,76 @@ impl TaskBoard {
         }
         Ok(())
     }
+}
+
+/// Assemble a ready task's `input_context`: a `[[BRIEF]]` anchor (the task's own
+/// subject + description — v1 has no cleaner "engagement brief" source in
+/// `check_unblocks`, and the brief forbids adding a column) followed by an
+/// `[[UPSTREAM]]` section of `- {dep_id}: {dep.result}` lines for its completed
+/// dependencies, ordered oldest→newest and bounded to
+/// [`MAX_INPUT_CONTEXT_CHARS`].
+fn build_input_context(task: &TeamTaskRow, deps_asc: &[&TeamTaskRow]) -> String {
+    let mut brief = task.subject.clone();
+    if let Some(desc) = task.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        brief.push('\n');
+        brief.push_str(desc);
+    }
+    let prefix = format!("[[BRIEF]]\n{brief}\n\n[[UPSTREAM]]\n");
+    let lines: Vec<String> = deps_asc
+        .iter()
+        .map(|d| format!("- {}: {}", d.id, d.result.as_deref().unwrap_or("").trim_end()))
+        .collect();
+    cap_upstream(&prefix, &lines)
+}
+
+/// Bounded `[[UPSTREAM]]` render. Keeps the newest dependency lines and drops
+/// the oldest on overflow (dependencies are passed in oldest→newest).
+///
+/// ponytail: naive byte cap, oldest-dep truncation, no per-result summarization.
+/// The whole-thing scan is O(deps^2) renders but `deps` is tiny. Upgrade to
+/// per-dependency summarization only if measured token pressure ever demands
+/// more than a length bound.
+fn cap_upstream(prefix: &str, lines_asc: &[String]) -> String {
+    let total = lines_asc.len();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0usize;
+    for line in lines_asc.iter().rev() {
+        let mut trial = kept.clone();
+        trial.insert(0, line.as_str());
+        let trial_dropped = total - trial.len();
+        if render_input_context(prefix, &trial, trial_dropped).len() <= MAX_INPUT_CONTEXT_CHARS {
+            kept = trial;
+            continue;
+        }
+        if !kept.is_empty() {
+            // This and every older line no longer fit; stop, keep the newest.
+            dropped = total - kept.len();
+            break;
+        }
+        // The single newest result already blows the cap on its own: hard
+        // truncate it so at least its head passes forward.
+        let budget = MAX_INPUT_CONTEXT_CHARS.saturating_sub(prefix.len() + 1);
+        let mut cut = budget.min(line.len());
+        while cut > 0 && !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        kept.push(&line[..cut]);
+        dropped = total - 1;
+        break;
+    }
+    render_input_context(prefix, &kept, dropped)
+}
+
+fn render_input_context(prefix: &str, kept_asc: &[&str], dropped: usize) -> String {
+    let mut s = String::from(prefix);
+    if dropped > 0 {
+        s.push_str(&format!("…{dropped} older upstream result(s) truncated\n"));
+    }
+    for line in kept_asc {
+        s.push_str(line);
+        s.push('\n');
+    }
+    s
 }
 
 #[cfg(test)]
@@ -648,5 +803,72 @@ mod tests {
 
         let tasks = board.list_tasks("t1").await.unwrap();
         assert_eq!(tasks.len(), 2);
+    }
+
+    // -- Phase 3a: input_context build/cap (pure helpers) ---------------------
+
+    fn dep_row(id: &str, created: i64, result: Option<&str>) -> TeamTaskRow {
+        TeamTaskRow {
+            id: id.into(),
+            team_id: "t1".into(),
+            subject: id.into(),
+            description: None,
+            status: "completed".into(),
+            owner: None,
+            blocked_by: "[]".into(),
+            blocks: r#"["B"]"#.into(),
+            metadata: None,
+            created_at: created,
+            updated_at: created,
+            engagement_id: None,
+            expected_output: None,
+            result: result.map(str::to_owned),
+            input_context: None,
+        }
+    }
+
+    fn ready_task() -> TeamTaskRow {
+        TeamTaskRow {
+            id: "B".into(),
+            team_id: "t1".into(),
+            subject: "Do B".into(),
+            description: None,
+            status: "pending".into(),
+            owner: None,
+            blocked_by: "[]".into(),
+            blocks: "[]".into(),
+            metadata: None,
+            created_at: 0,
+            updated_at: 0,
+            engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
+        }
+    }
+
+    #[test]
+    fn build_input_context_keeps_every_dep_under_the_cap() {
+        let deps = [
+            dep_row("A", 1, Some("oldest result")),
+            dep_row("X", 2, Some("newest result")),
+        ];
+        let refs: Vec<&TeamTaskRow> = deps.iter().collect();
+        let ctx = build_input_context(&ready_task(), &refs);
+        assert!(ctx.contains("- A: oldest result"), "{ctx}");
+        assert!(ctx.contains("- X: newest result"), "{ctx}");
+        assert!(!ctx.contains("truncated"), "no overflow, nothing dropped:\n{ctx}");
+    }
+
+    #[test]
+    fn cap_keeps_newest_dep_and_drops_oldest_on_overflow() {
+        let big = "y".repeat(MAX_INPUT_CONTEXT_CHARS);
+        let deps = [dep_row("A", 1, Some(&big)), dep_row("X", 2, Some("newest short"))];
+        let refs: Vec<&TeamTaskRow> = deps.iter().collect();
+        let ctx = build_input_context(&ready_task(), &refs);
+        assert!(ctx.len() <= MAX_INPUT_CONTEXT_CHARS, "cap respected: {}", ctx.len());
+        assert!(ctx.contains("newest short"), "newest dep kept:\n{ctx}");
+        assert!(!ctx.contains('y'), "oldest (huge) dep dropped:\n{ctx}");
+        assert!(ctx.contains("truncated"), "overflow recorded:\n{ctx}");
     }
 }

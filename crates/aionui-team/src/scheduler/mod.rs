@@ -94,6 +94,11 @@ pub struct WakePayload {
     pub agent: TeamAgent,
     pub tasks: Vec<TeamTask>,
     pub unread_messages: Vec<MailboxMessage>,
+    /// Materialized `input_context` of the task this slot is currently working
+    /// (its ready/in-progress owned task), carried into the wake's
+    /// `## Upstream Results` section. `None` → the wake is byte-identical to a
+    /// no-upstream wake.
+    pub input_context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

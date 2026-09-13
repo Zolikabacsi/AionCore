@@ -38,6 +38,12 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
+// Task 3 (context passing) uses these directly.
+use aionui_team::build_wake_payload;
+use aionui_team::types::TaskStatus;
+use aionui_team::{TaskBoard, TaskUpdate};
+use std::collections::HashSet;
+
 const USER: &str = "u-result";
 const TEAM: &str = "t-result";
 
@@ -472,4 +478,199 @@ async fn finalize_without_assistant_text_leaves_result_null() {
     );
 
     h.session.stop();
+}
+
+// ── Task 3: materialize ready `input_context` + inject into the wake ─────────
+//
+// Real `SqliteTeamRepository` + real `TaskBoard` pinned to an engagement. A
+// completed upstream task's captured `result` must flow into the downstream's
+// `input_context` when it transitions to ready, and the wake renderer must
+// surface it under a `## Upstream Results` section. No upstream → context stays
+// NULL and the wake output is byte-identical to the baseline.
+
+const CTX_USER: &str = "u-ctx";
+const CTX_TEAM: &str = "t-ctx";
+
+async fn ctx_board() -> (TaskBoard, Arc<SqliteTeamRepository>, aionui_db::Database) {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteTeamRepository::new(db.pool().clone()));
+    repo.create_team(&TeamRow {
+        id: CTX_TEAM.to_owned(),
+        user_id: CTX_USER.to_owned(),
+        name: CTX_TEAM.to_owned(),
+        workspace: String::new(),
+        workspace_mode: "shared".to_owned(),
+        agents: "[]".to_owned(),
+        lead_agent_id: None,
+        session_mode: None,
+        agents_version: "1.0.1".to_owned(),
+        created_at: now_ms(),
+        updated_at: now_ms(),
+        project_id: None,
+        folder_id: None,
+    })
+    .await
+    .unwrap();
+    let e = repo
+        .find_or_create_engagement(CTX_USER, CTX_TEAM, "proj-ctx", "/ws/ctx")
+        .await
+        .unwrap();
+    let board =
+        TaskBoard::new_for_user(repo.clone() as Arc<dyn ITeamRepository>, CTX_USER).with_engagement(e.id.clone());
+    (board, repo, db)
+}
+
+/// Completing an upstream task with a captured result materializes that result
+/// into the now-ready downstream's `input_context`.
+#[tokio::test]
+async fn ready_downstream_materializes_upstream_result_into_input_context() {
+    let (board, repo, _db) = ctx_board().await;
+    let a = board.create_task(CTX_TEAM, "A", None, None, &[], None).await.unwrap();
+    let b = board
+        .create_task(
+            CTX_TEAM,
+            "Implement B",
+            Some("the downstream task"),
+            None,
+            std::slice::from_ref(&a.id),
+            None,
+        )
+        .await
+        .unwrap();
+
+    repo.set_task_result(CTX_USER, &a.id, "A did X").await.unwrap();
+    board
+        .update_task(
+            CTX_TEAM,
+            &a.id,
+            &TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let b_row = repo.find_task_by_id(CTX_USER, CTX_TEAM, &b.id).await.unwrap().unwrap();
+    let ctx = b_row
+        .input_context
+        .expect("ready downstream with a completed-result upstream gets an input_context");
+    assert!(ctx.contains("A did X"), "must carry the upstream result:\n{ctx}");
+    assert!(ctx.contains(&a.id), "must name the upstream dep id:\n{ctx}");
+    assert!(ctx.contains("[[UPSTREAM]]"), "must have an upstream section:\n{ctx}");
+}
+
+/// A >cap upstream result is bounded to `MAX_INPUT_CONTEXT_CHARS`.
+#[tokio::test]
+async fn input_context_is_capped_at_max_chars() {
+    let (board, repo, _db) = ctx_board().await;
+    let a = board.create_task(CTX_TEAM, "A", None, None, &[], None).await.unwrap();
+    let b = board
+        .create_task(CTX_TEAM, "B", None, None, std::slice::from_ref(&a.id), None)
+        .await
+        .unwrap();
+
+    let huge = "x".repeat(20_000);
+    repo.set_task_result(CTX_USER, &a.id, &huge).await.unwrap();
+    board
+        .update_task(
+            CTX_TEAM,
+            &a.id,
+            &TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let ctx = repo
+        .find_task_by_id(CTX_USER, CTX_TEAM, &b.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .input_context
+        .expect("cap path still records the (truncated) upstream result");
+    assert!(ctx.len() <= 8000, "must be capped at 8000 bytes, got {}", ctx.len());
+    assert!(ctx.contains("[[UPSTREAM]]"), "capped context keeps the section:\n{ctx}");
+}
+
+/// A downstream that becomes ready with NO upstream result stays NULL (no
+/// context write) — hierarchical/legacy teams are unaffected.
+#[tokio::test]
+async fn ready_without_completed_upstream_result_leaves_input_context_null() {
+    let (board, repo, _db) = ctx_board().await;
+    let a = board.create_task(CTX_TEAM, "A", None, None, &[], None).await.unwrap();
+    let b = board
+        .create_task(CTX_TEAM, "B", None, None, std::slice::from_ref(&a.id), None)
+        .await
+        .unwrap();
+
+    // A completes WITHOUT a captured result (legacy / no-member turn).
+    board
+        .update_task(
+            CTX_TEAM,
+            &a.id,
+            &TaskUpdate {
+                status: Some(TaskStatus::Completed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let b_row = repo.find_task_by_id(CTX_USER, CTX_TEAM, &b.id).await.unwrap().unwrap();
+    let blocked_by: Vec<String> = serde_json::from_str(&b_row.blocked_by).unwrap();
+    assert!(blocked_by.is_empty(), "B is unblocked by A's completion");
+    assert!(
+        b_row.input_context.is_none(),
+        "no upstream result → no context materialized, got {:?}",
+        b_row.input_context
+    );
+}
+
+// -- Wake renderer injection --------------------------------------------------
+
+fn wake_agent() -> TeamAgent {
+    TeamAgent {
+        slot_id: "w1".into(),
+        name: "Worker".into(),
+        role: TeammateRole::Teammate,
+        conversation_id: "conv-w1".into(),
+        backend: "acp".into(),
+        model: "claude".into(),
+        assistant_id: None,
+        status: None,
+        conversation_type: None,
+        cli_path: None,
+    }
+}
+
+fn roster(ids: &[&str]) -> HashSet<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
+}
+
+#[test]
+fn wake_payload_renders_upstream_results_section() {
+    let ctx = "[[BRIEF]]\nB\n\n[[UPSTREAM]]\n- aaa11111: A did X\n";
+    let payload = build_wake_payload(&wake_agent(), &[], &[], &roster(&["w1"]), Some(ctx));
+    assert!(
+        payload.contains("## Upstream Results"),
+        "section header present:\n{payload}"
+    );
+    assert!(payload.contains("A did X"), "upstream text carried:\n{payload}");
+}
+
+#[test]
+fn wake_payload_without_upstream_is_unchanged() {
+    let none = build_wake_payload(&wake_agent(), &[], &[], &roster(&["w1"]), None);
+    let empty = build_wake_payload(&wake_agent(), &[], &[], &roster(&["w1"]), Some(""));
+    assert!(
+        !none.contains("## Upstream Results"),
+        "no upstream → no section:\n{none}"
+    );
+    assert_eq!(
+        none, empty,
+        "None and empty render identically (byte-identical baseline)"
+    );
 }

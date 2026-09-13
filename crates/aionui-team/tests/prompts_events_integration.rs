@@ -442,7 +442,7 @@ fn wp1_wake_payload_includes_unread_messages() {
             created_at: 0,
         },
     ];
-    let payload = build_wake_payload(&agent, &[], &messages, &roster(&["lead-1", "w1", "w2"]));
+    let payload = build_wake_payload(&agent, &[], &messages, &roster(&["lead-1", "w1", "w2"]), None);
 
     assert!(payload.contains("Feature X is done"));
     assert!(payload.contains("`w1`"));
@@ -491,7 +491,7 @@ fn wp2_wake_payload_includes_task_list() {
             input_context: None,
         },
     ];
-    let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]));
+    let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]), None);
 
     assert!(payload.contains("Current Task Board Summary"));
     assert!(payload.contains("Showing 2 of 2 tasks."));
@@ -513,7 +513,7 @@ fn wp2_wake_payload_includes_task_list() {
 #[test]
 fn wp3_wake_payload_empty_builds_normally() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]));
+    let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]), None);
 
     assert!(payload.contains("No new messages"));
     assert!(payload.contains("No tasks on the board"));
