@@ -767,6 +767,27 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
+    async fn set_task_result(&self, user_id: &str, task_id: &str, result: &str) -> Result<(), DbError> {
+        // User-scoped like `update_task`'s ownership guard; task ids are
+        // globally unique, and the caller (task board) engagement-gates the
+        // row through `find_task` before reaching here.
+        let updated = sqlx::query(
+            "UPDATE team_tasks SET result = ?, updated_at = ? \
+             WHERE id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_tasks.team_id AND t.user_id = ?)",
+        )
+        .bind(result)
+        .bind(now_ms())
+        .bind(task_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("task {task_id}")));
+        }
+        Ok(())
+    }
+
     // ── Engagements ──────────────────────────────────────────────────
 
     async fn create_engagement(

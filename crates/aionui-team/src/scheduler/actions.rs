@@ -43,6 +43,30 @@ impl TeammateManager {
         self.mark_idle(slot_id, None).await
     }
 
+    /// Records that `slot_id` completed `task_id` on its own account, so the
+    /// task's `result` can be captured from the slot's final assistant message
+    /// when the turn finalizes (Phase 3a). The completion MCP tool fires
+    /// mid-turn — before the assistant text is reliably projected — hence the
+    /// deferral to finalize.
+    pub async fn note_completion_for_result(&self, slot_id: &str, task_id: &str) {
+        self.pending_task_results
+            .lock()
+            .await
+            .entry(slot_id.to_owned())
+            .or_default()
+            .push(task_id.to_owned());
+    }
+
+    /// Drains the slot's pending completions for result capture at turn
+    /// finalize. Empty when the slot completed no task this turn.
+    pub(crate) async fn take_pending_task_results(&self, slot_id: &str) -> Vec<String> {
+        self.pending_task_results
+            .lock()
+            .await
+            .remove(slot_id)
+            .unwrap_or_default()
+    }
+
     pub async fn request_shutdown_agent(
         &self,
         from_slot_id: &str,

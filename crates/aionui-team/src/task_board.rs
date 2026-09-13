@@ -176,6 +176,18 @@ impl TaskBoard {
         Ok(task)
     }
 
+    /// Stamps a task's `result` (Phase 3a capture at turn finalize). Engagement-
+    /// gated like [`update_task`](Self::update_task): the `find_task` read-gate
+    /// rejects rows outside this board's engagement before the repo write.
+    pub async fn set_task_result(&self, team_id: &str, task_id: &str, result: &str) -> Result<(), TeamError> {
+        self.find_task(team_id, task_id)
+            .await?
+            .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
+        self.repo.set_task_result(&self.user_id, task_id, result).await?;
+        debug!(team_id, task_id, "task result captured");
+        Ok(())
+    }
+
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
         let rows = match &self.engagement_id {
             Some(engagement) => self.repo.list_tasks_by_engagement(&self.user_id, engagement).await?,

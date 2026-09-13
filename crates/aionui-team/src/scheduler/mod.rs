@@ -124,6 +124,10 @@ pub struct TeammateManager {
     // and double-write the IdleNotification (aionui-audit 4.3, 8 #3).
     pub(crate) finalized_turns: Arc<DashMap<String, Instant>>,
     pub(crate) wake_timeouts: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Tasks each slot completed this turn, awaiting result capture at turn
+    /// finalize (Phase 3a). Keyed by slot id; drained and cleared by
+    /// `TeamSession::capture_turn_results` when the slot's turn ends.
+    pub(crate) pending_task_results: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl TeammateManager {
@@ -158,6 +162,7 @@ impl TeammateManager {
             active_wakes: DashSet::new(),
             finalized_turns: Arc::new(DashMap::new()),
             wake_timeouts: Arc::new(DashMap::new()),
+            pending_task_results: Mutex::new(HashMap::new()),
         }
     }
 

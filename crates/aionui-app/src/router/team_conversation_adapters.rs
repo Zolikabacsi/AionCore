@@ -544,7 +544,9 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             }
             update.extra = Some(extra.to_string());
         }
-        self.conversation_repo.update(&user_id, conversation_id, &update).await?;
+        self.conversation_repo
+            .update(&user_id, conversation_id, &update)
+            .await?;
         Ok(())
     }
 
@@ -713,6 +715,36 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .delete(user_id, conversation_id)
             .await
             .map_err(map_conversation_update_error)
+    }
+
+    async fn latest_assistant_text(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        let Some(user_id) = self.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        // Newest `text` row in the member's conversation. The assistant's own
+        // output is the only left-position, non-teammate-mirrored `text` row;
+        // anything else (user bubble, teammate mirror) is NOT an assistant
+        // result, so capture degrades to a no-op rather than mis-stamping.
+        let Some(row) = self
+            .conversation_repo
+            .latest_message_of_type(&user_id, conversation_id, "text")
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.position.as_deref() != Some("left") {
+            return Ok(None);
+        }
+        let Ok(content) = serde_json::from_str::<serde_json::Value>(&row.content) else {
+            return Ok(Some(row.content));
+        };
+        if content.get("teammate_message").is_some() {
+            return Ok(None);
+        }
+        Ok(content
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned))
     }
 
     async fn lookup_team_binding_by_conversation(

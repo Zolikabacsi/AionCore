@@ -216,6 +216,16 @@ pub trait ITeamRepository: Send + Sync {
     /// Deletes all tasks belonging to a team.
     async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError>;
 
+    /// Stamps the `result` column of a task (additive capture at turn finalize;
+    /// Phase 3a task-context model). User-scoped: the row must belong to
+    /// `user_id`; returns `NotFound` otherwise. Default stub so non-SQLite test
+    /// doubles that never capture can skip it — mirrors `latest_message_of_type`.
+    async fn set_task_result(&self, _user_id: &str, _task_id: &str, _result: &str) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "set_task_result is not supported by this repository".into(),
+        ))
+    }
+
     // ── Engagements ──────────────────────────────────────────────────
     //
     // Declared with default "not implemented" bodies so non-SQLite test doubles

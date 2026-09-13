@@ -1218,6 +1218,14 @@ async fn exec_task_update(
         maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &task, "reassign").await;
     }
 
+    // The assignee completing its own task schedules the `result` capture for
+    // this slot's turn finalize: the assistant's final message is not
+    // projected yet at tool-call time, so only the (slot, task) pairing is
+    // recorded here (Phase 3a).
+    if completed && task.status == TaskStatus::Completed && task.owner.as_deref() == Some(caller_slot_id) {
+        scheduler.note_completion_for_result(caller_slot_id, &task.id).await;
+    }
+
     // Completing a task can unblock downstream tasks; wake each downstream owner
     // whose task is now fully unblocked and actionable.
     if completed

@@ -13,7 +13,7 @@ use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::DbError;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -670,6 +670,8 @@ impl TeamSession {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
         }
 
+        self.capture_turn_results(&slot_id).await;
+
         let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
 
         // Clear the dedup window unconditionally once finalize has run.
@@ -687,6 +689,53 @@ impl TeamSession {
         }
 
         Ok(wake_target)
+    }
+
+    /// Captures the task results for `slot_id` at turn finalize (Phase 3a):
+    /// every task the assignee completed during its turn gets its `result`
+    /// from the slot's latest assistant message. Best-effort side effect only
+    /// — never fails the finalize/wake/idle path: when no assistant text is
+    /// readable (legacy/hierarchical teams, a resume with no message yet, a
+    /// test double without the service) the capture is a no-op.
+    pub(crate) async fn capture_turn_results(&self, slot_id: &str) {
+        let pending = self.scheduler.take_pending_task_results(slot_id).await;
+        if pending.is_empty() {
+            return;
+        }
+        let Some(text) = self.latest_assistant_text_for_slot(slot_id).await else {
+            debug!(
+                team_id = %self.team.id,
+                slot_id,
+                task_count = pending.len(),
+                "task result capture skipped: no final assistant text available"
+            );
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        for task_id in &pending {
+            if let Err(error) = self.task_board.set_task_result(&self.team.id, task_id, text).await {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    task_id = %task_id,
+                    error = %error,
+                    "task result capture failed"
+                );
+            }
+        }
+    }
+
+    async fn latest_assistant_text_for_slot(&self, slot_id: &str) -> Option<String> {
+        let agent = self.scheduler.get_agent(slot_id).await.ok()?;
+        let service = self.service.upgrade()?;
+        service
+            .conversation_port()
+            .latest_assistant_text(&agent.conversation_id)
+            .await
+            .ok()?
     }
 
     /// Write a user message to the lead's mailbox and trigger a wake.
