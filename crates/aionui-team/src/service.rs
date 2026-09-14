@@ -207,6 +207,26 @@ pub struct TeamSessionService {
     self_ref: Weak<TeamSessionService>,
 }
 
+/// End marker of the `[[AION_DELEGATE]]` envelope block, as composed by
+/// `aionui_delegate::service::compose_delivery_body`. The seam stamps its
+/// correlation ids *before* this marker (inside the block) so the
+/// user-controlled body text that follows can never shadow them: the repo's
+/// line-prefix parse convention is first-match (see
+/// `aionui-session-message` e2e `extract_reply_to`).
+const DELEGATE_ENVELOPE_END_MARKER: &str = "[[/AION_DELEGATE]]";
+
+/// Insert the seam-owned `engagement_id`/`root_task_id` lines into a
+/// caller-composed delegate envelope block. A payload without the block
+/// marker is not a delegate envelope and is returned unchanged (the seam
+/// never formats envelopes).
+fn stamp_envelope_correlation(payload: &str, engagement_id: &str, root_task_id: &str) -> String {
+    let stamp = format!("engagement_id: {engagement_id}\nroot_task_id: {root_task_id}\n");
+    match payload.find(DELEGATE_ENVELOPE_END_MARKER) {
+        Some(idx) => format!("{}{}{}", &payload[..idx], stamp, &payload[idx..]),
+        None => payload.to_owned(),
+    }
+}
+
 impl TeamSessionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -808,10 +828,13 @@ impl TeamSessionService {
     /// Find-or-create the engagement binding `team_id` to `project_id`,
     /// reusing the same project→workspace resolution as `create_team`.
     ///
-    /// `project_id` may be the [`TEAM_NO_PROJECT_SENTINEL`]: a project-less
-    /// caller (Phase 4a, pre-selector) convenes/reuses the team's *default*
-    /// engagement, whose workspace comes from the team template row instead of
-    /// a (non-existent) `__none__` project lookup.
+    /// `project_id` may be the [`TEAM_NO_PROJECT_SENTINEL`] (a project-less
+    /// caller, Phase 4a pre-selector). A sentinel request maps to the team's
+    /// *default* engagement — `COALESCE(teams.project_id, '__none__')`, the
+    /// exact row `create_team` and migrations 045/047 backfill — so it is
+    /// convened/reused, never an orphan `__none__` row the team runtime does
+    /// not poll. The workspace comes from the resolved project, or from the
+    /// team template row when the default engagement is itself sentinel.
     pub async fn ensure_engagement(
         &self,
         user_id: &str,
@@ -821,15 +844,24 @@ impl TeamSessionService {
         // Ownership first: a missing team and another user's team both surface
         // as `TeamNotFound`, and the sentinel path needs the team row anyway.
         let team_row = self.load_owned_team_row(user_id, team_id).await?;
+        let project_id = if project_id == TEAM_NO_PROJECT_SENTINEL {
+            team_row
+                .project_id
+                .as_deref()
+                .unwrap_or(TEAM_NO_PROJECT_SENTINEL)
+                .to_owned()
+        } else {
+            project_id.to_owned()
+        };
         let workspace = if project_id == TEAM_NO_PROJECT_SENTINEL {
             team_row.workspace.clone()
         } else {
-            let (workspace, _folder_id) = self.resolve_project_workspace(user_id, project_id).await?;
+            let (workspace, _folder_id) = self.resolve_project_workspace(user_id, &project_id).await?;
             workspace
         };
         let row = self
             .repo
-            .find_or_create_engagement(user_id, team_id, project_id, &workspace)
+            .find_or_create_engagement(user_id, team_id, &project_id, &workspace)
             .await?;
         // Materialize this engagement's own member conversations (one per template
         // slot), each bound to the engagement workspace. Idempotent. The team row
@@ -848,7 +880,8 @@ impl TeamSessionService {
     /// enqueue the caller-composed `[[AION_DELEGATE]]` envelope into the lead's
     /// engagement mailbox. `envelope_payload` is pre-composed by the caller
     /// (via `compose_delivery_body`) — this seam never formats envelopes; it
-    /// only appends the engagement/root-task correlation ids it creates.
+    /// only stamps the engagement/root-task correlation ids it creates into
+    /// the `[[AION_DELEGATE]]` block (see [`stamp_envelope_correlation`]).
     ///
     /// Ownership: the team is loaded user-scoped FIRST, so a missing team and
     /// another user's team both surface as `TeamNotFound` (existence is never
@@ -890,13 +923,15 @@ impl TeamSessionService {
             )
             .await?;
         // Spec §5 step 4 (Task-1 deferral #4): stamp the correlation ids this
-        // seam just created onto the envelope. They are *appended after* the
-        // caller-composed body so the `[[AION_DELEGATE]]` block text stays
-        // byte-intact — envelope formatting remains in `aionui-delegate`.
-        let envelope_payload = format!(
-            "{envelope_payload}\nengagement_id: {}\nroot_task_id: {}\n",
-            engagement.id, task.id
-        );
+        // seam just created into the envelope. They go *inside* the
+        // `[[AION_DELEGATE]]` block (before the closing marker) so they share
+        // `reply_to`'s shadow-safe position: the repo's line-prefix parse is
+        // first-match (see aionui-session-message e2e `extract_reply_to`), and
+        // the user-controlled body text comes after the block, so a crafted
+        // `root_task_id:` line in a message can never shadow the real one.
+        // A payload without the marker (not a delegate envelope) is left
+        // byte-identical — the seam does not format envelopes.
+        let envelope_payload = stamp_envelope_correlation(envelope_payload, &engagement.id, &task.id);
         Mailbox::new_for_user(self.repo.clone(), user_id)
             .with_events(emitter)
             .with_engagement(engagement.id.clone())

@@ -214,3 +214,52 @@ fn team_guard_reads_canonical_teamid_key() {
     // A plain solo conversation is not team-owned.
     assert_eq!(super::team_id_from_extra(r#"{"backend":"opencode"}"#), None);
 }
+
+// Review fix (coverage): table-driven bad-path test for the BridgeError →
+// DelegateError mapping at the team-dispatch site. Asserts the specific
+// variant per input (AGENTS.md: never merely "not success").
+#[test]
+fn map_bridge_error_table() {
+    use super::map_bridge_error;
+    use crate::bridge::BridgeError;
+    use crate::error::DelegateError;
+
+    let cases: Vec<(BridgeError, DelegateError)> = vec![
+        (
+            BridgeError::TeamNotFound,
+            DelegateError::TargetNotFound { query: "Growth".into() },
+        ),
+        // NotOwner maps like TeamNotFound: existence must never leak.
+        (
+            BridgeError::NotOwner,
+            DelegateError::TargetNotFound { query: "Growth".into() },
+        ),
+        (
+            BridgeError::ProjectNotFound,
+            DelegateError::TransportUnavailable {
+                reason: "team 'Growth' could not resolve the project engagement".into(),
+            },
+        ),
+        (
+            BridgeError::Delivery("boom".into()),
+            DelegateError::TransportUnavailable { reason: "boom".into() },
+        ),
+    ];
+    for (input, expected) in cases {
+        let got = map_bridge_error(input, "Growth");
+        assert_eq!(got.to_string(), expected.to_string(), "mapping mismatch: {got:?}");
+        assert_eq!(got.code(), expected.code());
+    }
+    // Spot-check the exact variants (eq is on Debug output above; codes cover
+    // the HTTP contract).
+    assert!(matches!(
+        map_bridge_error(BridgeError::NotOwner, "T"),
+        DelegateError::TargetNotFound { ref query } if query == "T"
+    ));
+    assert!(matches!(
+        map_bridge_error(BridgeError::Delivery("x".into()), "T"),
+        DelegateError::TransportUnavailable { ref reason } if reason == "x"
+    ));
+    assert_eq!(map_bridge_error(BridgeError::TeamNotFound, "T").http_status(), 404);
+    assert_eq!(map_bridge_error(BridgeError::ProjectNotFound, "T").http_status(), 400);
+}

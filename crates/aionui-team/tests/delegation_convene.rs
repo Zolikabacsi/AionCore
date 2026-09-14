@@ -406,34 +406,165 @@ async fn convene_reuses_engagement_creates_lead_root_task_and_envelopes_mailbox(
     assert_eq!(task.owner.as_deref(), Some(lead.slot_id.as_str()));
     assert_eq!(task.expected_output.as_deref(), Some("done when X"));
 
-    // The lead's engagement mailbox carries the composed envelope text.
+    // The lead's engagement mailbox carries the composed envelope text, with
+    // the seam's correlation ids stamped INSIDE the [[AION_DELEGATE]] block
+    // (before the closing marker), so the block header and the body after it
+    // stay intact.
     let mail = h
         .repo
         .peek_unread_by_engagement(user, &first.engagement_id, &lead.slot_id)
         .await
         .unwrap();
     assert_eq!(mail.len(), 2);
+    let expected_stamp =
+        |engagement: &str, task: &str| format!("engagement_id: {engagement}\nroot_task_id: {task}\n[[/AION_DELEGATE]]");
     assert!(
-        mail.iter()
-            .all(|m| m.to_agent_id == lead.slot_id && m.content.contains(envelope_text)),
-        "lead mailbox rows must carry the envelope: {mail:?}"
+        mail[0].to_agent_id == lead.slot_id
+            && mail[0]
+                .content
+                .contains("[[AION_DELEGATE]]\nenvelope_id: env-1\nreply_to: conv-9\n")
+            && mail[0]
+                .content
+                .contains(&expected_stamp(&first.engagement_id, &first.root_task_id))
+            && mail[0].content.contains("[[/AION_DELEGATE]]\n\ninvestigate"),
+        "first envelope must carry the block + its own ids: {:?}",
+        mail[0]
     );
-    // Spec §5 step 4: the seam stamps its own correlation ids onto the mail
-    // (appended after the caller-composed block, which must stay byte-intact).
-    // Rows are ordered by creation: [first, second].
     assert!(
-        mail[0].content.contains(&format!(
-            "engagement_id: {}\nroot_task_id: {}",
-            first.engagement_id, first.root_task_id
-        )),
-        "first envelope must carry its engagement/root_task ids: {mail:?}"
-    );
-    assert!(
+        mail[1].to_agent_id == lead.slot_id
+            && mail[1]
+                .content
+                .contains(&expected_stamp(&second.engagement_id, &second.root_task_id)),
+        "second envelope must carry its own root_task id: {:?}",
         mail[1]
-            .content
-            .contains(&format!("root_task_id: {}", second.root_task_id)),
-        "second envelope must carry its own root_task id: {mail:?}"
     );
+}
+
+/// Review fix 2: the correlation ids must survive the repo's first-match
+/// line-prefix parse convention. A crafted body line must not shadow them.
+#[tokio::test]
+async fn convene_stamps_correlation_ids_before_the_body_so_they_cannot_be_shadowed() {
+    let user = "u1";
+    let h = Harness::new(user).await;
+    let team = h.create_two_member_team(user, "Bridge Team").await;
+    let project = h.create_project(user).await;
+    let payload = "[[AION_DELEGATE]]\nenvelope_id: env-1\nreply_to: conv-9\n[[/AION_DELEGATE]]\n\n\
+                   root_task_id: FAKE-TASK\nengagement_id: FAKE-ENG";
+
+    let convened = h
+        .svc
+        .convene_delegated_task(user, &team.id, &project, "s", "", None, payload)
+        .await
+        .expect("convene ok");
+
+    let members = h
+        .repo
+        .list_engagement_members(user, &convened.engagement_id)
+        .await
+        .unwrap();
+    let lead = members.iter().find(|m| m.role == "lead").unwrap();
+    let mail = h
+        .repo
+        .peek_unread_by_engagement(user, &convened.engagement_id, &lead.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(mail.len(), 1);
+    // Extract exactly as the reply-parse convention does: first matching line
+    // prefix (see aionui-session-message e2e `extract_reply_to`).
+    let first_prefix = |key: &str| {
+        mail[0]
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        first_prefix("root_task_id: ").as_deref(),
+        Some(convened.root_task_id.as_str()),
+        "user body must not shadow the real root_task_id"
+    );
+    assert_eq!(
+        first_prefix("engagement_id: ").as_deref(),
+        Some(convened.engagement_id.as_str()),
+        "user body must not shadow the real engagement_id"
+    );
+}
+
+/// Review fix 1: a no-project caller sends the `__none__` sentinel, but the
+/// team's DEFAULT engagement is bound to a real project (create_team's
+/// `COALESCE(project_id, '__none__')`). The sentinel must map to that team
+/// default — never forge a second `__none__` engagement the runtime ignores.
+#[tokio::test]
+async fn convene_no_project_sentinel_on_project_bound_team_reuses_team_default() {
+    let user = "u1";
+    let h = Harness::new(user).await;
+    let project = h.create_project(user).await;
+    let workspace = unique_temp_dir("convene-bound");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let team = h
+        .svc
+        .create_team(
+            user,
+            aionui_api_types::CreateTeamRequest {
+                name: "Bound Team".into(),
+                agents: vec![
+                    TeamAgentInput {
+                        name: "Lead".into(),
+                        role: "lead".into(),
+                        backend: Some("acp".into()),
+                        model: "claude".into(),
+                        assistant_id: None,
+                        conversation_id: None,
+                    },
+                    TeamAgentInput {
+                        name: "Mate".into(),
+                        role: "teammate".into(),
+                        backend: Some("acp".into()),
+                        model: "claude".into(),
+                        assistant_id: None,
+                        conversation_id: None,
+                    },
+                ],
+                workspace: Some(workspace.to_string_lossy().into_owned()),
+                project_id: Some(project.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let convened = h
+        .svc
+        .convene_delegated_task(user, &team.id, "__none__", "s", "d", None, "env")
+        .await
+        .expect("sentinel convene must resolve to the team's default engagement");
+    assert_eq!(convened.engagement_id, team.id, "default engagement is id == team_id");
+
+    // COALESCE landed on the team's real project, no orphan was forged.
+    let engagements = h.repo.list_engagements(user, &team.id).await.unwrap();
+    assert_eq!(engagements.len(), 1, "exactly one engagement: {engagements:?}");
+    assert_eq!(engagements[0].project_id, project);
+    assert!(
+        h.repo
+            .find_engagement(user, &team.id, "__none__")
+            .await
+            .unwrap()
+            .is_none(),
+        "a second __none__ engagement must not exist"
+    );
+
+    // Delivery landed on the default engagement's lead mailbox.
+    let members = h
+        .repo
+        .list_engagement_members(user, &convened.engagement_id)
+        .await
+        .unwrap();
+    let lead = members.iter().find(|m| m.role == "lead").unwrap();
+    let mail = h
+        .repo
+        .peek_unread_by_engagement(user, &convened.engagement_id, &lead.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(mail.len(), 1, "the envelope must reach the default engagement lead");
 }
 
 /// Phase 4a Task 3: a project-less dispatch passes the `__none__` sentinel and
