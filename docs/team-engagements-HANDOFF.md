@@ -43,12 +43,12 @@ Phase 2b is COMPLETE and unblocks Phase 4 (the delegation bridge can now convene
 
 </details>
 
-## Must carry forward (from Phase 2a review) — note: I2 / session-lock re-key / task-board re-scope were CONSUMED in 2b (see above); remaining live items: §11 UI, delegate-guard flip, per-request project selector (Phase 5)
+## Must carry forward (from Phase 2a review) — note: I2 / session-lock re-key / task-board re-scope were CONSUMED in 2b (see above); remaining live items: §11 UI, per-request project selector (Phase 5)
 - **I2 — resolve-fallback severity:** `aionui-team/src/session.rs` (`ensure_session` engagement resolve, ~line 590) falls back to `team.id` on a `find_or_create_engagement` error with only a `warn!`. A genuine DB failure would then silently mis-stamp writes. Make it `error!` (or fail the session start) on non-`NotFound` errors.
 - **Session/lock map re-key (deferred 4c):** `service.rs` `sessions`/`add_agent_locks`/`ensure_session_locks` are still keyed by `team_id` (was ~:168/172/175). Re-keying to `engagement_id` + threading `project_id` through `ensure_session`/`get_run_state`/routes is **behaviorally inert until members are per-engagement**, so it co-lands naturally with Phase 2b steps 1–3. Do it in 2b.
 - **task_board mutation paths** (`update_task`/`append_to_blocks`/`remove_from_blocked_by`) still team-scoped (safe today: globally-unique task ids + upstream engagement gate). Re-scope in the 2b re-key for defense-in-depth.
 - **§11 UI:** engagement-scoped read endpoints + the `TeamEngagementSelector` in AionUi (`pages/team/TeamPage.tsx`, repurpose the existing `TeamProjectSwitcher`) = Phase 5.
-- **Delegate sender guard behavior flip:** after the fix, a team-member conversation calling `delegate dispatch` now returns `SenderIsTeam` (guard was inert before). Confirm no shipped preset relies on member→solo-dispatch before enabling Phase 4's team→engagement bridge.
+- **Delegate sender guard behavior flip: CONSUMED in Phase 4c.** The 4a-era rejection was removed; team members may now delegate to teams AND assistants, cycle-guarded (member-lineage predicate → `cycle_detected`, server-derived depth +1 → `depth_exceeded`; see `docs/superpowers/plans/2026-09-14-team-engagements-phase4c-sender-inversion-cycle-safety.md`). Shipped presets verified not to rely on the rejection.
 - **Pre-existing repo `cargo fmt` drift** (~38 files, incl. `aionui-delegate/service.rs` and `aionui-team/service.rs`) predates this work; `just push` formats. Not ours to clean.
 
 ## Key invariants to preserve

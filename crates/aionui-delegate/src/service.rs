@@ -55,9 +55,11 @@ const CHAIN_DEPTH_SQL: &str =
 // `target_assistant_id`) never matches a team row. `LIVE_CHAIN_SQL`,
 // `find_envelope_on_chain` and `CHAIN_DEPTH_SQL` above therefore stay
 // byte-identical for assistant dispatch. Cross-engagement runaway for a team hop
-// is bounded by the retained `MAX_DEPTH` cap (for team-member senders derived
-// server-side from the engagement root task, §5.9 Phase 4c) and a direct cycle
-// (caller already a member of the target engagement) is caught by the
+// is bounded by the retained `MAX_DEPTH` cap — server-derived from the engagement
+// root task for team-member senders (§5.9 Phase 4c); a residual: a non-team
+// sender's assistant→team dispatch still carries `req.depth` verbatim, so an LLM
+// resetting it there is bounded by the rate limiter, not the depth cap. A direct
+// cycle (caller already a member of the target engagement) is caught by the
 // member-lineage predicate in `dispatch_to_team`; a multi-party graph cycle
 // (A→B→C→A, no self-member hop) relies on the depth cap, not full detection.
 

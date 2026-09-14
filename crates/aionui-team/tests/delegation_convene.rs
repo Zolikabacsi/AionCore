@@ -777,3 +777,89 @@ async fn convene_persists_depth_for_onward_increment() {
         "absent depth defaults to the chain root"
     );
 }
+
+/// The team-side depth primitive the Phase 4c sender-inversion guard calls
+/// (`TeamSessionService::conversation_current_depth`) on the REAL stack — the
+/// riskiest derivation in the boundary, previously exercised only against a
+/// delegate-side mock. Max-over-delegated-roots is what makes the §5.9 cycle
+/// bound sound: an engagement serving both a shallow and a deep caller (the
+/// A↔B loop ratchets stored depth upward each hop: A{0} → B{1} → A{2} → …)
+/// must yield the DEEPEST depth, never a shallower one — a `min`/`latest`
+/// implementation would under-count and let the loop slip past MAX_DEPTH, so
+/// the second assertion below is the one that fails if the derivation ever
+/// stops taking the max.
+#[tokio::test]
+async fn conversation_current_depth_is_max_over_delegated_roots() {
+    let user = "u1";
+    let h = Harness::new(user).await;
+    let team = h.create_two_member_team(user, "Bridge Team").await;
+    let project = h.create_project(user).await;
+
+    let lead_conv = {
+        let convened = h
+            .svc
+            .convene_delegated_task(user, &team.id, &project, "s", "", None, "env", Some("caller-1"), 2)
+            .await
+            .unwrap();
+        let members = h
+            .repo
+            .list_engagement_members(user, &convened.engagement_id)
+            .await
+            .unwrap();
+        members
+            .iter()
+            .find(|m| m.role == "lead")
+            .expect("lead member")
+            .conversation_id
+            .clone()
+    };
+
+    assert_eq!(
+        h.svc.conversation_current_depth(user, &lead_conv).await.unwrap(),
+        2,
+        "the depth the engagement's delegated root was convened AT"
+    );
+
+    // A SECOND, shallower root on the same engagement must not lower it.
+    h.svc
+        .convene_delegated_task(user, &team.id, &project, "s2", "", None, "env", Some("caller-2"), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.svc.conversation_current_depth(user, &lead_conv).await.unwrap(),
+        2,
+        "max over roots: a shallow sibling convene must never under-count the loop bound"
+    );
+
+    // Non-member conversation: no engagement lineage at all -> 0 (chain root).
+    assert_eq!(
+        h.svc.conversation_current_depth(user, "stranger-conv").await.unwrap(),
+        0,
+        "a non-member conversation is its own chain root"
+    );
+
+    // Engagement member whose roots were convened WITHOUT a reply target
+    // (metadata-free, Phase 3a shape): no delegated depth to resume -> 0.
+    let legacy_team = h.create_two_member_team(user, "Legacy").await;
+    let legacy = h
+        .svc
+        .convene_delegated_task(user, &legacy_team.id, "__none__", "s", "", None, "env", None, 7)
+        .await
+        .unwrap();
+    let legacy_members = h
+        .repo
+        .list_engagement_members(user, &legacy.engagement_id)
+        .await
+        .unwrap();
+    let legacy_lead = legacy_members
+        .iter()
+        .find(|m| m.role == "lead")
+        .expect("lead")
+        .conversation_id
+        .clone();
+    assert_eq!(
+        h.svc.conversation_current_depth(user, &legacy_lead).await.unwrap(),
+        0,
+        "no delegated root -> 0, never the metadata-free convene's discarded depth"
+    );
+}
