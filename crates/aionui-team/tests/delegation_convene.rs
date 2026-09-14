@@ -418,6 +418,49 @@ async fn convene_reuses_engagement_creates_lead_root_task_and_envelopes_mailbox(
             .all(|m| m.to_agent_id == lead.slot_id && m.content.contains(envelope_text)),
         "lead mailbox rows must carry the envelope: {mail:?}"
     );
+    // Spec §5 step 4: the seam stamps its own correlation ids onto the mail
+    // (appended after the caller-composed block, which must stay byte-intact).
+    // Rows are ordered by creation: [first, second].
+    assert!(
+        mail[0].content.contains(&format!(
+            "engagement_id: {}\nroot_task_id: {}",
+            first.engagement_id, first.root_task_id
+        )),
+        "first envelope must carry its engagement/root_task ids: {mail:?}"
+    );
+    assert!(
+        mail[1]
+            .content
+            .contains(&format!("root_task_id: {}", second.root_task_id)),
+        "second envelope must carry its own root_task id: {mail:?}"
+    );
+}
+
+/// Phase 4a Task 3: a project-less dispatch passes the `__none__` sentinel and
+/// must convene/reuse the team's *default* engagement (id == team_id, inserted
+/// by `create_team`), without touching the project service at all (this
+/// harness never calls `with_project_service` — a real project lookup would
+/// fail here).
+#[tokio::test]
+async fn convene_with_no_project_sentinel_reuses_team_default_engagement() {
+    let user = "u1";
+    let h = Harness::new(user).await;
+    let team = h.create_two_member_team(user, "Bridge Team").await;
+
+    let convened = h
+        .svc
+        .convene_delegated_task(user, &team.id, "__none__", "s", "", None, "env")
+        .await
+        .expect("sentinel convene must reuse the default engagement");
+    assert_eq!(convened.engagement_id, team.id);
+
+    let again = h
+        .svc
+        .convene_delegated_task(user, &team.id, "__none__", "s2", "", None, "env")
+        .await
+        .expect("second sentinel convene reuses too");
+    assert_eq!(again.engagement_id, convened.engagement_id);
+    assert_ne!(again.root_task_id, convened.root_task_id);
 }
 
 #[tokio::test]

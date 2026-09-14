@@ -17,6 +17,13 @@ pub const AIONUI_SESSIONS_END_MARKER: &str = "[[/AION_SESSIONS]]";
 pub const AIONUI_SESSION_MESSAGE_MARKER: &str = "[[AION_SESSION_MESSAGE]]";
 pub const AIONUI_SESSION_MESSAGE_END_MARKER: &str = "[[/AION_SESSION_MESSAGE]]";
 
+// --- Team engagements ---
+
+/// Sentinel `project_id` for a team's *default* engagement (no real project
+/// bound). Backfilled by migrations 045/047; a project-less team dispatch
+/// convenes/reuses this engagement until the Phase 5 project selector exists.
+pub const TEAM_NO_PROJECT_SENTINEL: &str = "__none__";
+
 // --- WebSocket ---
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;

@@ -17,6 +17,7 @@ use aionui_api_types::{
     TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
+use aionui_common::constants::TEAM_NO_PROJECT_SENTINEL;
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{
@@ -806,14 +807,26 @@ impl TeamSessionService {
 
     /// Find-or-create the engagement binding `team_id` to `project_id`,
     /// reusing the same project→workspace resolution as `create_team`.
-    /// Thin service seam; not wired to runtime routing in Phase 1.
+    ///
+    /// `project_id` may be the [`TEAM_NO_PROJECT_SENTINEL`]: a project-less
+    /// caller (Phase 4a, pre-selector) convenes/reuses the team's *default*
+    /// engagement, whose workspace comes from the team template row instead of
+    /// a (non-existent) `__none__` project lookup.
     pub async fn ensure_engagement(
         &self,
         user_id: &str,
         team_id: &str,
         project_id: &str,
     ) -> Result<TeamEngagement, TeamError> {
-        let (workspace, _folder_id) = self.resolve_project_workspace(user_id, project_id).await?;
+        // Ownership first: a missing team and another user's team both surface
+        // as `TeamNotFound`, and the sentinel path needs the team row anyway.
+        let team_row = self.load_owned_team_row(user_id, team_id).await?;
+        let workspace = if project_id == TEAM_NO_PROJECT_SENTINEL {
+            team_row.workspace.clone()
+        } else {
+            let (workspace, _folder_id) = self.resolve_project_workspace(user_id, project_id).await?;
+            workspace
+        };
         let row = self
             .repo
             .find_or_create_engagement(user_id, team_id, project_id, &workspace)
@@ -822,7 +835,6 @@ impl TeamSessionService {
         // slot), each bound to the engagement workspace. Idempotent. The team row
         // is ownership-scoped by `get_team`, matching the guard already applied to
         // the engagement lookup above.
-        let team_row = self.load_owned_team_row(user_id, team_id).await?;
         let team = Team::from_row(&team_row)?;
         self.provisioner()
             .ensure_engagement_members(user_id, &row, &team)
@@ -835,7 +847,8 @@ impl TeamSessionService {
     /// create the root task on that engagement's board owned by the lead, and
     /// enqueue the caller-composed `[[AION_DELEGATE]]` envelope into the lead's
     /// engagement mailbox. `envelope_payload` is pre-composed by the caller
-    /// (via `compose_delivery_body`) — this seam never formats envelopes.
+    /// (via `compose_delivery_body`) — this seam never formats envelopes; it
+    /// only appends the engagement/root-task correlation ids it creates.
     ///
     /// Ownership: the team is loaded user-scoped FIRST, so a missing team and
     /// another user's team both surface as `TeamNotFound` (existence is never
@@ -876,6 +889,14 @@ impl TeamSessionService {
                 expected_output,
             )
             .await?;
+        // Spec §5 step 4 (Task-1 deferral #4): stamp the correlation ids this
+        // seam just created onto the envelope. They are *appended after* the
+        // caller-composed body so the `[[AION_DELEGATE]]` block text stays
+        // byte-intact — envelope formatting remains in `aionui-delegate`.
+        let envelope_payload = format!(
+            "{envelope_payload}\nengagement_id: {}\nroot_task_id: {}\n",
+            engagement.id, task.id
+        );
         Mailbox::new_for_user(self.repo.clone(), user_id)
             .with_events(emitter)
             .with_engagement(engagement.id.clone())
@@ -884,7 +905,7 @@ impl TeamSessionService {
                 &lead.slot_id,
                 "user",
                 MailboxMessageType::Message,
-                envelope_payload,
+                &envelope_payload,
                 Some(subject),
             )
             .await?;

@@ -29,7 +29,7 @@ use sqlx::Row;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::bridge::TeamEngagementBridge;
+use crate::bridge::{BridgeError, ConveneRootTask, TeamEngagementBridge};
 use crate::error::DelegateError;
 use crate::queue::DelegateQueue;
 use crate::rate_limit::{DelegateRateLimiter, RateVerdict};
@@ -81,9 +81,8 @@ pub struct DelegateService {
     #[allow(dead_code)]
     pub(crate) broadcaster: Arc<dyn EventBroadcaster>,
     pub(crate) task_manager: Arc<dyn IWorkerTaskManager>,
-    /// Team-engagement bridge port (Phase 4a). Stored only for now; the
-    /// dispatch site starts calling it in Task 3.
-    #[allow(dead_code)]
+    /// Team-engagement bridge port (Phase 4a): `dispatch` routes team targets
+    /// through it (see [`Self::dispatch_to_team`]).
     pub(crate) team_bridge: Arc<dyn TeamEngagementBridge>,
 }
 
@@ -228,11 +227,9 @@ impl DelegateService {
         }
     }
 
-    /// Dispatch/ask route only to assistants for now: a `Team` target resolves
-    /// in the roster (Phase 4a Task 2) but the dispatch→bridge wiring is
-    /// Task 3, so keep the observable dispatch behavior identical to pre-4a
-    /// (where a team name was never resolvable) by reporting it not found.
-    /// ponytail: delete this guard in Task 3 once routing to the bridge lands.
+    /// Sync-ask-only guard: teams are dispatchable via the bridge (Task 3) but
+    /// a *sync* ask against a team is not wired (result return is 4b), so keep
+    /// reporting it as not found for `ask`.
     async fn assistant_target(&self, user_id: &str, query: &str) -> Result<String, DelegateError> {
         let resolved = self.resolve_target(user_id, query).await?;
         if resolved.kind != DelegateTargetKind::Assistant {
@@ -354,7 +351,22 @@ impl DelegateService {
             });
         }
 
-        let target_assistant_id = self.assistant_target(user_id, &req.to).await?;
+        let resolved = self.resolve_target(user_id, &req.to).await?;
+        // Phase 4a: a team target convenes the engagement through the bridge
+        // port; the assistant delivery path below stays byte-identical.
+        if resolved.kind == DelegateTargetKind::Team {
+            return self
+                .dispatch_to_team(
+                    user_id,
+                    from_conversation_id,
+                    from_agent_name,
+                    &sender_row,
+                    &resolved,
+                    req,
+                )
+                .await;
+        }
+        let target_assistant_id = resolved.id;
         if !self
             .is_delegation_enabled_for_assistant(user_id, &target_assistant_id)
             .await?
@@ -460,6 +472,8 @@ impl DelegateService {
                     to_assistant_id: target_assistant_id,
                     envelope_id,
                     depth,
+                    engagement_id: None,
+                    root_task_id: None,
                 })
             }
             Err(transient_reason) => {
@@ -493,9 +507,125 @@ impl DelegateService {
                     to_assistant_id: target_assistant_id,
                     envelope_id,
                     depth,
+                    engagement_id: None,
+                    root_task_id: None,
                 })
             }
         }
+    }
+
+    /// Team-target branch of [`Self::dispatch`] (Phase 4a): find-or-create the
+    /// team's engagement for the caller's project and create the root task via
+    /// the bridge port instead of delivering into an assistant conversation.
+    ///
+    /// Guards kept from the assistant path: feature toggle + sender checks
+    /// (already applied by the caller), rate limit, depth. Ownership is
+    /// enforced by the team seam (spec §5). Cycle/depth re-keying to the
+    /// engagement is Phase 4b; `ponytail: 4a guards stay conversation-keyed`.
+    ///
+    /// Project resolution (spec §5 step 1): the sender conversation's
+    /// `project_id`; when the caller has no project, the sentinel
+    /// [`aionui_common::constants::TEAM_NO_PROJECT_SENTINEL`] is passed so the
+    /// team's backfilled default engagement (migrations 045/047) is
+    /// convened/reused — §10's hard "error without a project" is deferred to
+    /// the Phase 5 project selector.
+    async fn dispatch_to_team(
+        &self,
+        user_id: &str,
+        from_conversation_id: &str,
+        from_agent_name: &str,
+        sender_row: &aionui_db::models::ConversationRow,
+        target: &ResolvedDelegateTarget,
+        req: DelegateDispatchRequest,
+    ) -> Result<DelegateDispatchResponse, DelegateError> {
+        let team_id = &target.id;
+        if let RateVerdict::Tripped { .. } = self.rate_limiter.check_and_record(from_conversation_id, team_id) {
+            return Err(DelegateError::RateLimited {
+                from: from_conversation_id.to_owned(),
+                to: team_id.clone(),
+            });
+        }
+
+        let reply_to = req.reply_to.clone().unwrap_or_else(|| from_conversation_id.to_owned());
+        if reply_to != from_conversation_id {
+            let reply_row = self
+                .conversation_repo
+                .get(user_id, &reply_to)
+                .await
+                .map_err(|e| DelegateError::TransportUnavailable { reason: e.to_string() })?
+                .ok_or_else(|| DelegateError::ReplyTargetNotOwned { id: reply_to.clone() })?;
+            if team_id_from_extra(&reply_row.extra).is_some() {
+                return Err(DelegateError::ReplyTargetNotOwned { id: reply_to.clone() });
+            }
+        }
+
+        let depth = req.depth.unwrap_or(0);
+        if depth > MAX_DEPTH {
+            return Err(DelegateError::DepthExceeded { depth, max: MAX_DEPTH });
+        }
+
+        let project_id = sender_row
+            .project_id
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(aionui_common::constants::TEAM_NO_PROJECT_SENTINEL)
+            .to_owned();
+        let envelope_id = Uuid::now_v7().to_string();
+        let from_agent_id =
+            extract_assistant_id_from_extra_value(&serde_json::from_str(&sender_row.extra).unwrap_or_default())
+                .unwrap_or_default();
+        let block = DelegateEnvelopeBlock {
+            kind: DelegateEnvelopeKind::Dispatch,
+            from_agent_id,
+            from_agent_name: from_agent_name.to_owned(),
+            reply_to: Some(reply_to.clone()),
+            depth,
+            envelope_id: envelope_id.clone(),
+            workspace: "unknown (differs from yours)".to_owned(),
+            created_at_ms: now_ms(),
+        };
+        let root = ConveneRootTask {
+            subject: first_line(&req.message),
+            description: &req.message,
+            expected_output: req.expected_output.as_deref(),
+        };
+
+        let convened = self
+            .team_bridge
+            .convene_engagement(user_id, team_id, &project_id, root, &block)
+            .await
+            .map_err(|e| map_bridge_error(e, &target.name))?;
+
+        // Audit row keeps the (caller-rooted) chain visible to the guards; the
+        // engagement's own board owns the real task state.
+        self.persist_envelope(
+            &envelope_id,
+            user_id,
+            from_conversation_id,
+            &convened.engagement_id,
+            team_id,
+            depth,
+            "delivered",
+        )
+        .await?;
+        info!(
+            envelope_id,
+            from = from_conversation_id,
+            team_id,
+            engagement_id = %convened.engagement_id,
+            root_task_id = %convened.root_task_id,
+            depth,
+            "delegate dispatch convened team engagement"
+        );
+        Ok(DelegateDispatchResponse {
+            status: DelegateDeliveryStatus::Delivered,
+            to_conversation_id: convened.engagement_id.clone(),
+            to_assistant_id: team_id.clone(),
+            envelope_id,
+            depth,
+            engagement_id: Some(convened.engagement_id),
+            root_task_id: Some(convened.root_task_id),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -888,6 +1018,35 @@ impl DelegateService {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Map a bridge failure onto the delegate error surface (dispatch site of the
+/// team branch). Reuses existing `DelegateError` variants only:
+/// `TeamNotFound`/`NotOwner` → `TargetNotFound` (404; the team side already
+/// collapses "other user's team" into not-found, so existence never leaks and
+/// `NotOwner` maps the same way). `ProjectNotFound`/`Delivery` →
+/// `TransportUnavailable` (the convene itself failed, not the target lookup).
+fn map_bridge_error(error: BridgeError, team_name: &str) -> DelegateError {
+    match error {
+        BridgeError::TeamNotFound | BridgeError::NotOwner => DelegateError::TargetNotFound {
+            query: team_name.to_owned(),
+        },
+        BridgeError::ProjectNotFound => DelegateError::TransportUnavailable {
+            reason: format!("team '{team_name}' could not resolve the project engagement"),
+        },
+        BridgeError::Delivery(reason) => DelegateError::TransportUnavailable { reason },
+    }
+}
+
+/// Root-task subject for a convened task: the message's first non-empty line
+/// (the task label the request carries).
+/// ponytail: no length cap; truncate when noisy subjects show up in boards.
+fn first_line(message: &str) -> &str {
+    message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+}
 
 fn team_id_from_extra(extra: &str) -> Option<String> {
     // Canonical key is `teamId` (camelCase) — provisioned by the team runtime

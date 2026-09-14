@@ -143,6 +143,11 @@ pub struct DelegateDispatchRequest {
     /// envelope chain. Setting this manually is a debug aid.
     #[serde(default)]
     pub depth: Option<u32>,
+    /// Optional success criteria. On a team-target dispatch this becomes the
+    /// engagement root task's `expected_output` (spec §5 step 4); ignored on
+    /// the assistant path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +168,13 @@ pub struct DelegateDispatchResponse {
     pub to_assistant_id: String,
     pub envelope_id: String,
     pub depth: u32,
+    /// Team dispatch only: the engagement convened/reused by the bridge.
+    /// `None` (omitted from the wire payload) for the assistant path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engagement_id: Option<String>,
+    /// Team dispatch only: the root task created on the engagement board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_task_id: Option<String>,
 }
 
 /// Body of `POST /api/runtime/delegate/ask` (sync mode).
@@ -370,7 +382,8 @@ fn delegate_tool_specs() -> Vec<DelegateToolSpec> {
                     "message": { "type": "string", "description": "Task body the recipient will execute." },
                     "files": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute file paths to attach." },
                     "reply_to": { "type": "string", "description": "Optional conversation_id that should receive the reply. Default: your conversation." },
-                    "depth": { "type": "integer", "description": "Optional chain depth override (debug aid)." }
+                    "depth": { "type": "integer", "description": "Optional chain depth override (debug aid)." },
+                    "expected_output": { "type": "string", "description": "Optional success criteria; on a team target it becomes the engagement root task's expected_output." }
                 },
                 "required": ["to", "message"],
                 "additionalProperties": false
