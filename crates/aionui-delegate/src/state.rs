@@ -11,6 +11,7 @@ use aionui_db::IConversationRepository;
 use aionui_db::ISettingsRepository;
 use aionui_realtime::EventBroadcaster;
 
+use crate::bridge::TeamEngagementBridge;
 use crate::queue::DelegateQueue;
 use crate::rate_limit::DelegateRateLimiter;
 use crate::service::DelegateService;
@@ -28,4 +29,6 @@ pub struct DelegateRouterState {
     pub broadcaster: Arc<dyn EventBroadcaster>,
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub task_manager: Arc<dyn IWorkerTaskManager>,
+    /// Team-engagement bridge port; called from dispatch in Phase 4a Task 3.
+    pub team_bridge: Arc<dyn TeamEngagementBridge>,
 }

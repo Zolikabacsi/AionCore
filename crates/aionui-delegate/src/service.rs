@@ -29,6 +29,7 @@ use sqlx::Row;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::bridge::TeamEngagementBridge;
 use crate::error::DelegateError;
 use crate::queue::DelegateQueue;
 use crate::rate_limit::{DelegateRateLimiter, RateVerdict};
@@ -80,6 +81,10 @@ pub struct DelegateService {
     #[allow(dead_code)]
     pub(crate) broadcaster: Arc<dyn EventBroadcaster>,
     pub(crate) task_manager: Arc<dyn IWorkerTaskManager>,
+    /// Team-engagement bridge port (Phase 4a). Stored only for now; the
+    /// dispatch site starts calling it in Task 3.
+    #[allow(dead_code)]
+    pub(crate) team_bridge: Arc<dyn TeamEngagementBridge>,
 }
 
 impl DelegateService {
@@ -89,6 +94,7 @@ impl DelegateService {
         settings_repo: Arc<dyn ISettingsRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
         task_manager: Arc<dyn IWorkerTaskManager>,
+        team_bridge: Arc<dyn TeamEngagementBridge>,
     ) -> Self {
         use crate::queue::{DelegateQueue, SystemClock};
         use crate::rate_limit::DelegateRateLimiter;
@@ -102,6 +108,7 @@ impl DelegateService {
             settings_repo,
             broadcaster,
             task_manager,
+            team_bridge,
         }
     }
 

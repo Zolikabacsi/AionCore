@@ -2,6 +2,7 @@
 
 mod antigravity_hook;
 mod clipboard_writer;
+mod delegate_team_bridge;
 mod fs_monitor;
 mod health;
 mod item_revealer;
