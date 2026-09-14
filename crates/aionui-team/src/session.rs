@@ -34,6 +34,7 @@ use crate::ports::{
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
 use crate::provisioning::PersistSpawnedAgentRequest;
+use crate::result_delivery::{delegated_engagement_id, delegated_reply_to};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
@@ -741,6 +742,14 @@ impl TeamSession {
     /// — never fails the finalize/wake/idle path: when no assistant text is
     /// readable (legacy/hierarchical teams, a resume with no message yet, a
     /// test double without the service) the capture is a no-op.
+    ///
+    /// Phase 4b §8 addendum: when the captured task carries the convene-stamped
+    /// `delegate_reply_to` metadata (it is a delegated engagement root), the
+    /// consolidated result is also returned to the caller through the
+    /// `DelegatedResultDelivery` port — asynchronously (spawned) and
+    /// best-effort (a delivery failure warns, it never blocks the finalize).
+    /// Tasks without that metadata never reach the port: ordinary and legacy
+    /// completions are byte-identical to Phase 3a.
     pub(crate) async fn capture_turn_results(&self, slot_id: &str) {
         let pending = self.scheduler.take_pending_task_results(slot_id).await;
         if pending.is_empty() {
@@ -760,16 +769,78 @@ impl TeamSession {
             return;
         }
         for task_id in &pending {
-            if let Err(error) = self.task_board.set_task_result(&self.team.id, task_id, text).await {
-                warn!(
-                    team_id = %self.team.id,
-                    slot_id,
-                    task_id = %task_id,
-                    error = %error,
-                    "task result capture failed"
-                );
-            }
+            let metadata = match self.task_board.set_task_result(&self.team.id, task_id, text).await {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warn!(
+                        team_id = %self.team.id,
+                        slot_id,
+                        task_id = %task_id,
+                        error = %error,
+                        "task result capture failed"
+                    );
+                    continue;
+                }
+            };
+            self.deliver_delegated_result(task_id, metadata.as_ref(), text);
         }
+    }
+
+    /// Spec §8 return leg: a task whose metadata carries `delegate_reply_to`
+    /// is a delegated engagement root and owes the caller its consolidated
+    /// result. Fire-and-forget via `tokio::spawn` so delivery latency/failure
+    /// can never block or fail the turn finalize that just captured the
+    /// result; ownership/validation (spec §10) lives in the adapter. No
+    /// metadata → nothing happens (the Phase 3a path is untouched).
+    fn deliver_delegated_result(&self, task_id: &str, metadata: Option<&serde_json::Value>, text: &str) {
+        let Some(caller_conversation_id) = delegated_reply_to(metadata) else {
+            return;
+        };
+        let Some(service) = self.service.upgrade() else {
+            warn!(
+                team_id = %self.team.id,
+                task_id,
+                "delegated result not returned: no service to resolve the delivery port"
+            );
+            return;
+        };
+        let Some(port) = service.result_delivery() else {
+            warn!(
+                team_id = %self.team.id,
+                task_id,
+                caller_conversation_id,
+                "delegated result not returned: delivery port not wired"
+            );
+            return;
+        };
+        let engagement_id = delegated_engagement_id(metadata, &self.engagement_id);
+        let (user_id, team_id) = (self.user_id.clone(), self.team.id.clone());
+        let task_id = task_id.to_owned();
+        let text = text.to_owned();
+        tokio::spawn(async move {
+            match port
+                .deliver_result(&user_id, &caller_conversation_id, &engagement_id, &text)
+                .await
+            {
+                Ok(()) => info!(
+                    kind = "team",
+                    team_id,
+                    task_id,
+                    engagement_id,
+                    caller_conversation_id,
+                    "delegated engagement result returned to caller"
+                ),
+                Err(error) => warn!(
+                    kind = "team",
+                    team_id,
+                    task_id,
+                    engagement_id,
+                    caller_conversation_id,
+                    error = %error,
+                    "delegated engagement result delivery failed; result stays on the task"
+                ),
+            }
+        });
     }
 
     async fn latest_assistant_text_for_slot(&self, slot_id: &str) -> Option<String> {

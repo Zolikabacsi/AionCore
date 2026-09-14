@@ -15,6 +15,7 @@ pub mod ports;
 pub mod prompt_dump;
 pub mod prompts;
 pub mod provisioning;
+pub mod result_delivery;
 pub mod routes;
 pub mod runtime_tools;
 pub mod scheduler;
@@ -53,6 +54,10 @@ pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload, 
 pub use provisioning::{
     TeamAgentProvisioner, TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationModelFacts,
     TeamConversationProvisioningPort, TeamMcpSnapshotResolution,
+};
+pub use result_delivery::{
+    DELEGATE_REPLY_TO_KEY, DelegatedResultDelivery, ENGAGEMENT_ID_KEY, NoopDelegatedResultDelivery,
+    delegated_engagement_id, delegated_reply_to, delegated_result_metadata,
 };
 pub use routes::{TeamRouterState, team_routes};
 pub use runtime_tools::ResolvedTeamToolContext;

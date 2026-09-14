@@ -53,6 +53,7 @@ impl TeamEngagementBridge for TeamEngagementBridgeAdapter {
                 root.description,
                 root.expected_output,
                 &envelope_payload,
+                envelope.reply_to.as_deref(),
             )
             .await
             .map_err(map_team_error)?;

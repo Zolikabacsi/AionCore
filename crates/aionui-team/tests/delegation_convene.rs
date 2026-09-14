@@ -372,12 +372,13 @@ async fn convene_reuses_engagement_creates_lead_root_task_and_envelopes_mailbox(
             "description one",
             Some("done when X"),
             envelope_text,
+            None,
         )
         .await
         .expect("convene ok");
     let second = h
         .svc
-        .convene_delegated_task(user, &team.id, &project, "subject two", "", None, envelope_text)
+        .convene_delegated_task(user, &team.id, &project, "subject two", "", None, envelope_text, None)
         .await
         .expect("convene ok again");
 
@@ -453,7 +454,7 @@ async fn convene_stamps_correlation_ids_before_the_body_so_they_cannot_be_shadow
 
     let convened = h
         .svc
-        .convene_delegated_task(user, &team.id, &project, "s", "", None, payload)
+        .convene_delegated_task(user, &team.id, &project, "s", "", None, payload, None)
         .await
         .expect("convene ok");
 
@@ -534,7 +535,7 @@ async fn convene_no_project_sentinel_on_project_bound_team_reuses_team_default()
 
     let convened = h
         .svc
-        .convene_delegated_task(user, &team.id, "__none__", "s", "d", None, "env")
+        .convene_delegated_task(user, &team.id, "__none__", "s", "d", None, "env", None)
         .await
         .expect("sentinel convene must resolve to the team's default engagement");
     assert_eq!(convened.engagement_id, team.id, "default engagement is id == team_id");
@@ -580,14 +581,14 @@ async fn convene_with_no_project_sentinel_reuses_team_default_engagement() {
 
     let convened = h
         .svc
-        .convene_delegated_task(user, &team.id, "__none__", "s", "", None, "env")
+        .convene_delegated_task(user, &team.id, "__none__", "s", "", None, "env", None)
         .await
         .expect("sentinel convene must reuse the default engagement");
     assert_eq!(convened.engagement_id, team.id);
 
     let again = h
         .svc
-        .convene_delegated_task(user, &team.id, "__none__", "s2", "", None, "env")
+        .convene_delegated_task(user, &team.id, "__none__", "s2", "", None, "env", None)
         .await
         .expect("second sentinel convene reuses too");
     assert_eq!(again.engagement_id, convened.engagement_id);
@@ -604,7 +605,7 @@ async fn convene_by_non_owner_is_rejected_without_side_effects() {
     let intruder = "intruder";
     let err = h
         .svc
-        .convene_delegated_task(intruder, &team.id, &project, "steal", "", None, "env")
+        .convene_delegated_task(intruder, &team.id, &project, "steal", "", None, "env", None)
         .await
         .expect_err("non-owner must be rejected");
     // Same convention as the read paths: a missing team and another user's team
