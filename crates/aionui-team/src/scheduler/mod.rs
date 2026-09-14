@@ -12,7 +12,7 @@ use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
 use crate::mailbox::Mailbox;
 use crate::task_board::TaskBoard;
-use crate::types::{MailboxMessage, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, TaskProcess, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
 
 mod actions;
 mod agent_lifecycle;
@@ -133,9 +133,14 @@ pub struct TeammateManager {
     /// finalize (Phase 3a). Keyed by slot id; drained and cleared by
     /// `TeamSession::capture_turn_results` when the slot's turn ends.
     pub(crate) pending_task_results: Mutex<HashMap<String, Vec<String>>>,
+    /// Per-engagement scheduling mode. Threaded in at session start; the
+    /// sequential gate is applied by wake/scheduling (Task 3b.3). Default is
+    /// `Hierarchical`, so pre-Phase-3b behavior is byte-identical.
+    process: TaskProcess,
 }
 
 impl TeammateManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         team_id: String,
         user_id: String,
@@ -143,6 +148,7 @@ impl TeammateManager {
         mailbox: Arc<Mailbox>,
         task_board: Arc<TaskBoard>,
         broadcaster: Arc<dyn EventBroadcaster>,
+        process: TaskProcess,
     ) -> Self {
         let mut slots = HashMap::new();
         for agent in agents {
@@ -168,7 +174,13 @@ impl TeammateManager {
             finalized_turns: Arc::new(DashMap::new()),
             wake_timeouts: Arc::new(DashMap::new()),
             pending_task_results: Mutex::new(HashMap::new()),
+            process,
         }
+    }
+
+    /// The engagement's scheduling mode this manager was built with.
+    pub fn process(&self) -> TaskProcess {
+        self.process
     }
 
     pub async fn get_agent(&self, slot_id: &str) -> Result<TeamAgent, TeamError> {

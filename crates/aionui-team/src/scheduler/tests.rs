@@ -13,7 +13,29 @@ use crate::crash_detection::CrashReason;
 use crate::mailbox::Mailbox;
 use crate::task_board::TaskBoard;
 use crate::test_utils::MockTeamRepo;
-use crate::types::{MailboxMessageType, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessageType, TaskProcess, TeammateRole, TeammateStatus};
+
+// -----------------------------------------------------------------
+// process mode plumbing (Task 3b.2): scheduler carries the mode, no gate yet
+// -----------------------------------------------------------------
+
+#[test]
+fn scheduler_reports_configured_process_mode() {
+    let build = |process| {
+        let repo = Arc::new(MockTeamRepo::new());
+        TeammateManager::new(
+            "t1".into(),
+            "user-1".into(),
+            &[make_agent("lead-1", "Lead", TeammateRole::Lead)],
+            Arc::new(Mailbox::new(repo.clone())),
+            Arc::new(TaskBoard::new(repo)),
+            Arc::new(RecordingBroadcaster::new()),
+            process,
+        )
+    };
+    assert_eq!(build(TaskProcess::Sequential).process(), TaskProcess::Sequential);
+    assert_eq!(build(TaskProcess::Hierarchical).process(), TaskProcess::Hierarchical);
+}
 
 // -----------------------------------------------------------------
 // normalize_name — §15.1 contract
@@ -101,6 +123,7 @@ fn make_manager(agents: &[TeamAgent]) -> (TeammateManager, Arc<RecordingBroadcas
         mailbox,
         task_board,
         broadcaster.clone(),
+        TaskProcess::Hierarchical,
     );
     (mgr, broadcaster)
 }
@@ -477,6 +500,7 @@ async fn execute_shutdown_agent_writes_shutdown_request() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.request_shutdown_agent("lead-1", "worker-1", Some("No longer needed"))
@@ -512,6 +536,7 @@ async fn lead_cannot_shutdown_lead() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     let result = mgr
@@ -543,6 +568,7 @@ async fn lead_can_shutdown_worker() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.request_shutdown_agent("lead-1", "worker-1", Some("not needed"))
@@ -570,6 +596,7 @@ async fn finalize_turn_marks_idle_exactly_once() {
         mailbox,
         task_board,
         broadcaster.clone(),
+        TaskProcess::Hierarchical,
     );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
@@ -593,7 +620,15 @@ async fn finalize_turn_all_teammates_done_signals_leader_wake() {
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
     let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, broadcaster);
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board,
+        broadcaster,
+        TaskProcess::Hierarchical,
+    );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
     mgr.set_status("worker-2", TeammateStatus::Working).await.unwrap();
@@ -620,6 +655,7 @@ async fn wake_payload_includes_tasks_and_unread() {
         mailbox.clone(),
         task_board.clone(),
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     task_board
@@ -661,6 +697,7 @@ async fn mark_idle_with_summary_writes_idle_notification_to_lead() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
@@ -688,6 +725,7 @@ async fn mark_idle_without_summary_still_writes_fallback_content() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
@@ -713,6 +751,7 @@ async fn mark_idle_from_lead_does_not_write_notification() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
@@ -1141,6 +1180,7 @@ async fn write_crash_testament_delivers_to_lead_mailbox() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.write_crash_testament("worker-1", "Worker1", &CrashReason::ProcessExited, None)
@@ -1174,6 +1214,7 @@ async fn write_crash_testament_noop_when_no_lead() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     // Should not panic or error
@@ -1204,6 +1245,7 @@ async fn write_crash_testament_noop_when_lead_crashes() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     // Lead crashing should not write to itself
@@ -1268,6 +1310,7 @@ async fn handle_agent_crash_writes_testament_to_lead() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.handle_agent_crash("worker-1", CrashReason::Unknown("segfault".into()), Some("cleaning up"))
@@ -1319,6 +1362,7 @@ async fn handle_agent_crash_leader_branch_returns_none() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
@@ -1436,6 +1480,7 @@ async fn handle_inactivity_timeout_teammate_marks_error_and_wakes_lead() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.set_status("worker-1", TeammateStatus::Working).await.unwrap();
@@ -1471,6 +1516,7 @@ async fn handle_inactivity_timeout_leader_returns_none_no_mailbox_write() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.set_status("lead-1", TeammateStatus::Working).await.unwrap();
@@ -1555,6 +1601,7 @@ async fn handle_inactivity_timeout_no_lead_returns_none() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     let wake_target = mgr.handle_inactivity_timeout("worker-1").await.unwrap();
@@ -1582,6 +1629,7 @@ async fn notify_shutdown_rejected_delivers_to_lead_mailbox() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.notify_shutdown_rejected("worker-1", "still working on task X")
@@ -1616,6 +1664,7 @@ async fn notify_shutdown_rejected_noop_when_no_lead() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.notify_shutdown_rejected("worker-1", "busy").await.unwrap();
@@ -1640,6 +1689,7 @@ async fn notify_shutdown_rejected_noop_when_sender_is_lead() {
         mailbox.clone(),
         task_board,
         broadcaster,
+        TaskProcess::Hierarchical,
     );
 
     mgr.notify_shutdown_rejected("lead-1", "irrelevant").await.unwrap();

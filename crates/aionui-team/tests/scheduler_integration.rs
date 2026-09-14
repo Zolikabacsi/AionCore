@@ -5,7 +5,8 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::{
-    Mailbox, MailboxMessageType, TaskBoard, TeamAgent, TeammateManager, TeammateRole, TeammateStatus, WAKE_TIMEOUT_MS,
+    Mailbox, MailboxMessageType, TaskBoard, TaskProcess, TeamAgent, TeammateManager, TeammateRole, TeammateStatus,
+    WAKE_TIMEOUT_MS,
 };
 use common::MockTeamRepo;
 
@@ -75,6 +76,7 @@ fn setup_team(agents: &[TeamAgent]) -> TestHarness {
         mailbox.clone(),
         task_board.clone(),
         broadcaster.clone(),
+        TaskProcess::Hierarchical,
     );
     TestHarness {
         mgr,

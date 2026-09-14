@@ -255,6 +255,18 @@ pub trait ITeamRepository: Send + Sync {
         Err(DbError::NotFound("find_engagement not implemented".to_string()))
     }
 
+    /// Returns the engagement identified by `engagement_id`, owned by `user_id`,
+    /// or `None`. Scoped to `user_id` for data isolation. Used to read the
+    /// engagement's `process` mode at session start (the id is already resolved,
+    /// so this is the by-primary-key counterpart to `find_engagement`).
+    async fn find_engagement_by_id(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
+        Err(DbError::NotFound("find_engagement_by_id not implemented".to_string()))
+    }
+
     /// Returns all engagements for `user_id` in a team, oldest first.
     async fn list_engagements(&self, _user_id: &str, _team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError> {
         Err(DbError::NotFound("list_engagements not implemented".to_string()))

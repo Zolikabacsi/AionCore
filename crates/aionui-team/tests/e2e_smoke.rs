@@ -30,7 +30,7 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
-use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole};
+use aionui_team::{Mailbox, TaskBoard, TaskProcess, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole};
 use common::MockTeamRepo;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -106,6 +106,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
         mailbox.clone(),
         task_board.clone(),
         broadcaster.clone(),
+        TaskProcess::Hierarchical,
     ));
 
     let auth_token = "smoke-token".to_string();
