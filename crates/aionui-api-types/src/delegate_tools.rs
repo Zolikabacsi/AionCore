@@ -212,15 +212,24 @@ pub enum DelegateTargetKind {
     Team,
 }
 
+impl DelegateTargetKind {
+    /// Used as the `skip_serializing_if` predicate so an `Assistant` target's
+    /// wire payload carries no `kind` key (byte-identical to pre-4a).
+    pub fn is_assistant(&self) -> bool {
+        *self == Self::Assistant
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateTarget {
     pub assistant_id: String,
     pub name: String,
     pub backend: String,
     pub description: Option<String>,
-    /// Target kind. Defaults to `Assistant` so pre-4a serialized payloads
-    /// (which lack the field) deserialize unchanged.
-    #[serde(default)]
+    /// Target kind. Defaults to `Assistant` on read (pre-4a payloads lack it)
+    /// and is omitted from the wire for assistants so their serialized bytes are
+    /// unchanged; only `Team` entries emit `"kind":"team"`.
+    #[serde(default, skip_serializing_if = "DelegateTargetKind::is_assistant")]
     pub kind: DelegateTargetKind,
     /// Populated only for `Team` entries; `None` for assistants. Omitted from
     /// the wire when absent so assistant responses stay byte-identical.

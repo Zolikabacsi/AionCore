@@ -205,6 +205,17 @@ impl DelegateService {
             }
         }
 
+        // Deterministic tie-break for an exact-name collision between an
+        // assistant and a team: the ASSISTANT wins, because until Phase 4a
+        // Task 3 a team target is not dispatchable, so an assistant that
+        // resolved this name before must keep resolving (non-breaking superset).
+        // Genuine same-kind ambiguity is preserved (two exact teams, or the
+        // prefix arms below, still error as before). Assistant-only users see
+        // `exact` filtered to a no-op (all already Assistant).
+        if exact.iter().any(|t| t.kind == DelegateTargetKind::Assistant) {
+            exact.retain(|t| t.kind == DelegateTargetKind::Assistant);
+        }
+
         match (exact.len(), prefix.len()) {
             (0, 0) => Err(DelegateError::TargetNotFound { query: q.to_owned() }),
             (1, _) => Ok(exact.into_iter().next().unwrap()),

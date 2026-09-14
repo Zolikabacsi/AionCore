@@ -237,3 +237,61 @@ async fn empty_roster_yields_target_not_found() {
         aionui_delegate::error::DelegateError::TargetNotFound { .. }
     ));
 }
+
+/// Regression: an assistant target must serialize EXACTLY as before Phase 4a —
+/// no `kind` key at all on the wire. Only a `Team` entry emits `kind`/`team_id`.
+#[tokio::test]
+async fn assistant_target_wire_payload_has_no_kind_key() {
+    let (svc, r) = service().await;
+    insert_assistant(&r, "asstdef-1", "custom-1", "CMO").await;
+    let resp = svc
+        .list_targets("user-1", DelegateTargetsQuery::default())
+        .await
+        .unwrap();
+    let asst = &resp.items[0];
+    let map = serde_json::to_value(asst).unwrap().as_object().unwrap().clone();
+    assert!(
+        !map.contains_key("kind"),
+        "assistant wire payload gained a `kind` key: {map:?}"
+    );
+    assert!(!map.contains_key("team_id"));
+
+    insert_team(&r, "team-1", "Growth", false).await;
+    let resp = svc
+        .list_targets("user-1", DelegateTargetsQuery::default())
+        .await
+        .unwrap();
+    let team = resp.items.iter().find(|t| t.kind == DelegateTargetKind::Team).unwrap();
+    let tmap = serde_json::to_value(team).unwrap().as_object().unwrap().clone();
+    assert_eq!(tmap.get("kind").and_then(|v| v.as_str()), Some("team"));
+    assert_eq!(tmap.get("team_id").and_then(|v| v.as_str()), Some("team-1"));
+}
+
+/// Regression: a team and an assistant sharing an EXACT name must resolve to the
+/// ASSISTANT (dispatch to a team is not wired until Task 3), not error out.
+#[tokio::test]
+async fn exact_name_collision_resolves_to_assistant() {
+    let (svc, r) = service().await;
+    insert_assistant(&r, "asstdef-1", "custom-1", "Bot").await;
+    insert_team(&r, "team-1", "Bot", false).await;
+    let hit = svc.resolve_target("user-1", "Bot").await.unwrap();
+    assert_eq!(
+        hit.kind,
+        DelegateTargetKind::Assistant,
+        "assistant must win exact collision"
+    );
+    assert_eq!(hit.id, "asstdef-1");
+}
+
+/// Same-kind ambiguity is preserved: a prefix matching two teams still errors.
+#[tokio::test]
+async fn two_teams_shared_prefix_is_ambiguous() {
+    let (svc, r) = service().await;
+    insert_team(&r, "team-1", "Growth A", false).await;
+    insert_team(&r, "team-2", "Growth B", false).await;
+    let err = svc.resolve_target("user-1", "Growth").await.unwrap_err();
+    assert!(
+        matches!(err, aionui_delegate::error::DelegateError::AmbiguousTarget { .. }),
+        "two-team prefix collision should stay ambiguous, got {err:?}"
+    );
+}
