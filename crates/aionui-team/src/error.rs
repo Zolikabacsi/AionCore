@@ -28,6 +28,9 @@ pub enum TeamError {
     #[error("Blocked task not found: {0}")]
     BlockedTaskNotFound(String),
 
+    #[error("Cyclic task dependency: {task_id} cannot be blocked by {dependency}")]
+    CyclicDependency { task_id: String, dependency: String },
+
     #[error("Backend not allowed: {0}")]
     BackendNotAllowed(String),
 
@@ -174,6 +177,14 @@ mod tests {
         assert_eq!(TeamError::TeamNotFound("t1".into()).to_string(), "Team not found: t1");
         assert_eq!(TeamError::AgentNotFound("s1".into()).to_string(), "Agent not found: s1");
         assert_eq!(TeamError::TaskNotFound("tk1".into()).to_string(), "Task not found: tk1");
+        assert_eq!(
+            TeamError::CyclicDependency {
+                task_id: "A".into(),
+                dependency: "B".into()
+            }
+            .to_string(),
+            "Cyclic task dependency: A cannot be blocked by B"
+        );
     }
 
     #[test]

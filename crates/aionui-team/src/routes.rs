@@ -57,6 +57,15 @@ impl From<TeamError> for ApiError {
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
             TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
+            TeamError::CyclicDependency { task_id, dependency } => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "TEAM_CYCLIC_DEPENDENCY",
+                format!("Cyclic task dependency: {task_id} cannot be blocked by {dependency}"),
+                Some(serde_json::json!({
+                    "task_id": task_id,
+                    "dependency": dependency,
+                })),
+            ),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::RuntimeNotReady { conversation_id } => ApiError::coded(
@@ -783,6 +792,21 @@ mod tests {
     fn blocked_task_not_found_maps_to_bad_request() {
         let err: ApiError = TeamError::BlockedTaskNotFound("tk-x".into()).into();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn cyclic_dependency_maps_to_bad_request_with_code() {
+        let err: ApiError = TeamError::CyclicDependency {
+            task_id: "tk-a".into(),
+            dependency: "tk-b".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_code(), "TEAM_CYCLIC_DEPENDENCY");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({ "task_id": "tk-a", "dependency": "tk-b" }))
+        );
     }
 
     #[test]

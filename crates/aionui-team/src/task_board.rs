@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aionui_api_types::TeamTaskChange;
@@ -81,6 +82,42 @@ impl TaskBoard {
         Ok(row)
     }
 
+    /// Reject a new `blocked_by` edge set for `task_id` that would make the
+    /// engagement's task graph cyclic (spec §7.3). The graph is read through the
+    /// engagement-scoped [`list_tasks`](Self::list_tasks), so a cycle can only
+    /// ever be formed inside this board's engagement.
+    ///
+    /// For each proposed dependency, a DFS over the existing `blocked_by`
+    /// transitive closure checks whether `task_id` is reachable from it; if so,
+    /// adding `task_id -> dep` closes a cycle and the update is rejected without
+    /// writing. A self-edge (`dep == task_id`) is caught immediately.
+    async fn assert_no_cycle(&self, team_id: &str, task_id: &str, new_blocked_by: &[String]) -> Result<(), TeamError> {
+        let tasks = self.list_tasks(team_id).await?;
+        let mut graph: HashMap<&str, &[String]> = HashMap::with_capacity(tasks.len());
+        for task in &tasks {
+            graph.insert(task.id.as_str(), &task.blocked_by);
+        }
+
+        let mut visited: HashSet<&str> = HashSet::new();
+        for dep in new_blocked_by {
+            let mut stack = vec![dep.as_str()];
+            while let Some(node) = stack.pop() {
+                if node == task_id {
+                    return Err(TeamError::CyclicDependency {
+                        task_id: task_id.to_owned(),
+                        dependency: dep.clone(),
+                    });
+                }
+                if visited.insert(node)
+                    && let Some(next) = graph.get(node)
+                {
+                    stack.extend(next.iter().map(String::as_str));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_task(
         &self,
         team_id: &str,
@@ -103,6 +140,13 @@ impl TaskBoard {
 
         let task_id = generate_id();
         let now = now_ms();
+        // Acyclicity (spec §7.3): reject a `blocked_by` that closes a cycle
+        // before persisting. A brand-new id has no dependents yet, so for
+        // `create_task` this only catches a self-edge — kept for the shared
+        // invariant the update path also relies on. Runs after the dep-exists
+        // loop above (validate edges exist, then validate the graph is acyclic).
+        self.assert_no_cycle(team_id, &task_id, blocked_by).await?;
+
         let blocked_by_json = serde_json::to_string(blocked_by)?;
 
         let row = TeamTaskRow {
@@ -150,6 +194,14 @@ impl TaskBoard {
             .find_task(team_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
+
+        // Acyclicity (spec §7.3): when the dependency set is being replaced,
+        // reject edges that would close a cycle BEFORE persisting. This is the
+        // path where real cycles appear (e.g. A blocked-by B after B was
+        // created blocked-by A).
+        if let Some(new_blocked_by) = &update.blocked_by {
+            self.assert_no_cycle(team_id, task_id, new_blocked_by).await?;
+        }
 
         let params = UpdateTaskParams {
             status: update.status.map(|s| s.to_string()),
