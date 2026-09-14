@@ -56,6 +56,7 @@ use aionui_team::{
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::delegate_team_bridge::TeamEngagementBridgeAdapter;
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
@@ -299,6 +300,20 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
     );
+    // The team state is built before the bundle (not inside the literal) so the
+    // delegate state can receive the team-engagement bridge adapter: delegate
+    // and team are same-layer crates and only meet through the port, which the
+    // adapter here implements over the team service.
+    let team = build_module_state_phase(&boot, "team", || {
+        build_team_state(
+            services,
+            Some(cron.cron_service.clone()),
+            backend_binary_path.clone(),
+            assistant.service.clone(),
+        )
+    });
+    let team_bridge: Arc<dyn aionui_delegate::bridge::TeamEngagementBridge> =
+        Arc::new(TeamEngagementBridgeAdapter::new(team.service.clone()));
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
@@ -322,16 +337,11 @@ pub async fn build_module_states(
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
-        team: build_module_state_phase(&boot, "team", || {
-            build_team_state(
-                services,
-                Some(cron.cron_service.clone()),
-                backend_binary_path.clone(),
-                assistant.service.clone(),
-            )
-        }),
+        team,
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
-        delegate: build_module_state_phase(&boot, "delegate", || build_delegate_state(services)),
+        delegate: build_module_state_phase(&boot, "delegate", || {
+            build_delegate_state(services, team_bridge.clone())
+        }),
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
@@ -419,7 +429,12 @@ pub fn build_session_message_state(services: &AppServices) -> SessionMessageRout
 
 /// Build the `aionui-delegate` router state. Mirrors the `session-message`
 /// shape: queue + rate limiter + suspend registry + service + repo wiring.
-pub fn build_delegate_state(services: &AppServices) -> DelegateRouterState {
+/// The team-engagement bridge is injected by the caller because the team
+/// service is constructed just before this in the module-states sequence.
+pub fn build_delegate_state(
+    services: &AppServices,
+    team_bridge: Arc<dyn aionui_delegate::bridge::TeamEngagementBridge>,
+) -> DelegateRouterState {
     use aionui_delegate::service::DelegateService;
 
     let service = Arc::new(DelegateService::new(
@@ -428,6 +443,7 @@ pub fn build_delegate_state(services: &AppServices) -> DelegateRouterState {
         services.settings_repo.clone(),
         services.event_broadcaster.clone(),
         services.worker_task_manager.clone(),
+        team_bridge.clone(),
     ));
 
     DelegateRouterState {
@@ -438,6 +454,7 @@ pub fn build_delegate_state(services: &AppServices) -> DelegateRouterState {
         broadcaster: services.event_broadcaster.clone(),
         runtime_token_service: services.runtime_token_service.clone(),
         task_manager: services.worker_task_manager.clone(),
+        team_bridge,
         // queue/rate_limiter/suspend are exposed via the service's
         // `Arc` clone — the router only needs `service` to dispatch.
         queue: service.queue.clone(),

@@ -840,9 +840,8 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        Cli, Command, ConfigArgs, ConfigCommand, DelegateArgs, DelegateCommand, ManagedResourcesModeArg,
-        PrepareManagedResourcesArgs, SecretArgs, SecretCommand, SessionCommand, TeamCommand, UserArgs,
-        UserCommand, UserStatusArgs,
+        Cli, Command, ConfigArgs, ConfigCommand, DelegateCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs,
+        SecretArgs, SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
     };
 
     #[test]

@@ -4,6 +4,7 @@
 //! both addressed by name/assistant_id, with `reply_to` envelope routing
 //! and depth/cycle protection.
 
+pub mod bridge;
 pub mod error;
 pub mod rate_limit;
 pub mod state;

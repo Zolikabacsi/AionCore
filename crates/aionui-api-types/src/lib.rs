@@ -114,11 +114,11 @@ pub use custom_agent::{
     SetAgentOverridesRequest, SetEnabledRequest,
 };
 pub use delegate_tools::{
-    DelegateAskRequest, DelegateAskResponse, DelegateCliEnvelope, DelegateDeliveryStatus, DelegateDispatchRequest,
-    DelegateDispatchResponse, DelegateEnvelopeBlock, DelegateEnvelopeKind, DelegateTarget, DelegateTargetsQuery,
-    DelegateTargetsResponse, DelegateToolDescriptor, DelegateToolErrorCode, DelegateToolErrorPayload,
-    DelegateToolName, DELEGATE_TOOLS_SCHEMA_VERSION, delegate_tool_descriptor, delegate_tool_descriptors,
-    tool_name_for_delegate_cli_path,
+    DELEGATE_TOOLS_SCHEMA_VERSION, DelegateAskRequest, DelegateAskResponse, DelegateCliEnvelope,
+    DelegateDeliveryStatus, DelegateDispatchRequest, DelegateDispatchResponse, DelegateEnvelopeBlock,
+    DelegateEnvelopeKind, DelegateTarget, DelegateTargetKind, DelegateTargetsQuery, DelegateTargetsResponse,
+    DelegateToolDescriptor, DelegateToolErrorCode, DelegateToolErrorPayload, DelegateToolName, ResolvedDelegateTarget,
+    delegate_tool_descriptor, delegate_tool_descriptors, tool_name_for_delegate_cli_path,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,

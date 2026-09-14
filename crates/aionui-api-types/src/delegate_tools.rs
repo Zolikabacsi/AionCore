@@ -143,6 +143,11 @@ pub struct DelegateDispatchRequest {
     /// envelope chain. Setting this manually is a debug aid.
     #[serde(default)]
     pub depth: Option<u32>,
+    /// Optional success criteria. On a team-target dispatch this becomes the
+    /// engagement root task's `expected_output` (spec §5 step 4); ignored on
+    /// the assistant path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +168,13 @@ pub struct DelegateDispatchResponse {
     pub to_assistant_id: String,
     pub envelope_id: String,
     pub depth: u32,
+    /// Team dispatch only: the engagement convened/reused by the bridge.
+    /// `None` (omitted from the wire payload) for the assistant path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engagement_id: Option<String>,
+    /// Team dispatch only: the root task created on the engagement board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_task_id: Option<String>,
 }
 
 /// Body of `POST /api/runtime/delegate/ask` (sync mode).
@@ -201,12 +213,50 @@ pub struct DelegateTargetsQuery {
     pub limit: Option<u32>,
 }
 
+/// Discriminates a delegation roster entry. `Assistant` is the original
+/// (and default) kind; `Team` targets were added in Phase 4a as a non-breaking
+/// superset so a caller can resolve/list a team by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegateTargetKind {
+    #[default]
+    Assistant,
+    Team,
+}
+
+impl DelegateTargetKind {
+    /// Used as the `skip_serializing_if` predicate so an `Assistant` target's
+    /// wire payload carries no `kind` key (byte-identical to pre-4a).
+    pub fn is_assistant(&self) -> bool {
+        *self == Self::Assistant
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateTarget {
     pub assistant_id: String,
     pub name: String,
     pub backend: String,
     pub description: Option<String>,
+    /// Target kind. Defaults to `Assistant` on read (pre-4a payloads lack it)
+    /// and is omitted from the wire for assistants so their serialized bytes are
+    /// unchanged; only `Team` entries emit `"kind":"team"`.
+    #[serde(default, skip_serializing_if = "DelegateTargetKind::is_assistant")]
+    pub kind: DelegateTargetKind,
+    /// Populated only for `Team` entries; `None` for assistants. Omitted from
+    /// the wire when absent so assistant responses stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+}
+
+/// Outcome of `resolve_target`: the matched roster entry with its kind, so a
+/// caller can tell an assistant definition id from a team id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedDelegateTarget {
+    pub kind: DelegateTargetKind,
+    /// Assistant definition id (`asstdef_*`) for `Assistant`; team id for `Team`.
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,7 +382,8 @@ fn delegate_tool_specs() -> Vec<DelegateToolSpec> {
                     "message": { "type": "string", "description": "Task body the recipient will execute." },
                     "files": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute file paths to attach." },
                     "reply_to": { "type": "string", "description": "Optional conversation_id that should receive the reply. Default: your conversation." },
-                    "depth": { "type": "integer", "description": "Optional chain depth override (debug aid)." }
+                    "depth": { "type": "integer", "description": "Optional chain depth override (debug aid)." },
+                    "expected_output": { "type": "string", "description": "Optional success criteria; on a team target it becomes the engagement root task's expected_output." }
                 },
                 "required": ["to", "message"],
                 "additionalProperties": false
