@@ -305,6 +305,17 @@ impl Harness {
         }
     }
 
+    async fn seed_user(&self, user: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?1, 'local', ?1, 'hash', 'active', 0, 1, 1)",
+        )
+        .bind(user)
+        .execute(self._db.pool())
+        .await
+        .unwrap();
+    }
+
     async fn create_two_member_team(&self, user: &str, name: &str) -> aionui_api_types::TeamResponse {
         let workspace = unique_temp_dir("delegation-convene-team");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -373,12 +384,23 @@ async fn convene_reuses_engagement_creates_lead_root_task_and_envelopes_mailbox(
             Some("done when X"),
             envelope_text,
             None,
+            0,
         )
         .await
         .expect("convene ok");
     let second = h
         .svc
-        .convene_delegated_task(user, &team.id, &project, "subject two", "", None, envelope_text, None)
+        .convene_delegated_task(
+            user,
+            &team.id,
+            &project,
+            "subject two",
+            "",
+            None,
+            envelope_text,
+            None,
+            0,
+        )
         .await
         .expect("convene ok again");
 
@@ -454,7 +476,7 @@ async fn convene_stamps_correlation_ids_before_the_body_so_they_cannot_be_shadow
 
     let convened = h
         .svc
-        .convene_delegated_task(user, &team.id, &project, "s", "", None, payload, None)
+        .convene_delegated_task(user, &team.id, &project, "s", "", None, payload, None, 0)
         .await
         .expect("convene ok");
 
@@ -535,7 +557,7 @@ async fn convene_no_project_sentinel_on_project_bound_team_reuses_team_default()
 
     let convened = h
         .svc
-        .convene_delegated_task(user, &team.id, "__none__", "s", "d", None, "env", None)
+        .convene_delegated_task(user, &team.id, "__none__", "s", "d", None, "env", None, 0)
         .await
         .expect("sentinel convene must resolve to the team's default engagement");
     assert_eq!(convened.engagement_id, team.id, "default engagement is id == team_id");
@@ -581,14 +603,14 @@ async fn convene_with_no_project_sentinel_reuses_team_default_engagement() {
 
     let convened = h
         .svc
-        .convene_delegated_task(user, &team.id, "__none__", "s", "", None, "env", None)
+        .convene_delegated_task(user, &team.id, "__none__", "s", "", None, "env", None, 0)
         .await
         .expect("sentinel convene must reuse the default engagement");
     assert_eq!(convened.engagement_id, team.id);
 
     let again = h
         .svc
-        .convene_delegated_task(user, &team.id, "__none__", "s2", "", None, "env", None)
+        .convene_delegated_task(user, &team.id, "__none__", "s2", "", None, "env", None, 0)
         .await
         .expect("second sentinel convene reuses too");
     assert_eq!(again.engagement_id, convened.engagement_id);
@@ -605,7 +627,7 @@ async fn convene_by_non_owner_is_rejected_without_side_effects() {
     let intruder = "intruder";
     let err = h
         .svc
-        .convene_delegated_task(intruder, &team.id, &project, "steal", "", None, "env", None)
+        .convene_delegated_task(intruder, &team.id, &project, "steal", "", None, "env", None, 0)
         .await
         .expect_err("non-owner must be rejected");
     // Same convention as the read paths: a missing team and another user's team
@@ -613,5 +635,145 @@ async fn convene_by_non_owner_is_rejected_without_side_effects() {
     assert!(
         matches!(&err, TeamError::TeamNotFound(id) if *id == team.id),
         "expected TeamNotFound, got {err:?}"
+    );
+}
+
+// ── Phase 4c Task 1: cross-engagement cycle safety pieces (seam level) ────────
+
+/// Member-lineage predicate on the REAL team repo: a conversation that is a
+/// member of the target (team, project) engagement -> true; any other
+/// conversation, a member of a different engagement, and a member owned by a
+/// different user -> false (the comparison is against the resolved engagement
+/// id, so it is user- and engagement-scoped without a new repo method).
+#[tokio::test]
+async fn predicate_reports_membership_of_the_target_engagement() {
+    let user = "u1";
+    let h = Harness::new(user).await;
+    let team = h.create_two_member_team(user, "Bridge Team").await;
+    let project = h.create_project(user).await;
+    let convened = h
+        .svc
+        .convene_delegated_task(user, &team.id, &project, "s", "", None, "env", Some("caller-1"), 2)
+        .await
+        .unwrap();
+    let members = h
+        .repo
+        .list_engagement_members(user, &convened.engagement_id)
+        .await
+        .unwrap();
+    let member_conv = members
+        .iter()
+        .find(|m| m.role == "teammate")
+        .expect("teammate member")
+        .conversation_id
+        .clone();
+
+    assert!(
+        h.svc
+            .conversation_is_member_of_engagement(user, &member_conv, &team.id, &project)
+            .await
+            .unwrap(),
+        "a member conversation of the engagement -> true"
+    );
+    assert!(
+        !h.svc
+            .conversation_is_member_of_engagement(user, "unrelated-conv", &team.id, &project)
+            .await
+            .unwrap(),
+        "a conversation that is no member -> false"
+    );
+
+    let team2 = h.create_two_member_team(user, "Other Team").await;
+    assert!(
+        !h.svc
+            .conversation_is_member_of_engagement(user, &member_conv, &team2.id, &project)
+            .await
+            .unwrap(),
+        "a member of a different engagement of the same user -> false"
+    );
+
+    let other = "u2";
+    h.seed_user(other).await;
+    let team_u2 = h.create_two_member_team(other, "Rival").await;
+    let convened_u2 = h
+        .svc
+        .convene_delegated_task(other, &team_u2.id, "__none__", "s", "", None, "env", Some("c2"), 0)
+        .await
+        .unwrap();
+    let m_u2 = h
+        .repo
+        .list_engagement_members(other, &convened_u2.engagement_id)
+        .await
+        .unwrap();
+    let conv_u2 = m_u2
+        .iter()
+        .find(|m| m.role == "teammate")
+        .expect("teammate")
+        .conversation_id
+        .clone();
+    assert!(
+        !h.svc
+            .conversation_is_member_of_engagement(user, &conv_u2, &team.id, &project)
+            .await
+            .unwrap(),
+        "a member of another user's engagement is never a member of this user's engagement (user-scoped)"
+    );
+}
+
+/// Depth threading on the seam: the convene persists the caller's depth in the
+/// root task's metadata, and the read-back helper yields `depth + 1` for the
+/// lead's later hop. A convene with no reply target stays metadata-free so the
+/// Phase 3a completion path is byte-identical.
+#[tokio::test]
+async fn convene_persists_depth_for_onward_increment() {
+    let user = "u1";
+    let h = Harness::new(user).await;
+    let team = h.create_two_member_team(user, "Bridge Team").await;
+    let project = h.create_project(user).await;
+    let convened = h
+        .svc
+        .convene_delegated_task(user, &team.id, &project, "s", "", None, "env", Some("caller-1"), 2)
+        .await
+        .unwrap();
+    let task = h
+        .repo
+        .find_task_by_engagement(user, &convened.engagement_id, &convened.root_task_id)
+        .await
+        .unwrap()
+        .expect("root task");
+    let md: serde_json::Value = serde_json::from_str(task.metadata.as_deref().expect("depth metadata")).unwrap();
+    assert_eq!(md["delegate_reply_to"], serde_json::json!("caller-1"));
+    assert_eq!(
+        md["delegate_depth"],
+        serde_json::json!(2),
+        "caller's depth persisted on the root task"
+    );
+    assert_eq!(
+        aionui_team::next_depth_from_metadata(Some(&md)),
+        3,
+        "the lead's onward hop must be depth + 1"
+    );
+
+    let h2 = Harness::new(user).await;
+    let team2 = h2.create_two_member_team(user, "No Reply").await;
+    let c2 = h2
+        .svc
+        .convene_delegated_task(user, &team2.id, "__none__", "s", "", None, "env", None, 5)
+        .await
+        .unwrap();
+    let t2 = h2
+        .repo
+        .find_task_by_engagement(user, &c2.engagement_id, &c2.root_task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        t2.metadata.is_none(),
+        "no reply target -> no metadata (Phase 3a byte-identical preserved)"
+    );
+    assert_eq!(
+        aionui_team::next_depth_from_metadata(None),
+        0,
+        "absent depth defaults to the chain root"
     );
 }

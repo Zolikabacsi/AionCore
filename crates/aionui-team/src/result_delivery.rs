@@ -18,11 +18,30 @@ use crate::error::TeamError;
 pub const DELEGATE_REPLY_TO_KEY: &str = "delegate_reply_to";
 /// Task-metadata key carrying the engagement the root task belongs to.
 pub const ENGAGEMENT_ID_KEY: &str = "engagement_id";
+/// Task-metadata key carrying the caller's delegation-chain depth at convene
+/// time (Phase 4c). Threaded across the engagement boundary so the lead's
+/// onward hop can increment it and the depth cap stays authoritative (spec §5.9).
+pub const DELEGATE_DEPTH_KEY: &str = "delegate_depth";
 
 /// Correlation metadata stamped on the ROOT task at convene time so the
-/// result-capture path can find the caller without a second lookup.
-pub fn delegated_result_metadata(reply_to: &str, engagement_id: &str) -> serde_json::Value {
-    serde_json::json!({ DELEGATE_REPLY_TO_KEY: reply_to, ENGAGEMENT_ID_KEY: engagement_id })
+/// result-capture path can find the caller without a second lookup, and so a
+/// later engagement hop can resume the depth budget the caller arrived on.
+pub fn delegated_result_metadata(reply_to: &str, engagement_id: &str, depth: u32) -> serde_json::Value {
+    serde_json::json!({
+        DELEGATE_REPLY_TO_KEY: reply_to,
+        ENGAGEMENT_ID_KEY: engagement_id,
+        DELEGATE_DEPTH_KEY: depth,
+    })
+}
+
+/// Depth the lead must pass to the NEXT engagement hop: the root task's stored
+/// caller depth + 1, saturating at `u32::MAX`. `0` when the metadata is absent
+/// or carries no depth key (an ordinary / legacy task — the chain root).
+pub fn next_depth_from_metadata(metadata: Option<&serde_json::Value>) -> u32 {
+    metadata
+        .and_then(|value| value.get(DELEGATE_DEPTH_KEY))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |depth| u32::try_from(depth).unwrap_or(u32::MAX).saturating_add(1))
 }
 
 /// Extract the caller conversation id from a task's metadata. `None` for

@@ -622,6 +622,7 @@ impl DelegateService {
             subject: first_line(&req.message),
             description: &req.message,
             expected_output: req.expected_output.as_deref(),
+            depth,
         };
 
         let convened = self

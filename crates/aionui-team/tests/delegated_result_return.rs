@@ -456,6 +456,7 @@ impl Harness {
                 None,
                 &envelope,
                 reply_to,
+                0,
             )
             .await
             .expect("convene ok");
@@ -569,6 +570,7 @@ async fn root_task_completion_delivers_consolidated_result_to_caller() {
             None,
             "[[AION_DELEGATE]]\nenvelope_id: env-2\n[[/AION_DELEGATE]]\n\nx",
             Some(CALLER_CONV),
+            0,
         )
         .await
         .unwrap();
@@ -616,6 +618,7 @@ async fn non_delegated_completions_never_deliver() {
             None,
             "[[AION_DELEGATE]]\nenvelope_id: env-3\n[[/AION_DELEGATE]]\n\nx",
             None,
+            0,
         )
         .await
         .unwrap();
@@ -660,6 +663,7 @@ async fn delivery_failure_does_not_break_finalize() {
             None,
             "[[AION_DELEGATE]]\nenvelope_id: env-4\n[[/AION_DELEGATE]]\n\nx",
             Some(CALLER_CONV),
+            0,
         )
         .await
         .unwrap();
@@ -695,6 +699,7 @@ async fn finalize_without_assistant_text_delivers_nothing() {
             None,
             "[[AION_DELEGATE]]\nenvelope_id: env-5\n[[/AION_DELEGATE]]\n\nx",
             Some(CALLER_CONV),
+            0,
         )
         .await
         .unwrap();

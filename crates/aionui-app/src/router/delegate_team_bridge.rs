@@ -54,6 +54,7 @@ impl TeamEngagementBridge for TeamEngagementBridgeAdapter {
                 root.expected_output,
                 &envelope_payload,
                 envelope.reply_to.as_deref(),
+                root.depth,
             )
             .await
             .map_err(map_team_error)?;
@@ -62,6 +63,19 @@ impl TeamEngagementBridge for TeamEngagementBridgeAdapter {
             root_task_id: convened.root_task_id,
             lead_slot_id: convened.lead_slot_id,
         })
+    }
+
+    async fn conversation_is_member_of_engagement(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        team_id: &str,
+        project_id: &str,
+    ) -> Result<bool, BridgeError> {
+        self.team_service
+            .conversation_is_member_of_engagement(user_id, conversation_id, team_id, project_id)
+            .await
+            .map_err(map_team_error)
     }
 }
 

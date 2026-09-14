@@ -911,10 +911,13 @@ impl TeamSessionService {
     ///
     /// `reply_to` (the delegating caller conversation from the 4a envelope) is
     /// correlated onto the ROOT task's `metadata` as
-    /// `{delegate_reply_to, engagement_id}` so the Phase 3a result-capture hook
-    /// can return the consolidated result to the caller without a second
-    /// lookup (spec §8, Phase 4b ruling 1). No reply target → no metadata →
-    /// the completion path is byte-identical to Phase 3a.
+    /// `{delegate_reply_to, engagement_id, delegate_depth}` so the Phase 3a
+    /// result-capture hook can return the consolidated result to the caller
+    /// without a second lookup (spec §8, Phase 4b ruling 1) and so a later
+    /// engagement hop resumes the caller's depth budget (Phase 4c, spec §5.9).
+    /// `depth` is the caller's current chain depth (0 for a top-level user
+    /// dispatch); it is persisted only alongside a reply target, so a no-reply
+    /// convene stays metadata-free and byte-identical to Phase 3a.
     #[allow(clippy::too_many_arguments)]
     pub async fn convene_delegated_task(
         &self,
@@ -926,6 +929,7 @@ impl TeamSessionService {
         expected_output: Option<&str>,
         envelope_payload: &str,
         reply_to: Option<&str>,
+        depth: u32,
     ) -> Result<TeamEngagementConvened, TeamError> {
         self.load_owned_team_row(user_id, team_id).await?;
         let engagement = self.ensure_engagement(user_id, team_id, project_id).await?;
@@ -943,7 +947,7 @@ impl TeamSessionService {
         let task = TaskBoard::new_for_user(self.repo.clone(), user_id)
             .with_events(emitter.clone())
             .with_engagement(engagement.id.clone())
-            .with_task_metadata(reply_to.map(|reply_to| delegated_result_metadata(reply_to, &engagement.id)))
+            .with_task_metadata(reply_to.map(|reply_to| delegated_result_metadata(reply_to, &engagement.id, depth)))
             .create_task(
                 team_id,
                 subject,
@@ -989,6 +993,31 @@ impl TeamSessionService {
             root_task_id: task.id,
             lead_slot_id: lead.slot_id.clone(),
         })
+    }
+
+    /// Cross-engagement cycle predicate (Phase 4c, spec §5.9): is
+    /// `conversation_id` already a member of `team_id`'s engagement for
+    /// `project_id`? Used by the delegating side to reject a caller that is
+    /// dispatching back into an engagement it already belongs to (`CycleDetected`).
+    ///
+    /// Resolves the target engagement with the SAME `ensure_engagement` the
+    /// convene path uses (so the `__none__` sentinel / project→default mapping is
+    /// shared, not forked) — which also ownership-checks `team_id` for `user_id`
+    /// — then compares the caller conversation's member row's engagement id. A
+    /// foreign user's member conversation resolves to a distinct engagement id,
+    /// so it is never reported as a member here (user-scoped) without a second
+    /// repo lookup. Read-only beyond the idempotent engagement/member
+    /// materialization `ensure_engagement` already performs.
+    pub async fn conversation_is_member_of_engagement(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        team_id: &str,
+        project_id: &str,
+    ) -> Result<bool, TeamError> {
+        let engagement = self.ensure_engagement(user_id, team_id, project_id).await?;
+        let member = self.repo.get_engagement_member_by_conversation(conversation_id).await?;
+        Ok(member.is_some_and(|member| member.engagement_id == engagement.id))
     }
 
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
