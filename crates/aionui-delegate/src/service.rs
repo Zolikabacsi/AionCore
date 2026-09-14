@@ -48,6 +48,19 @@ const LIVE_CHAIN_SQL: &str = "SELECT target_assistant_id FROM delegation_envelop
 const CHAIN_DEPTH_SQL: &str =
     "SELECT MAX(depth) AS max_depth FROM delegation_envelopes WHERE root_conversation_id = ?1 AND expires_at > ?2";
 
+// Engagement re-key (spec §5.9): a TEAM hop is attributed to its engagement via
+// the `target_engagement_id` envelope column (migration 049). `dispatch_to_team`
+// stores the engagement id there and leaves the assistant-scoped
+// `target_assistant_id` empty, so `LIVE_CHAIN_SQL` (which selects
+// `target_assistant_id`) never matches a team row. `LIVE_CHAIN_SQL`,
+// `find_envelope_on_chain` and `CHAIN_DEPTH_SQL` above therefore stay
+// byte-identical for assistant dispatch. Cross-engagement runaway for a team hop
+// is bounded by the retained `MAX_DEPTH` cap threaded through `req.depth`; a
+// full graph-cycle detector (caller already a member of the target engagement)
+// needs team-side member lineage that the conversation->assistant per-root model
+// cannot see — see the task-2 report for why that is out of §5.9's smallest
+// change.
+
 /// The caller's own existing delegated room for an exact target, matched on
 /// structured `extra` fields (not a greedy substring `LIKE`) so a room created
 /// for a different conversation is never hijacked.
@@ -451,6 +464,7 @@ impl DelegateService {
                     from_conversation_id,
                     &target_conversation_id,
                     &target_assistant_id,
+                    None,
                     depth,
                     "delivered",
                 )
@@ -493,6 +507,7 @@ impl DelegateService {
                     from_conversation_id,
                     &target_conversation_id,
                     &target_assistant_id,
+                    None,
                     depth,
                     "pending",
                 )
@@ -519,9 +534,15 @@ impl DelegateService {
     /// the bridge port instead of delivering into an assistant conversation.
     ///
     /// Guards kept from the assistant path: feature toggle + sender checks
-    /// (already applied by the caller), rate limit, depth. Ownership is
-    /// enforced by the team seam (spec §5). Cycle/depth re-keying to the
-    /// engagement is Phase 4b; `ponytail: 4a guards stay conversation-keyed`.
+    /// (already applied by the caller). The rate and cycle/depth guards are
+    /// engagement-scoped (§5.9, §9): the rate bucket is keyed on
+    /// `caller -> (team, project)` (= engagement via §6 `UNIQUE`), and the audit
+    /// envelope records the engagement in `target_engagement_id` (not
+    /// `target_assistant_id`), leaving the assistant chain byte-identical.
+    /// Cross-engagement runaway is bounded by `MAX_DEPTH` (retained); a full
+    /// graph-cycle detector needs team-side member lineage the per-root
+    /// conversation→assistant model cannot see (see task-2 report). Ownership
+    /// is enforced by the team seam (spec §5).
     ///
     /// Project resolution (spec §5 step 1): the sender conversation's
     /// `project_id`; when the caller has no project, the sentinel
@@ -539,7 +560,26 @@ impl DelegateService {
         req: DelegateDispatchRequest,
     ) -> Result<DelegateDispatchResponse, DelegateError> {
         let team_id = &target.id;
-        if let RateVerdict::Tripped { .. } = self.rate_limiter.check_and_record(from_conversation_id, team_id) {
+        // Project resolution (spec §5 step 1) runs before the rate gate so the
+        // team hop's budget is engagement-scoped.
+        let project_id = sender_row
+            .project_id
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(aionui_common::constants::TEAM_NO_PROJECT_SENTINEL)
+            .to_owned();
+
+        // §9: a team has no assistant id, so its rate bucket is keyed on the
+        // engagement as `caller -> (team, project)`. `UNIQUE(team_id, project_id)`
+        // (spec §6 find-or-create) makes this key 1:1 with the engagement, so a
+        // same-team follow-up reuses the caller's own budget while a different
+        // engagement of the same team is never starved by it. The assistant pair
+        // stays `(caller, assistant_def_id)` byte-identical.
+        let engagement_key = format!("{team_id}\u{1f}{project_id}");
+        if let RateVerdict::Tripped { .. } = self
+            .rate_limiter
+            .check_and_record(from_conversation_id, &engagement_key)
+        {
             return Err(DelegateError::RateLimited {
                 from: from_conversation_id.to_owned(),
                 to: team_id.clone(),
@@ -564,12 +604,6 @@ impl DelegateService {
             return Err(DelegateError::DepthExceeded { depth, max: MAX_DEPTH });
         }
 
-        let project_id = sender_row
-            .project_id
-            .as_deref()
-            .filter(|p| !p.trim().is_empty())
-            .unwrap_or(aionui_common::constants::TEAM_NO_PROJECT_SENTINEL)
-            .to_owned();
         let envelope_id = Uuid::now_v7().to_string();
         let from_agent_id =
             extract_assistant_id_from_extra_value(&serde_json::from_str(&sender_row.extra).unwrap_or_default())
@@ -596,14 +630,19 @@ impl DelegateService {
             .await
             .map_err(|e| map_bridge_error(e, &target.name))?;
 
-        // Audit row keeps the (caller-rooted) chain visible to the guards; the
-        // engagement's own board owns the real task state.
+        // Audit row attributes the team hop to its engagement (§5.9): the
+        // engagement id is recorded in `target_engagement_id`, NOT the
+        // assistant-scoped `target_assistant_id` (a team has none) — so the
+        // assistant `LIVE_CHAIN` / cycle index never sees a team row, while the
+        // (caller-rooted) engagement lineage stays queryable. The engagement's
+        // own board owns the real task state.
         self.persist_envelope(
             &envelope_id,
             user_id,
             from_conversation_id,
             &convened.engagement_id,
-            team_id,
+            "",
+            Some(&convened.engagement_id),
             depth,
             "delivered",
         )
@@ -715,6 +754,7 @@ impl DelegateService {
             from_conversation_id,
             &target_conversation_id,
             &target_assistant_id,
+            None,
             depth + 1,
             "sync_pending",
         )
@@ -964,6 +1004,7 @@ impl DelegateService {
         root_conversation_id: &str,
         target_conversation_id: &str,
         target_assistant_id: &str,
+        target_engagement_id: Option<&str>,
         depth: u32,
         status: &str,
     ) -> Result<(), DelegateError> {
@@ -971,13 +1012,14 @@ impl DelegateService {
         let expires_at = (now_ms() + QUEUE_TTL_MS).to_string();
         self.conversation_repo
             .raw_execute(
-                "INSERT OR REPLACE INTO delegation_envelopes (id, user_id, root_conversation_id, target_conversation_id, target_assistant_id, depth, status, expires_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT OR REPLACE INTO delegation_envelopes (id, user_id, root_conversation_id, target_conversation_id, target_assistant_id, target_engagement_id, depth, status, expires_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 vec![
                     envelope_id.to_owned(),
                     user_id.to_owned(),
                     root_conversation_id.to_owned(),
                     target_conversation_id.to_owned(),
                     target_assistant_id.to_owned(),
+                    target_engagement_id.unwrap_or("").to_owned(),
                     depth.to_string(),
                     status.to_owned(),
                     expires_at,

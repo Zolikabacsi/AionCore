@@ -29,6 +29,10 @@ pub struct TaskBoard {
     /// through this board belongs to. Stamped on `TeamTaskRow` so the runtime
     /// no longer leaves `engagement_id` NULL (Phase 1 legacy).
     engagement_id: Option<String>,
+    /// Extension metadata stamped on tasks created through this board. Only the
+    /// delegated-convene seam sets it (root ↔ caller correlation, Phase 4b);
+    /// every other board leaves tasks metadata-free as before.
+    task_metadata: Option<serde_json::Value>,
 }
 
 /// Optional fields for task update.
@@ -52,6 +56,7 @@ impl TaskBoard {
             events: None,
             user_id: user_id.into(),
             engagement_id: None,
+            task_metadata: None,
         }
     }
 
@@ -65,6 +70,13 @@ impl TaskBoard {
     /// Set once at `TeamSession::start` from the team's resolved engagement.
     pub fn with_engagement(mut self, engagement_id: impl Into<String>) -> Self {
         self.engagement_id = Some(engagement_id.into());
+        self
+    }
+
+    /// Stamp extension metadata onto tasks created through this board (the
+    /// delegated-convene root task's caller correlation).
+    pub fn with_task_metadata(mut self, metadata: Option<serde_json::Value>) -> Self {
+        self.task_metadata = metadata;
         self
     }
 
@@ -158,7 +170,7 @@ impl TaskBoard {
             owner: owner.map(str::to_owned),
             blocked_by: blocked_by_json,
             blocks: "[]".to_owned(),
-            metadata: None,
+            metadata: self.task_metadata.as_ref().map(serde_json::to_string).transpose()?,
             created_at: now,
             updated_at: now,
             engagement_id: self.engagement_id.clone(),
@@ -236,13 +248,28 @@ impl TaskBoard {
     /// Stamps a task's `result` (Phase 3a capture at turn finalize). Engagement-
     /// gated like [`update_task`](Self::update_task): the `find_task` read-gate
     /// rejects rows outside this board's engagement before the repo write.
-    pub async fn set_task_result(&self, team_id: &str, task_id: &str, result: &str) -> Result<(), TeamError> {
-        self.find_task(team_id, task_id)
+    ///
+    /// Returns the row's parsed `metadata` (from the gate read it already
+    /// performs) so the caller can decide, without a second lookup, whether the
+    /// completed task is a delegated convene root that owes the caller a result
+    /// (Phase 4b §8). `None` metadata → ordinary task.
+    pub async fn set_task_result(
+        &self,
+        team_id: &str,
+        task_id: &str,
+        result: &str,
+    ) -> Result<Option<serde_json::Value>, TeamError> {
+        let existing = self
+            .find_task(team_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
         self.repo.set_task_result(&self.user_id, task_id, result).await?;
         debug!(team_id, task_id, "task result captured");
-        Ok(())
+        let metadata = match existing.metadata.as_deref() {
+            Some(raw) => serde_json::from_str(raw).ok(),
+            None => None,
+        };
+        Ok(metadata)
     }
 
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {

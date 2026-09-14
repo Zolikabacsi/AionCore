@@ -24,6 +24,7 @@ use aionui_db::{
     SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
     SqliteSettingsRepository,
 };
+use aionui_delegate::state::DelegateRouterState;
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
@@ -40,7 +41,6 @@ use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
-use aionui_delegate::state::DelegateRouterState;
 use aionui_shell::ShellRouterState;
 use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
 use aionui_skill_runtime::{SkillRuntimeRouterState, SkillRuntimeService};
@@ -1046,6 +1046,14 @@ pub fn build_team_state(
     service.with_project_service(Arc::new(services.project_service.clone()));
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
     service.with_user_order_store(services.user_order_store.clone());
+    // Phase 4b §8: a convened engagement's root-task result returns to the
+    // delegating caller through the app's conversation write.
+    service.with_result_delivery(Arc::new(
+        crate::router::team_result_delivery::DelegatedResultDeliveryAdapter::new(
+            services.conversation_service.clone(),
+            services.worker_task_manager.clone(),
+        ),
+    ));
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),

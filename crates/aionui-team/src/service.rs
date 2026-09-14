@@ -50,6 +50,7 @@ use crate::ports::{
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
+use crate::result_delivery::{DelegatedResultDelivery, delegated_result_metadata};
 use crate::runtime_tools::{
     ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
 };
@@ -199,6 +200,11 @@ pub struct TeamSessionService {
     /// team's `user_order` rows (design §4.3, path 2). `None` → no-op, so team
     /// deletion behaves exactly as before.
     user_order: Arc<RwLock<Option<Arc<dyn IUserOrderStore>>>>,
+    /// Delegated-engagement result-return port (Phase 4b §8), late-injected by
+    /// the composition layer exactly like `project_service`/`user_order`.
+    /// `None` → a convened root's completion logs a warn and posts nothing;
+    /// non-delegated tasks never touch it.
+    result_delivery: Arc<RwLock<Option<Arc<dyn DelegatedResultDelivery>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -344,6 +350,7 @@ impl TeamSessionService {
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
+            result_delivery: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -478,6 +485,21 @@ impl TeamSessionService {
         if let Ok(mut guard) = self.user_order.write() {
             *guard = Some(user_order);
         }
+    }
+
+    /// Inject the delegated-engagement result-return port (Phase 4b §8, spec
+    /// §10). When unset, a completed delegated root warns and the result stays
+    /// only on the task; ordinary team tasks never reach this.
+    pub fn with_result_delivery(&self, result_delivery: Arc<dyn DelegatedResultDelivery>) {
+        if let Ok(mut guard) = self.result_delivery.write() {
+            *guard = Some(result_delivery);
+        }
+    }
+
+    /// The result-return port, resolved by the session's capture hook at
+    /// finalize time. `None` → not wired (test / non-app builds).
+    pub(crate) fn result_delivery(&self) -> Option<Arc<dyn DelegatedResultDelivery>> {
+        self.result_delivery.read().ok().and_then(|guard| guard.clone())
     }
 
     /// Best-effort cascade of a removed team's `user_order` row (design §4.3,
@@ -886,6 +908,13 @@ impl TeamSessionService {
     /// Ownership: the team is loaded user-scoped FIRST, so a missing team and
     /// another user's team both surface as `TeamNotFound` (existence is never
     /// leaked, same convention as the read paths).
+    ///
+    /// `reply_to` (the delegating caller conversation from the 4a envelope) is
+    /// correlated onto the ROOT task's `metadata` as
+    /// `{delegate_reply_to, engagement_id}` so the Phase 3a result-capture hook
+    /// can return the consolidated result to the caller without a second
+    /// lookup (spec §8, Phase 4b ruling 1). No reply target → no metadata →
+    /// the completion path is byte-identical to Phase 3a.
     #[allow(clippy::too_many_arguments)]
     pub async fn convene_delegated_task(
         &self,
@@ -896,6 +925,7 @@ impl TeamSessionService {
         description: &str,
         expected_output: Option<&str>,
         envelope_payload: &str,
+        reply_to: Option<&str>,
     ) -> Result<TeamEngagementConvened, TeamError> {
         self.load_owned_team_row(user_id, team_id).await?;
         let engagement = self.ensure_engagement(user_id, team_id, project_id).await?;
@@ -913,6 +943,7 @@ impl TeamSessionService {
         let task = TaskBoard::new_for_user(self.repo.clone(), user_id)
             .with_events(emitter.clone())
             .with_engagement(engagement.id.clone())
+            .with_task_metadata(reply_to.map(|reply_to| delegated_result_metadata(reply_to, &engagement.id)))
             .create_task(
                 team_id,
                 subject,
