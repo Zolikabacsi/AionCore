@@ -55,12 +55,15 @@ const CHAIN_DEPTH_SQL: &str =
 // `target_assistant_id`) never matches a team row. `LIVE_CHAIN_SQL`,
 // `find_envelope_on_chain` and `CHAIN_DEPTH_SQL` above therefore stay
 // byte-identical for assistant dispatch. Cross-engagement runaway for a team hop
-// is bounded by the retained `MAX_DEPTH` cap — server-derived from the engagement
-// root task for team-member senders (§5.9 Phase 4c); a residual: a non-team
-// sender's assistant→team dispatch still carries `req.depth` verbatim, so an LLM
-// resetting it there is bounded by the rate limiter, not the depth cap. A direct
-// cycle (caller already a member of the target engagement) is caught by the
-// member-lineage predicate in `dispatch_to_team`; a multi-party graph cycle
+// is bounded by the retained `MAX_DEPTH` cap — server-derived for EVERY sender
+// (Phase 4c final-fix, §5.9): from the engagement root task for a team-member
+// sender, and via the delegated ancestor's engagement depth / the caller's own
+// live assistant chain (`CHAIN_DEPTH_SQL`) for the assistant→team mixed edge,
+// so an LLM cannot reset the ratchet by under-reporting `req.depth`. A genuine
+// top-level user/assistant root with no engagement lineage and no live chain is
+// its own chain root and still carries `req.depth` (nothing to ratchet against).
+// A direct cycle (caller already a member of the target engagement) is caught by
+// the member-lineage predicate in `dispatch_to_team`; a multi-party graph cycle
 // (A→B→C→A, no self-member hop) relies on the depth cap, not full detection.
 
 /// The caller's own existing delegated room for an exact target, matched on
@@ -601,17 +604,34 @@ impl DelegateService {
             }
         }
 
-        // Cycle/depth guard for the team→team edge, BEFORE convening. A
-        // team-member sender: (1) dispatching back into an engagement it is a
-        // member of is a direct cycle → `CycleDetected` (skill Rule 9: STOP);
-        // (2) otherwise its chain depth is derived SERVER-side from the
-        // engagement root task (the agent-supplied `req.depth` is a debug aid
-        // and cannot bound a loop), and the convene carries depth+1; past
-        // `MAX_DEPTH` → `DepthExceeded`. A multi-party graph cycle (A→B→C→A,
-        // no self-member hop) is bounded by that depth cap, not detected
-        // (spec §5.9 accepted trade-off). Non-team senders keep the 4a/4b
-        // behavior: `req.depth` verbatim.
-        let depth = if team_id_from_extra(&sender_row.extra).is_some() {
+        // Server-derived chain depth for the team hop, BEFORE convening (Phase
+        // 4c final-fix, spec §5.9): the agent-supplied `req.depth` can never
+        // bound a loop — the `team → assistant → team` hop that trusted it
+        // reset the ratchet to 0 forever, defeating `MAX_DEPTH` on the mixed
+        // edge. Every sender's depth is now derived server-side:
+        //  * a TEAM-MEMBER sender first runs the member-lineage cycle predicate
+        //    (a caller dispatching back into an engagement it belongs to is a
+        //    direct `CycleDetected`, skill Rule 9: STOP), then its chain depth
+        //    is the engagement's delegated-root `delegate_depth`
+        //    (`conversation_current_depth`), incremented for this convene;
+        //  * an ASSISTANT delegated room (the A→X→A middle leg) inherits its
+        //    DELEGATING ANCESTOR's engagement depth, so a lying `req.depth` on
+        //    the assistant→team edge can no longer reset the counter; a pure
+        //    assistant chain is measured by its own live delegation chain
+        //    (`current_chain_depth`, the same server-side read the sync `ask`
+        //    path uses) and the two are maxed;
+        //  * a genuine top-level user/assistant root — not a team member, with
+        //    no delegated ancestor and no live chain — is its own chain root
+        //    and keeps `req.depth` (there is nothing to ratchet against).
+        // A multi-party graph cycle with no self-member hop stays bounded by
+        // the `MAX_DEPTH` cap rather than detected (spec §5.9 accepted trade-
+        // off). Residual, documented: a >1-assistant-deep chain (A→X→Y→A) is
+        // measured one hop short (the middle assistant's own hop is not counted
+        // here, only the nearest member ancestor), so it over-ratchets toward
+        // the cap — never under — and so still converges.
+        let ancestor = delegated_ancestor_from_extra(&sender_row.extra);
+        let is_team_sender = team_id_from_extra(&sender_row.extra).is_some();
+        let base = if is_team_sender {
             if self
                 .team_bridge
                 .conversation_is_member_of_engagement(user_id, from_conversation_id, team_id, &project_id)
@@ -623,26 +643,33 @@ impl DelegateService {
                     target: team_id.clone(),
                 });
             }
-            let next = self
-                .team_bridge
+            self.team_bridge
                 .conversation_current_depth(user_id, from_conversation_id)
                 .await
                 .map_err(|e| map_bridge_error(e, &target.name))?
-                .saturating_add(1);
-            if depth_exceeds_max(next) {
-                return Err(DelegateError::DepthExceeded {
-                    depth: next,
-                    max: MAX_DEPTH,
-                });
-            }
-            next
         } else {
-            let depth = req.depth.unwrap_or(0);
-            if depth_exceeds_max(depth) {
-                return Err(DelegateError::DepthExceeded { depth, max: MAX_DEPTH });
+            let mut base = self.current_chain_depth(from_conversation_id).await.unwrap_or(0);
+            if let Some(ancestor) = ancestor.as_deref() {
+                let ancestor_depth = self
+                    .team_bridge
+                    .conversation_current_depth(user_id, ancestor)
+                    .await
+                    .map_err(|e| map_bridge_error(e, &target.name))?;
+                base = base.max(ancestor_depth);
             }
-            depth
+            base
         };
+        // A pure top-level user/assistant root (its own chain root) keeps
+        // `req.depth`; anything with engagement lineage ratchets `base + 1`.
+        let own_root = !is_team_sender && ancestor.is_none() && base == 0;
+        let depth = if own_root {
+            req.depth.unwrap_or(0)
+        } else {
+            base.saturating_add(1)
+        };
+        if depth_exceeds_max(depth) {
+            return Err(DelegateError::DepthExceeded { depth, max: MAX_DEPTH });
+        }
 
         let envelope_id = Uuid::now_v7().to_string();
         let from_agent_id =
@@ -1138,6 +1165,21 @@ fn team_id_from_extra(extra: &str) -> Option<String> {
     // sender-is-team guard permanently inert (spec §16 P2-4). Reuse the single
     // source of truth so this cannot drift again.
     aionui_conversation::session_mentions::team_id_from_extra_str(extra)
+}
+
+/// The delegating-ancestor conversation id recorded on an assistant delegated
+/// room's `extra` (`delegated_from`, set at `ensure_target_conversation`). Used
+/// to server-derive the A→X→A mixed-edge depth: the room inherits the depth of
+/// the conversation that convened it, so a lying `req.depth` on its onward hop
+/// cannot reset the ratchet. `None` for a top-level / user-rooted conversation.
+fn delegated_ancestor_from_extra(extra: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(extra)
+        .ok()?
+        .get("delegated_from")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn extract_assistant_id_from_extra_value(extra: &serde_json::Value) -> Option<String> {

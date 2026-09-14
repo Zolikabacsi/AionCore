@@ -34,21 +34,13 @@ pub fn delegated_result_metadata(reply_to: &str, engagement_id: &str, depth: u32
     })
 }
 
-/// Depth the lead must pass to the NEXT engagement hop: the root task's stored
-/// caller depth + 1, saturating at `u32::MAX`. `0` when the metadata is absent
-/// or carries no depth key (an ordinary / legacy task — the chain root).
-pub fn next_depth_from_metadata(metadata: Option<&serde_json::Value>) -> u32 {
-    metadata
-        .and_then(|value| value.get(DELEGATE_DEPTH_KEY))
-        .and_then(serde_json::Value::as_u64)
-        .map_or(0, |depth| u32::try_from(depth).unwrap_or(u32::MAX).saturating_add(1))
-}
-
 /// The caller depth a root task was convened AT, read straight from metadata
-/// (`0` when absent — an ordinary/legacy task or a no-reply convene). Unlike
-/// [`next_depth_from_metadata`] this does NOT increment: it answers "what is
-/// this engagement's current chain depth" for the sender-inversion guard
-/// (Phase 4c, spec §5.9).
+/// (`0` when absent — an ordinary/legacy task or a no-reply convene). This
+/// answers "what is this engagement's current chain depth" for the sender-
+/// inversion guard (Phase 4c, spec §5.9): `conversation_current_depth` is the
+/// max over an engagement's delegated roots, and the delegating side derives
+/// the next hop server-side as `current + 1`, so it never trusts the
+/// agent-supplied `req.depth`.
 pub fn delegated_depth_from_metadata(metadata: Option<&serde_json::Value>) -> u32 {
     metadata
         .and_then(|value| value.get(DELEGATE_DEPTH_KEY))

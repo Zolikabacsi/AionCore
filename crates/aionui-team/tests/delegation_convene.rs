@@ -721,9 +721,10 @@ async fn predicate_reports_membership_of_the_target_engagement() {
 }
 
 /// Depth threading on the seam: the convene persists the caller's depth in the
-/// root task's metadata, and the read-back helper yields `depth + 1` for the
-/// lead's later hop. A convene with no reply target stays metadata-free so the
-/// Phase 3a completion path is byte-identical.
+/// root task's metadata, and the read-back helper yields that stored depth —
+/// the value `conversation_current_depth` maxes over and the delegating side
+/// increments server-side for the lead's later hop. A convene with no reply
+/// target stays metadata-free so the Phase 3a completion path is byte-identical.
 #[tokio::test]
 async fn convene_persists_depth_for_onward_increment() {
     let user = "u1";
@@ -749,9 +750,9 @@ async fn convene_persists_depth_for_onward_increment() {
         "caller's depth persisted on the root task"
     );
     assert_eq!(
-        aionui_team::next_depth_from_metadata(Some(&md)),
-        3,
-        "the lead's onward hop must be depth + 1"
+        aionui_team::delegated_depth_from_metadata(Some(&md)),
+        2,
+        "the caller's depth is what the next hop ratchets from (current + 1, server-side)"
     );
 
     let h2 = Harness::new(user).await;
@@ -772,7 +773,7 @@ async fn convene_persists_depth_for_onward_increment() {
         "no reply target -> no metadata (Phase 3a byte-identical preserved)"
     );
     assert_eq!(
-        aionui_team::next_depth_from_metadata(None),
+        aionui_team::delegated_depth_from_metadata(None),
         0,
         "absent depth defaults to the chain root"
     );

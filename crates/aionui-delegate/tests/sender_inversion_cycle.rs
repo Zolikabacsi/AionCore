@@ -496,3 +496,122 @@ fn delegate_skill_rule6_no_longer_prohibits_team_senders() {
         "Rule 6 must still route intra-team work to team tools"
     );
 }
+
+// ── FINAL-FIX: kill the assistant-mediated depth escape ─────────────────────
+
+/// A live engagement whose `delegate_depth` the seam persists on convene, and
+/// returns on `conversation_current_depth` — so the mixed `team → assistant →
+/// team` hop ratchets off the real engagement root instead of resetting to the
+/// caller's (lies-about) `req.depth`.
+struct RatchetBridge {
+    engagement_depth: Mutex<u32>,
+    convened: Mutex<Vec<u32>>,
+}
+
+impl RatchetBridge {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            engagement_depth: Mutex::new(0),
+            convened: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl TeamEngagementBridge for RatchetBridge {
+    async fn convene_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        root: ConveneRootTask<'_>,
+        _envelope: &aionui_api_types::DelegateEnvelopeBlock,
+    ) -> Result<ConvenedEngagement, aionui_delegate::bridge::BridgeError> {
+        let mut current = self.engagement_depth.lock().unwrap();
+        *current = (*current).max(root.depth);
+        drop(current);
+        self.convened.lock().unwrap().push(root.depth);
+        Ok(ConvenedEngagement {
+            engagement_id: "eng-1".into(),
+            root_task_id: "task-1".into(),
+            lead_slot_id: "lead-1".into(),
+        })
+    }
+
+    // Caller is NOT a member of the target engagement → no `CycleDetected`; the
+    // only bound is the ratcheting depth cap.
+    async fn conversation_is_member_of_engagement(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+    ) -> Result<bool, aionui_delegate::bridge::BridgeError> {
+        Ok(false)
+    }
+
+    async fn conversation_current_depth(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<u32, aionui_delegate::bridge::BridgeError> {
+        Ok(*self.engagement_depth.lock().unwrap())
+    }
+}
+
+/// The `team → assistant → team` escape closed (Phase 4c final-fix): an
+/// assistant delegated room (`delegated_from = <team member>`) re-dispatching
+/// into the member's team NEVER resets depth to the caller's `req.depth` (0);
+/// it ratchets off the engagement root's server-derived depth until the hop is
+/// rejected with `DepthExceeded`.
+#[tokio::test]
+async fn assistant_mediated_redispach_to_team_ratchets_to_depth_exceeded() {
+    let bridge = RatchetBridge::new();
+    let (svc, r) = service_with(bridge.clone()).await;
+    // Assistant delegated room X whose only link is to the delegating team
+    // member conversation `lead-1` (an engagement member). It reports no depth.
+    insert_conversation(&r, "room-x", r#"{"delegated_from":"lead-1"}"#, Some("proj-1")).await;
+    insert_team(&r, "team-2", "Research").await;
+
+    let mut last_ok = None;
+    let mut exceeded = None;
+    for _ in 0..(MAX_DEPTH + 2) {
+        match svc
+            .dispatch("user-1", "room-x", "X", dispatch_req("Research", "re-convene", Some(0)))
+            .await
+        {
+            // An LLM that always claims `depth: 0` must be ignored: the seam
+            // derives a nonzero, strictly-increasing depth server-side.
+            Ok(resp) => {
+                assert!(
+                    resp.depth >= 1,
+                    "the mixed-edge hop must never reset to the caller's req.depth 0, got {}",
+                    resp.depth
+                );
+                last_ok = Some(resp.depth);
+            }
+            Err(aionui_delegate::error::DelegateError::DepthExceeded { depth, max }) => {
+                assert_eq!(max, MAX_DEPTH);
+                exceeded = Some(depth);
+                break;
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    assert!(
+        last_ok.is_some_and(|d| d >= 1),
+        "each re-convene ratcheted depth up, not reset to 0"
+    );
+    assert_eq!(
+        exceeded,
+        Some(MAX_DEPTH + 1),
+        "the ratchet converges to DepthExceeded rather than looping forever"
+    );
+    // The convene never saw a zero depth from the lying caller.
+    assert!(
+        bridge.convened.lock().unwrap().iter().all(|&d| d >= 1),
+        "every convened root carried a server-derived depth >= 1: {:?}",
+        bridge.convened.lock().unwrap()
+    );
+}

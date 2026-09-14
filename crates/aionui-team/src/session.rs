@@ -853,6 +853,30 @@ impl TeamSession {
             .ok()?
     }
 
+    /// Phase 4c final-fix (§8/§10): best-effort WAKE for a delegated child
+    /// result already written into `slot_id`'s engagement mailbox by the service
+    /// (`deliver_child_result` does the 4a-style `Mailbox::write`). This only
+    /// needs to make the parent member's runtime act on the row NOW rather than
+    /// at its next drain: bring up a dormant member runtime
+    /// (`ensure_member_runtime_lazy`) and signal the event loop (`notify`).
+    /// `prepare_next_batch` peeks unread mailbox rows directly, so a row written
+    /// outside the coordinator is still claimed — the wake is additive, never a
+    /// second post. Failures are swallowed (log-not-throw): the durable row is
+    /// already persisted, so surfacing a wake error would invite a retry that
+    /// double-writes it.
+    pub(crate) async fn wake_slot_for_delivery(&self, slot_id: &str) {
+        if let Err(error) = self.ensure_member_runtime_lazy(slot_id, true).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id,
+                error = %error,
+                "delegated child result mailbox row persisted but member runtime wake failed"
+            );
+            return;
+        }
+        self.event_loops.notify(slot_id);
+    }
+
     /// Write a user message to the lead's mailbox and trigger a wake.
     ///
     /// Wake failures are logged but **not** propagated (D7b log-not-throw

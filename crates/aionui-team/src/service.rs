@@ -1048,6 +1048,83 @@ impl TeamSessionService {
             .unwrap_or(0))
     }
 
+    /// Whether `conversation_id` is a TEAM-MEMBER (engagement-owned) conversation,
+    /// returning the `(engagement_id, slot_id, team_id)` needed to deliver a
+    /// delegated child result back into that member's engagement (Phase 4c
+    /// final-fix, spec §8/§10). The app result-delivery adapter uses this to
+    /// choose the team mailbox over the user/assistant `send_message` write —
+    /// which rejects team-owned conversations — so a convene whose `reply_to` is
+    /// a team member actually lands. `Ok(None)` for a user/assistant (non-member)
+    /// caller, which keeps the existing `send_message` path byte-identical.
+    pub async fn delegated_parent_member(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, String, String)>, TeamError> {
+        Ok(self
+            .repo
+            .get_engagement_member_by_conversation(conversation_id)
+            .await?
+            .map(|member| (member.engagement_id, member.slot_id, member.team_id)))
+    }
+
+    /// App-adapter entrypoint for §10's team-parent return: deliver a delegated
+    /// child engagement's consolidated result into a TEAM-MEMBER parent slot's
+    /// engagement mailbox, mirroring how the 4a convene enqueues the caller
+    /// envelope (`Mailbox::write`, `from = "user"`, engagement-pinned) — so the
+    /// row lands with or without a live runtime — and then best-effort WAKE the
+    /// parent's running event loop so it acts on the result now rather than only
+    /// on its next drain. Ownership is enforced by `load_owned_team_row` (a
+    /// foreign/absent team surfaces as `TeamNotFound`, existence is never
+    /// leaked). Team-internal only — no conversation / delegate coupling; the
+    /// send_message-vs-mailbox routing decision lives in the app adapter.
+    ///
+    /// §10: the write is user-scoped to the parent's own engagement; if the
+    /// parent is gone (team not owned / engagement torn down) the mailbox row is
+    /// still the durable "store" and the caller's wake is a no-op — the result
+    /// already stays on the child task regardless, so there is never an orphan
+    /// post into a foreign conversation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn deliver_child_result(
+        &self,
+        user_id: &str,
+        parent_engagement_id: &str,
+        parent_slot_id: &str,
+        parent_team_id: &str,
+        envelope: &str,
+        subject: Option<&str>,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team_row(user_id, parent_team_id).await?;
+        let emitter = Arc::new(TeamEventEmitter::new(
+            parent_team_id.to_owned(),
+            user_id.to_owned(),
+            self.broadcaster.clone(),
+        ));
+        Mailbox::new_for_user(self.repo.clone(), user_id)
+            .with_events(emitter)
+            .with_engagement(parent_engagement_id.to_owned())
+            .write(
+                parent_team_id,
+                parent_slot_id,
+                "user",
+                MailboxMessageType::Message,
+                envelope,
+                subject,
+            )
+            .await?;
+        // Best-effort wake: only meaningful while the parent's session is live
+        // (the normal case — the member delegated from its own running turn).
+        // A dormant/torn-down parent keeps the persisted row for its next drain.
+        if let Some(session) = self
+            .sessions
+            .get(parent_engagement_id)
+            .map(|entry| Arc::clone(&entry.session))
+            .filter(|session| session.user_id() == user_id)
+        {
+            session.wake_slot_for_delivery(parent_slot_id).await;
+        }
+        Ok(())
+    }
+
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
         if req.agents.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
