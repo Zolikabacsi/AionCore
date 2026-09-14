@@ -21,9 +21,6 @@ pub enum DelegateError {
     #[error("sender conversation {id} has delegation disabled")]
     DelegationDisabledForSender { id: String },
 
-    #[error("sender conversation is team-owned: {id}")]
-    SenderIsTeam { id: String },
-
     #[error("sender and target resolve to the same conversation: {id}")]
     TargetIsSelf { id: String },
 
@@ -69,7 +66,6 @@ impl DelegateError {
             Self::AmbiguousTarget { .. } => C::AmbiguousTarget,
             Self::DelegationDisabledForTarget { .. } => C::DelegationDisabledForTarget,
             Self::DelegationDisabledForSender { .. } => C::DelegationDisabledForSender,
-            Self::SenderIsTeam { .. } => C::SenderIsTeam,
             Self::TargetIsSelf { .. } => C::TargetIsSelf,
             Self::ReplyTargetNotOwned { .. } => C::ReplyTargetNotOwned,
             Self::CycleDetected { .. } => C::CycleDetected,
@@ -92,7 +88,6 @@ impl DelegateError {
             C::TargetNotFound | C::AmbiguousTarget => 404,
             C::DelegationDisabledForTarget
             | C::DelegationDisabledForSender
-            | C::SenderIsTeam
             | C::TargetIsSelf
             | C::ReplyTargetNotOwned => 403,
             C::CycleDetected | C::DepthExceeded => 409,

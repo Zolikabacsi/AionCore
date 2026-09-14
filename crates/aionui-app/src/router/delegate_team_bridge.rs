@@ -77,6 +77,13 @@ impl TeamEngagementBridge for TeamEngagementBridgeAdapter {
             .await
             .map_err(map_team_error)
     }
+
+    async fn conversation_current_depth(&self, user_id: &str, conversation_id: &str) -> Result<u32, BridgeError> {
+        self.team_service
+            .conversation_current_depth(user_id, conversation_id)
+            .await
+            .map_err(map_team_error)
+    }
 }
 
 fn map_team_error(error: TeamError) -> BridgeError {

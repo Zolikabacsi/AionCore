@@ -57,7 +57,8 @@ pub use provisioning::{
 };
 pub use result_delivery::{
     DELEGATE_REPLY_TO_KEY, DelegatedResultDelivery, ENGAGEMENT_ID_KEY, NoopDelegatedResultDelivery,
-    delegated_engagement_id, delegated_reply_to, delegated_result_metadata, next_depth_from_metadata,
+    delegated_depth_from_metadata, delegated_engagement_id, delegated_reply_to, delegated_result_metadata,
+    next_depth_from_metadata,
 };
 pub use routes::{TeamRouterState, team_routes};
 pub use runtime_tools::ResolvedTeamToolContext;

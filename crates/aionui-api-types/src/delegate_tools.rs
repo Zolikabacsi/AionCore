@@ -24,8 +24,6 @@ pub enum DelegateToolErrorCode {
     DelegationDisabledForTarget,
     /// Caller's `allow_delegation = 0`.
     DelegationDisabledForSender,
-    /// Caller conversation is team-owned (must use `team send-message` instead).
-    SenderIsTeam,
     /// Caller conversation is the target conversation (self-dispatch).
     TargetIsSelf,
     /// `reply_to` resolved to a conversation the caller doesn't own.

@@ -50,7 +50,7 @@ use crate::ports::{
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
-use crate::result_delivery::{DelegatedResultDelivery, delegated_result_metadata};
+use crate::result_delivery::{DelegatedResultDelivery, delegated_depth_from_metadata, delegated_result_metadata};
 use crate::runtime_tools::{
     ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
 };
@@ -1018,6 +1018,34 @@ impl TeamSessionService {
         let engagement = self.ensure_engagement(user_id, team_id, project_id).await?;
         let member = self.repo.get_engagement_member_by_conversation(conversation_id).await?;
         Ok(member.is_some_and(|member| member.engagement_id == engagement.id))
+    }
+
+    /// Current delegation-chain depth of `conversation_id` as a convened
+    /// engagement member (Phase 4c sender inversion, spec §5.9): the max
+    /// `delegate_depth` persisted on the engagement's delegated root tasks
+    /// (an engagement may serve several callers; the max is the conservative
+    /// bound — it can only OVER-count a hop, never let a loop slip past
+    /// `MAX_DEPTH`). `0` for a conversation that is not an engagement member
+    /// and for engagements with no delegated root: such a sender is its own
+    /// chain root. Read-only; the caller (delegate dispatch) has already
+    /// user-scoped the conversation, and the task read is engagement-owner
+    /// scoped via `list_tasks_by_engagement`.
+    pub async fn conversation_current_depth(&self, user_id: &str, conversation_id: &str) -> Result<u32, TeamError> {
+        let Some(member) = self.repo.get_engagement_member_by_conversation(conversation_id).await? else {
+            return Ok(0);
+        };
+        let tasks = self
+            .repo
+            .list_tasks_by_engagement(user_id, &member.engagement_id)
+            .await?;
+        Ok(tasks
+            .iter()
+            .map(|task| {
+                let metadata = task.metadata.as_ref().and_then(|raw| serde_json::from_str(raw).ok());
+                delegated_depth_from_metadata(metadata.as_ref())
+            })
+            .max()
+            .unwrap_or(0))
     }
 
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {

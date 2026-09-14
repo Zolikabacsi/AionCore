@@ -96,6 +96,7 @@ When the user explicitly asks to dismiss/fire/shut down teammates:
 
 ## Important Rules
 - Use Team tools for coordination, not plain text instructions
+- Work that belongs to ANOTHER team (or another agent) may be handed off with the `delegate` skill (cross-team delegation); intra-team handoffs still go through team tasks / `team_send_message`
 - Do NOT call team_spawn_agent immediately just because the task sounds broad, hard, or multi-step
 - When you think new teammates are needed, first explain why in one short sentence, then recommend the teammate lineup
 - ${presetFormattingImportantRule}
@@ -293,6 +294,7 @@ If you receive a message with type `shutdown_request`, the leader is asking you 
 - Report back to the leader when you finish, including a summary of what you did
 - If you get stuck, send a message to the leader asking for guidance
 - You can communicate with other teammates directly if needed
+- Work outside your team may go through the `delegate` skill (another team's engagement or another agent); if it returns `cycle_detected` or `depth_exceeded`, stop and report it — never retry
 - Use your native tools (Read, Write, Bash, etc.) for implementation work"#;
 
 fn build_teammate_role_prompt(params: &TeammatePromptParams<'_>) -> String {

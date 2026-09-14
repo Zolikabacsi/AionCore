@@ -34,7 +34,7 @@ use crate::error::DelegateError;
 use crate::queue::DelegateQueue;
 use crate::rate_limit::{DelegateRateLimiter, RateVerdict};
 use crate::turn_suspend::{SuspendedTurn, TurnSuspendRegistry};
-use crate::{DEFAULT_SYNC_TIMEOUT_SECONDS, MAX_DEPTH, QUEUE_TTL_MS};
+use crate::{DEFAULT_SYNC_TIMEOUT_SECONDS, MAX_DEPTH, QUEUE_TTL_MS, depth_exceeds_max};
 
 /// Live (non-expired) envelopes on a delegation chain, used to reject a
 /// repeat dispatch to the same target (`cycle_detected`). `expired` rows are
@@ -55,11 +55,11 @@ const CHAIN_DEPTH_SQL: &str =
 // `target_assistant_id`) never matches a team row. `LIVE_CHAIN_SQL`,
 // `find_envelope_on_chain` and `CHAIN_DEPTH_SQL` above therefore stay
 // byte-identical for assistant dispatch. Cross-engagement runaway for a team hop
-// is bounded by the retained `MAX_DEPTH` cap threaded through `req.depth`; a
-// full graph-cycle detector (caller already a member of the target engagement)
-// needs team-side member lineage that the conversation->assistant per-root model
-// cannot see — see the task-2 report for why that is out of §5.9's smallest
-// change.
+// is bounded by the retained `MAX_DEPTH` cap (for team-member senders derived
+// server-side from the engagement root task, §5.9 Phase 4c) and a direct cycle
+// (caller already a member of the target engagement) is caught by the
+// member-lineage predicate in `dispatch_to_team`; a multi-party graph cycle
+// (A→B→C→A, no self-member hop) relies on the depth cap, not full detection.
 
 /// The caller's own existing delegated room for an exact target, matched on
 /// structured `extra` fields (not a greedy substring `LIKE`) so a room created
@@ -353,11 +353,11 @@ impl DelegateService {
             .ok_or_else(|| DelegateError::TransportUnavailable {
                 reason: format!("sender conversation {from_conversation_id} not found"),
             })?;
-        if team_id_from_extra(&sender_row.extra).is_some() {
-            return Err(DelegateError::SenderIsTeam {
-                id: from_conversation_id.to_owned(),
-            });
-        }
+        // Phase 4c sender inversion: a team-member conversation IS a valid
+        // sender now. The assistant leg below needs no special-casing — the
+        // member's own conversation is the chain root, so the existing
+        // per-root LIVE_CHAIN / depth / rate guards govern it; the team leg
+        // gets the engagement-boundary guards in `dispatch_to_team`.
         if req.message.trim().is_empty() {
             return Err(DelegateError::SchemaValidation {
                 reason: "`message` must not be empty".to_owned(),
@@ -539,10 +539,10 @@ impl DelegateService {
     /// `caller -> (team, project)` (= engagement via §6 `UNIQUE`), and the audit
     /// envelope records the engagement in `target_engagement_id` (not
     /// `target_assistant_id`), leaving the assistant chain byte-identical.
-    /// Cross-engagement runaway is bounded by `MAX_DEPTH` (retained); a full
-    /// graph-cycle detector needs team-side member lineage the per-root
-    /// conversation→assistant model cannot see (see task-2 report). Ownership
-    /// is enforced by the team seam (spec §5).
+    /// Cross-engagement runaway is bounded by `MAX_DEPTH` plus the
+    /// member-lineage predicate (Phase 4c: team-member senders run the
+    /// cycle/depth guard block below before convening). Ownership is enforced
+    /// by the team seam (spec §5).
     ///
     /// Project resolution (spec §5 step 1): the sender conversation's
     /// `project_id`; when the caller has no project, the sentinel
@@ -599,10 +599,48 @@ impl DelegateService {
             }
         }
 
-        let depth = req.depth.unwrap_or(0);
-        if depth > MAX_DEPTH {
-            return Err(DelegateError::DepthExceeded { depth, max: MAX_DEPTH });
-        }
+        // Cycle/depth guard for the team→team edge, BEFORE convening. A
+        // team-member sender: (1) dispatching back into an engagement it is a
+        // member of is a direct cycle → `CycleDetected` (skill Rule 9: STOP);
+        // (2) otherwise its chain depth is derived SERVER-side from the
+        // engagement root task (the agent-supplied `req.depth` is a debug aid
+        // and cannot bound a loop), and the convene carries depth+1; past
+        // `MAX_DEPTH` → `DepthExceeded`. A multi-party graph cycle (A→B→C→A,
+        // no self-member hop) is bounded by that depth cap, not detected
+        // (spec §5.9 accepted trade-off). Non-team senders keep the 4a/4b
+        // behavior: `req.depth` verbatim.
+        let depth = if team_id_from_extra(&sender_row.extra).is_some() {
+            if self
+                .team_bridge
+                .conversation_is_member_of_engagement(user_id, from_conversation_id, team_id, &project_id)
+                .await
+                .map_err(|e| map_bridge_error(e, &target.name))?
+            {
+                return Err(DelegateError::CycleDetected {
+                    root: from_conversation_id.to_owned(),
+                    target: team_id.clone(),
+                });
+            }
+            let next = self
+                .team_bridge
+                .conversation_current_depth(user_id, from_conversation_id)
+                .await
+                .map_err(|e| map_bridge_error(e, &target.name))?
+                .saturating_add(1);
+            if depth_exceeds_max(next) {
+                return Err(DelegateError::DepthExceeded {
+                    depth: next,
+                    max: MAX_DEPTH,
+                });
+            }
+            next
+        } else {
+            let depth = req.depth.unwrap_or(0);
+            if depth_exceeds_max(depth) {
+                return Err(DelegateError::DepthExceeded { depth, max: MAX_DEPTH });
+            }
+            depth
+        };
 
         let envelope_id = Uuid::now_v7().to_string();
         let from_agent_id =

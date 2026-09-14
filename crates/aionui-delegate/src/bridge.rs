@@ -74,6 +74,18 @@ pub trait TeamEngagementBridge: Send + Sync {
     ) -> Result<bool, BridgeError> {
         Ok(false)
     }
+
+    /// Server-side current delegation-chain depth of `conversation_id` when it
+    /// is a convened engagement member (Phase 4c, spec §5.9): the
+    /// `delegate_depth` persisted on the engagement's delegated root task(s).
+    /// A team-member onward dispatch must derive its depth from this instead
+    /// of the agent-supplied `req.depth` (a debug aid an LLM can drop or
+    /// lie about, which would let a loop slip past `MAX_DEPTH`). `Ok(0)` when
+    /// the conversation is not a convened member — it is its own chain root —
+    /// and as the trait default, so unwired doubles never shift depths.
+    async fn conversation_current_depth(&self, _user_id: &str, _conversation_id: &str) -> Result<u32, BridgeError> {
+        Ok(0)
+    }
 }
 
 /// Default double: the bridge is never wired for unit tests / non-team builds.

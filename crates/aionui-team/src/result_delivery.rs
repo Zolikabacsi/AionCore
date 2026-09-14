@@ -44,6 +44,18 @@ pub fn next_depth_from_metadata(metadata: Option<&serde_json::Value>) -> u32 {
         .map_or(0, |depth| u32::try_from(depth).unwrap_or(u32::MAX).saturating_add(1))
 }
 
+/// The caller depth a root task was convened AT, read straight from metadata
+/// (`0` when absent — an ordinary/legacy task or a no-reply convene). Unlike
+/// [`next_depth_from_metadata`] this does NOT increment: it answers "what is
+/// this engagement's current chain depth" for the sender-inversion guard
+/// (Phase 4c, spec §5.9).
+pub fn delegated_depth_from_metadata(metadata: Option<&serde_json::Value>) -> u32 {
+    metadata
+        .and_then(|value| value.get(DELEGATE_DEPTH_KEY))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |depth| u32::try_from(depth).unwrap_or(u32::MAX))
+}
+
 /// Extract the caller conversation id from a task's metadata. `None` for
 /// ordinary team tasks (no metadata / no key) → the capture path is
 /// byte-identical to Phase 3a for them.
