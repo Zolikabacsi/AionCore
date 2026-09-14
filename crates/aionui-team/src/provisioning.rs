@@ -197,6 +197,15 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
 
+    /// The conversation's latest assistant-authored text, if any. Used at turn
+    /// finalize to capture a completed task's `result` from its assignee's
+    /// final message (Phase 3a). Default `Ok(None)` keeps the capture a no-op
+    /// for test doubles and non-SQLite implementations, mirroring
+    /// `IConversationRepository::latest_message_of_type`'s default-stub pattern.
+    async fn latest_assistant_text(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+        Ok(None)
+    }
+
     async fn lookup_team_binding_by_conversation(
         &self,
         _conversation_id: &str,

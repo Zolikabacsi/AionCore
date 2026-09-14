@@ -13,7 +13,7 @@ use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::DbError;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -38,7 +38,7 @@ use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
-use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, MailboxMessageType, TaskProcess, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
     MAX_MESSAGE_DELIVERY_FAILURES, ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
@@ -222,6 +222,32 @@ impl TeamSession {
         }
     }
 
+    /// Resolve the engagement's scheduling `process` mode for session start.
+    ///
+    /// Reads the resolved engagement row and maps its `process` string to a
+    /// [`TaskProcess`]. Any failure to obtain the row — a miss (`Ok(None)`),
+    /// the `NotFound` stub of a test double / legacy team, or a genuine DB
+    /// error — falls back to [`TaskProcess::Hierarchical`] so session start
+    /// never fails on the lookup and pre-Phase-3b behavior stays byte-identical.
+    pub(crate) async fn resolve_process(
+        repo: &Arc<dyn ITeamRepository>,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> TaskProcess {
+        match repo.find_engagement_by_id(user_id, engagement_id).await {
+            Ok(Some(row)) => TaskProcess::from(row.process.as_str()),
+            Ok(None) => TaskProcess::Hierarchical,
+            Err(err) => {
+                warn!(
+                    engagement_id,
+                    error = %err,
+                    "engagement process lookup failed; defaulting to hierarchical"
+                );
+                TaskProcess::Hierarchical
+            }
+        }
+    }
+
     /// Build the runtime member roster the scheduler drives: overlay each
     /// engagement's materialized member rows (fresh `slot_id` /
     /// `conversation_id`) on top of the `teams.agents` template, taking
@@ -292,6 +318,11 @@ impl TeamSession {
         // (send, projection, wake, MCP, runtime-status events) carries the
         // engagement's own `slot_id`/`conversation_id`.
         let member_agents = Self::engagement_member_agents(&repo, &user_id, &engagement_id, &team.agents).await;
+        // Per-engagement scheduling mode, resolved before `repo` is moved into
+        // the task board. Missing/legacy/unimplemented lookups default to
+        // Hierarchical (see `resolve_process`), so this never changes behavior
+        // for teams that have no `process` row yet.
+        let process = Self::resolve_process(&repo, &user_id, &engagement_id).await;
         // Single emitter shared by mailbox, task board, and the run manager so
         // all team events reuse the same team-scoped subscription/delivery.
         let emitter = Arc::new(TeamEventEmitter::new(
@@ -324,6 +355,7 @@ impl TeamSession {
             mailbox.clone(),
             task_board.clone(),
             broadcaster.clone(),
+            process,
         ));
 
         let auth_token = aionui_common::generate_id();
@@ -388,6 +420,11 @@ impl TeamSession {
     /// write in this session is stamped with. Resolved once at `start`.
     pub fn engagement_id(&self) -> &str {
         &self.engagement_id
+    }
+
+    /// The engagement's scheduling mode the scheduler was built with.
+    pub fn process(&self) -> TaskProcess {
+        self.scheduler.process()
     }
 
     pub fn user_id(&self) -> &str {
@@ -562,7 +599,14 @@ impl TeamSession {
                         .unwrap_or_default();
                     (command, false)
                 } else {
-                    let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                    let input_context = crate::prompts::input_context_for_slot(&tasks, &agent.slot_id);
+                    let wake_body = build_wake_payload(
+                        &agent,
+                        &tasks,
+                        &claimed_unread,
+                        &current_slot_ids,
+                        input_context.as_deref(),
+                    );
                     let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                     let first_message = if needs_role_prompt {
                         let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
@@ -670,6 +714,8 @@ impl TeamSession {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
         }
 
+        self.capture_turn_results(&slot_id).await;
+
         let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
 
         // Clear the dedup window unconditionally once finalize has run.
@@ -687,6 +733,53 @@ impl TeamSession {
         }
 
         Ok(wake_target)
+    }
+
+    /// Captures the task results for `slot_id` at turn finalize (Phase 3a):
+    /// every task the assignee completed during its turn gets its `result`
+    /// from the slot's latest assistant message. Best-effort side effect only
+    /// — never fails the finalize/wake/idle path: when no assistant text is
+    /// readable (legacy/hierarchical teams, a resume with no message yet, a
+    /// test double without the service) the capture is a no-op.
+    pub(crate) async fn capture_turn_results(&self, slot_id: &str) {
+        let pending = self.scheduler.take_pending_task_results(slot_id).await;
+        if pending.is_empty() {
+            return;
+        }
+        let Some(text) = self.latest_assistant_text_for_slot(slot_id).await else {
+            debug!(
+                team_id = %self.team.id,
+                slot_id,
+                task_count = pending.len(),
+                "task result capture skipped: no final assistant text available"
+            );
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        for task_id in &pending {
+            if let Err(error) = self.task_board.set_task_result(&self.team.id, task_id, text).await {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    task_id = %task_id,
+                    error = %error,
+                    "task result capture failed"
+                );
+            }
+        }
+    }
+
+    async fn latest_assistant_text_for_slot(&self, slot_id: &str) -> Option<String> {
+        let agent = self.scheduler.get_agent(slot_id).await.ok()?;
+        let service = self.service.upgrade()?;
+        service
+            .conversation_port()
+            .latest_assistant_text(&agent.conversation_id)
+            .await
+            .ok()?
     }
 
     /// Write a user message to the lead's mailbox and trigger a wake.
@@ -4676,6 +4769,35 @@ mod tests {
         assert!(
             !logs.contains("ERROR"),
             "the expected NotFound must stay a warn, not error: {logs}"
+        );
+    }
+
+    // ── resolve_process: per-engagement mode + default-hierarchical fallback ──
+
+    async fn process_for(lookup: crate::test_utils::EngagementLookup) -> TaskProcess {
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_lookup(lookup);
+        let repo: Arc<dyn ITeamRepository> = repo;
+        TeamSession::resolve_process(&repo, "u1", "eng-1").await
+    }
+
+    #[tokio::test]
+    async fn resolve_process_reads_sequential_from_row() {
+        let p = process_for(crate::test_utils::EngagementLookup::Process("sequential".into())).await;
+        assert_eq!(p, TaskProcess::Sequential);
+    }
+
+    #[tokio::test]
+    async fn resolve_process_defaults_hierarchical_on_miss_and_stub() {
+        // Real miss (Ok(None)).
+        assert_eq!(
+            process_for(crate::test_utils::EngagementLookup::Missing).await,
+            TaskProcess::Hierarchical
+        );
+        // Unimplemented double / legacy team (trait default NotFound stub).
+        assert_eq!(
+            process_for(crate::test_utils::EngagementLookup::Unimplemented).await,
+            TaskProcess::Hierarchical
         );
     }
 }

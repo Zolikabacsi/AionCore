@@ -2586,6 +2586,14 @@ impl TeamSessionService {
             .map(|e| e.session.user_id().to_owned())
     }
 
+    /// The conversation port this service was wired with. A `TeamSession`
+    /// reaches the latest-assistant read through the weak service back-ref it
+    /// already holds, instead of getting a new constructor dependency
+    /// (Phase 3a task result capture).
+    pub(crate) fn conversation_port(&self) -> Arc<dyn TeamConversationProvisioningPort> {
+        self.conversation_port.clone()
+    }
+
     pub(crate) fn capture_published_session(&self, expected: &TeamSession) -> Option<Arc<TeamSession>> {
         self.sessions
             .get(expected.engagement_id())

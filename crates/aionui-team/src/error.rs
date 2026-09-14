@@ -28,6 +28,12 @@ pub enum TeamError {
     #[error("Blocked task not found: {0}")]
     BlockedTaskNotFound(String),
 
+    #[error("Cyclic task dependency: {task_id} cannot be blocked by {dependency}")]
+    CyclicDependency { task_id: String, dependency: String },
+
+    #[error("Sequential engagement busy: task {task_id} cannot start while {current_task_id} is in progress")]
+    SequentialBusy { task_id: String, current_task_id: String },
+
     #[error("Backend not allowed: {0}")]
     BackendNotAllowed(String),
 
@@ -174,6 +180,22 @@ mod tests {
         assert_eq!(TeamError::TeamNotFound("t1".into()).to_string(), "Team not found: t1");
         assert_eq!(TeamError::AgentNotFound("s1".into()).to_string(), "Agent not found: s1");
         assert_eq!(TeamError::TaskNotFound("tk1".into()).to_string(), "Task not found: tk1");
+        assert_eq!(
+            TeamError::CyclicDependency {
+                task_id: "A".into(),
+                dependency: "B".into()
+            }
+            .to_string(),
+            "Cyclic task dependency: A cannot be blocked by B"
+        );
+        assert_eq!(
+            TeamError::SequentialBusy {
+                task_id: "B".into(),
+                current_task_id: "A".into()
+            }
+            .to_string(),
+            "Sequential engagement busy: task B cannot start while A is in progress"
+        );
     }
 
     #[test]

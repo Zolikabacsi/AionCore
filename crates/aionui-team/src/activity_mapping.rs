@@ -56,6 +56,9 @@ pub fn task_to_response(task: &TeamTask) -> TeamTaskResponse {
         blocks: task.blocks.clone(),
         created_at: task.created_at,
         updated_at: task.updated_at,
+        expected_output: task.expected_output.clone(),
+        result: task.result.clone(),
+        input_context: task.input_context.clone(),
     }
 }
 
@@ -157,6 +160,9 @@ mod tests {
             metadata: Some(serde_json::json!({"priority": "high"})),
             created_at: 1,
             updated_at: 2,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let resp = task_to_response(&task);
         assert_eq!(resp.id, "tk1");

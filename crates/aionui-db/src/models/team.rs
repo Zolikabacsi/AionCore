@@ -70,6 +70,12 @@ pub struct TeamTaskRow {
     pub updated_at: TimestampMs,
     /// Engagement (team+project) that owns this task; NULL for legacy rows.
     pub engagement_id: Option<String>,
+    /// CrewAI expected deliverable for the task; set on create, NULL if unset.
+    pub expected_output: Option<String>,
+    /// Task outcome, captured on completion; NULL until result capture.
+    pub result: Option<String>,
+    /// Upstream inputs fed to the task; NULL until input-context wiring.
+    pub input_context: Option<String>,
 }
 
 /// Row mapping for the `team_engagements` table.
@@ -180,6 +186,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let blocked: Vec<String> = serde_json::from_str(&row.blocked_by).expect("blocked_by should be valid JSON");
         assert!(blocked.is_empty());
@@ -202,6 +211,9 @@ mod tests {
             created_at: 1000,
             updated_at: 2000,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         let restored: TeamTaskRow = serde_json::from_str(&json).expect("deserialize");

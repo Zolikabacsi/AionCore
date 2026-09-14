@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aionui_api_types::TeamTaskChange;
@@ -11,6 +12,11 @@ use crate::activity_mapping::task_to_response;
 use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
 use crate::types::{TaskStatus, TeamTask};
+
+/// Upper bound (bytes) on a computed task `input_context`. Context passing is a
+/// naive newest-first concat of upstream results; see [`cap_upstream`] for the
+/// cap's upgrade path.
+const MAX_INPUT_CONTEXT_CHARS: usize = 8000;
 
 pub struct TaskBoard {
     repo: Arc<dyn ITeamRepository>,
@@ -76,6 +82,42 @@ impl TaskBoard {
         Ok(row)
     }
 
+    /// Reject a new `blocked_by` edge set for `task_id` that would make the
+    /// engagement's task graph cyclic (spec §7.3). The graph is read through the
+    /// engagement-scoped [`list_tasks`](Self::list_tasks), so a cycle can only
+    /// ever be formed inside this board's engagement.
+    ///
+    /// For each proposed dependency, a DFS over the existing `blocked_by`
+    /// transitive closure checks whether `task_id` is reachable from it; if so,
+    /// adding `task_id -> dep` closes a cycle and the update is rejected without
+    /// writing. A self-edge (`dep == task_id`) is caught immediately.
+    async fn assert_no_cycle(&self, team_id: &str, task_id: &str, new_blocked_by: &[String]) -> Result<(), TeamError> {
+        let tasks = self.list_tasks(team_id).await?;
+        let mut graph: HashMap<&str, &[String]> = HashMap::with_capacity(tasks.len());
+        for task in &tasks {
+            graph.insert(task.id.as_str(), &task.blocked_by);
+        }
+
+        let mut visited: HashSet<&str> = HashSet::new();
+        for dep in new_blocked_by {
+            let mut stack = vec![dep.as_str()];
+            while let Some(node) = stack.pop() {
+                if node == task_id {
+                    return Err(TeamError::CyclicDependency {
+                        task_id: task_id.to_owned(),
+                        dependency: dep.clone(),
+                    });
+                }
+                if visited.insert(node)
+                    && let Some(next) = graph.get(node)
+                {
+                    stack.extend(next.iter().map(String::as_str));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_task(
         &self,
         team_id: &str,
@@ -83,6 +125,7 @@ impl TaskBoard {
         description: Option<&str>,
         owner: Option<&str>,
         blocked_by: &[String],
+        expected_output: Option<&str>,
     ) -> Result<TeamTask, TeamError> {
         for dep_id in blocked_by {
             // `create_task` is engagement-gated upstream: the dep loop below
@@ -97,6 +140,13 @@ impl TaskBoard {
 
         let task_id = generate_id();
         let now = now_ms();
+        // Acyclicity (spec §7.3): reject a `blocked_by` that closes a cycle
+        // before persisting. A brand-new id has no dependents yet, so for
+        // `create_task` this only catches a self-edge — kept for the shared
+        // invariant the update path also relies on. Runs after the dep-exists
+        // loop above (validate edges exist, then validate the graph is acyclic).
+        self.assert_no_cycle(team_id, &task_id, blocked_by).await?;
+
         let blocked_by_json = serde_json::to_string(blocked_by)?;
 
         let row = TeamTaskRow {
@@ -112,6 +162,9 @@ impl TaskBoard {
             created_at: now,
             updated_at: now,
             engagement_id: self.engagement_id.clone(),
+            expected_output: expected_output.map(str::to_owned),
+            result: None,
+            input_context: None,
         };
 
         self.repo.create_task(&self.user_id, &row).await?;
@@ -141,6 +194,14 @@ impl TaskBoard {
             .find_task(team_id, task_id)
             .await?
             .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
+
+        // Acyclicity (spec §7.3): when the dependency set is being replaced,
+        // reject edges that would close a cycle BEFORE persisting. This is the
+        // path where real cycles appear (e.g. A blocked-by B after B was
+        // created blocked-by A).
+        if let Some(new_blocked_by) = &update.blocked_by {
+            self.assert_no_cycle(team_id, task_id, new_blocked_by).await?;
+        }
 
         let params = UpdateTaskParams {
             status: update.status.map(|s| s.to_string()),
@@ -172,6 +233,18 @@ impl TaskBoard {
         Ok(task)
     }
 
+    /// Stamps a task's `result` (Phase 3a capture at turn finalize). Engagement-
+    /// gated like [`update_task`](Self::update_task): the `find_task` read-gate
+    /// rejects rows outside this board's engagement before the repo write.
+    pub async fn set_task_result(&self, team_id: &str, task_id: &str, result: &str) -> Result<(), TeamError> {
+        self.find_task(team_id, task_id)
+            .await?
+            .ok_or_else(|| TeamError::TaskNotFound(task_id.to_owned()))?;
+        self.repo.set_task_result(&self.user_id, task_id, result).await?;
+        debug!(team_id, task_id, "task result captured");
+        Ok(())
+    }
+
     pub async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTask>, TeamError> {
         let rows = match &self.engagement_id {
             Some(engagement) => self.repo.list_tasks_by_engagement(&self.user_id, engagement).await?,
@@ -179,6 +252,29 @@ impl TaskBoard {
         };
         let tasks = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
         Ok(tasks)
+    }
+
+    /// The oldest task currently `InProgress` in this board's engagement, if any.
+    /// `sequential` gating (spec §7.2) uses this to forbid a second concurrent
+    /// in-progress task; in `hierarchical` mode it is simply the first in-progress
+    /// task found (informational).
+    pub async fn in_progress_task(&self, team_id: &str) -> Result<Option<TeamTask>, TeamError> {
+        let tasks = self.list_tasks(team_id).await?;
+        Ok(tasks
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .min_by_key(|t| t.created_at))
+    }
+
+    /// The next task to start in `sequential` mode: the oldest `Pending` task
+    /// with no outstanding blockers (ready), i.e. dependency-then-`created_at`
+    /// order. `None` when nothing is startable (all done / in-progress / blocked).
+    pub async fn next_sequential_ready(&self, team_id: &str) -> Result<Option<TeamTask>, TeamError> {
+        let tasks = self.list_tasks(team_id).await?;
+        Ok(tasks
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::Pending && t.blocked_by.is_empty())
+            .min_by_key(|t| t.created_at))
     }
 
     /// Unblocks every downstream task listed in `completed_row.blocks`.
@@ -219,6 +315,11 @@ impl TaskBoard {
                 unblocked = %downstream_id,
                 "dependency unblocked"
             );
+            // Context passing (Phase 3a) is NOT materialized here: the completing
+            // task's `result` is only written at its turn FINALIZE, which happens
+            // after this tool call returns. The downstream owner's wake computes
+            // its `[[UPSTREAM]]` context live (see `compute_input_context`), so it
+            // always reflects results that are persisted by wake time.
             // Broadcast the downstream task's changed dependency set so the
             // activity board and the downstream-owner wake path both observe it
             // is now (potentially) actionable. Non-fatal: a missing row or parse
@@ -232,6 +333,92 @@ impl TaskBoard {
         }
         Ok(())
     }
+}
+
+/// Compute a task's `input_context` on the fly from the results its completed
+/// upstream dependencies have captured so far. `tasks` must be the engagement-
+/// scoped task list the target's deps live in (the caller reads it through the
+/// engagement+user-gated `TaskBoard::list_tasks`); a dep outside that scope is
+/// never present, so it can never leak another engagement's results.
+///
+/// Returns `None` when the target has no completed upstream with a non-empty
+/// result — so a task with nothing to pass forward renders no wake section,
+/// byte-identical to a hierarchical/no-dependency wake.
+///
+/// This is computed at WAKE time, not stored at completion time: an upstream's
+/// `result` is only persisted at its turn finalize (after its completion tool
+/// call returns), so any value captured earlier would miss it. Recomputing from
+/// the live results is race-free.
+pub fn compute_input_context(target: &TeamTask, tasks: &[TeamTask]) -> Option<String> {
+    let mut deps: Vec<&TeamTask> = tasks
+        .iter()
+        .filter(|t| t.blocks.iter().any(|id| id == &target.id))
+        .filter(|t| t.status == TaskStatus::Completed && t.result.as_deref().is_some_and(|r| !r.trim().is_empty()))
+        .collect();
+    if deps.is_empty() {
+        return None;
+    }
+    // Oldest first; the cap keeps the newest on overflow.
+    deps.sort_by_key(|t| t.created_at);
+
+    // `[[BRIEF]]` is the target's subject — v1 has no cleaner engagement/root
+    // brief source, and the column is not to be invented.
+    let prefix = format!("[[BRIEF]]\n{}\n\n[[UPSTREAM]]\n", target.subject);
+    let lines: Vec<String> = deps
+        .iter()
+        .map(|d| format!("- {}: {}", d.id, d.result.as_deref().unwrap_or("").trim_end()))
+        .collect();
+    Some(cap_upstream(&prefix, &lines))
+}
+
+/// Bounded `[[UPSTREAM]]` render. Keeps the newest dependency lines and drops
+/// the oldest on overflow (dependencies are passed in oldest→newest).
+///
+/// ponytail: naive byte cap, oldest-dep truncation, no per-result summarization.
+/// The whole-thing scan is O(deps^2) renders but `deps` is tiny. Upgrade to
+/// per-dependency summarization only if measured token pressure ever demands
+/// more than a length bound.
+fn cap_upstream(prefix: &str, lines_asc: &[String]) -> String {
+    let total = lines_asc.len();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0usize;
+    for line in lines_asc.iter().rev() {
+        let mut trial = kept.clone();
+        trial.insert(0, line.as_str());
+        let trial_dropped = total - trial.len();
+        if render_input_context(prefix, &trial, trial_dropped).len() <= MAX_INPUT_CONTEXT_CHARS {
+            kept = trial;
+            continue;
+        }
+        if !kept.is_empty() {
+            // This and every older line no longer fit; stop, keep the newest.
+            dropped = total - kept.len();
+            break;
+        }
+        // The single newest result already blows the cap on its own: hard
+        // truncate it so at least its head passes forward.
+        let budget = MAX_INPUT_CONTEXT_CHARS.saturating_sub(prefix.len() + 1);
+        let mut cut = budget.min(line.len());
+        while cut > 0 && !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        kept.push(&line[..cut]);
+        dropped = total - 1;
+        break;
+    }
+    render_input_context(prefix, &kept, dropped)
+}
+
+fn render_input_context(prefix: &str, kept_asc: &[&str], dropped: usize) -> String {
+    let mut s = String::from(prefix);
+    if dropped > 0 {
+        s.push_str(&format!("…{dropped} older upstream result(s) truncated\n"));
+    }
+    for line in kept_asc {
+        s.push_str(line);
+        s.push('\n');
+    }
+    s
 }
 
 #[cfg(test)]
@@ -286,7 +473,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let (board, bc) = board_with_events(repo);
 
-        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        let task = board.create_task("t1", "Build", None, None, &[], None).await.unwrap();
 
         let changes = task_changes(&bc);
         assert_eq!(changes.len(), 1);
@@ -300,7 +487,7 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let (board, bc) = board_with_events(repo);
 
-        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        let task = board.create_task("t1", "Build", None, None, &[], None).await.unwrap();
         board
             .update_task(
                 "t1",
@@ -327,9 +514,9 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let (board, bc) = board_with_events(repo);
 
-        let a = board.create_task("t1", "A", None, None, &[]).await.unwrap();
+        let a = board.create_task("t1", "A", None, None, &[], None).await.unwrap();
         let b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&a.id))
+            .create_task("t1", "B", None, None, std::slice::from_ref(&a.id), None)
             .await
             .unwrap();
 
@@ -362,7 +549,7 @@ mod tests {
     async fn no_emitter_does_not_panic_and_emits_nothing() {
         let repo = Arc::new(MockTeamRepo::new());
         let board = TaskBoard::new(repo);
-        let task = board.create_task("t1", "Build", None, None, &[]).await.unwrap();
+        let task = board.create_task("t1", "Build", None, None, &[], None).await.unwrap();
         board
             .update_task(
                 "t1",
@@ -380,7 +567,10 @@ mod tests {
     // -- Helper ---------------------------------------------------------------
 
     async fn create_simple_task(board: &TaskBoard, team_id: &str, subject: &str) -> TeamTask {
-        board.create_task(team_id, subject, None, None, &[]).await.unwrap()
+        board
+            .create_task(team_id, subject, None, None, &[], None)
+            .await
+            .unwrap()
     }
 
     // -- Tests ----------------------------------------------------------------
@@ -403,7 +593,7 @@ mod tests {
         let board = TaskBoard::new(repo);
 
         let task = board
-            .create_task("t1", "Design API", Some("REST endpoints"), Some("a1"), &[])
+            .create_task("t1", "Design API", Some("REST endpoints"), Some("a1"), &[], None)
             .await
             .unwrap();
         assert_eq!(task.description.as_deref(), Some("REST endpoints"));
@@ -417,7 +607,7 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "Task A").await;
         let task_b = board
-            .create_task("t1", "Task B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "Task B", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
 
@@ -437,7 +627,9 @@ mod tests {
         let repo = Arc::new(MockTeamRepo::new());
         let board = TaskBoard::new(repo);
 
-        let result = board.create_task("t1", "X", None, None, &["nonexistent".into()]).await;
+        let result = board
+            .create_task("t1", "X", None, None, &["nonexistent".into()], None)
+            .await;
         assert!(matches!(result, Err(TeamError::BlockedTaskNotFound(_))));
     }
 
@@ -499,7 +691,7 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
 
@@ -529,11 +721,11 @@ mod tests {
 
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_b = board
-            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "B", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
         let task_c = board
-            .create_task("t1", "C", None, None, std::slice::from_ref(&task_a.id))
+            .create_task("t1", "C", None, None, std::slice::from_ref(&task_a.id), None)
             .await
             .unwrap();
 
@@ -564,7 +756,7 @@ mod tests {
         let task_a = create_simple_task(&board, "t1", "A").await;
         let task_x = create_simple_task(&board, "t1", "X").await;
         let task_b = board
-            .create_task("t1", "B", None, None, &[task_a.id.clone(), task_x.id.clone()])
+            .create_task("t1", "B", None, None, &[task_a.id.clone(), task_x.id.clone()], None)
             .await
             .unwrap();
 
@@ -627,5 +819,69 @@ mod tests {
 
         let tasks = board.list_tasks("t1").await.unwrap();
         assert_eq!(tasks.len(), 2);
+    }
+
+    // -- Phase 3a: input_context compute/cap (pure helpers) -------------------
+
+    fn ttask(id: &str, created: i64, status: TaskStatus, blocks: Vec<String>, result: Option<&str>) -> TeamTask {
+        TeamTask {
+            id: id.into(),
+            team_id: "t1".into(),
+            subject: id.into(),
+            description: None,
+            status,
+            owner: None,
+            blocked_by: vec![],
+            blocks,
+            metadata: None,
+            created_at: created,
+            updated_at: created,
+            expected_output: None,
+            result: result.map(str::to_owned),
+            input_context: None,
+        }
+    }
+
+    #[test]
+    fn compute_input_context_keeps_every_dep_under_the_cap() {
+        let target = ttask("B", 0, TaskStatus::Pending, vec![], None);
+        let tasks = vec![
+            ttask("A", 1, TaskStatus::Completed, vec!["B".into()], Some("oldest result")),
+            ttask("X", 2, TaskStatus::Completed, vec!["B".into()], Some("newest result")),
+            target.clone(),
+        ];
+        let ctx = compute_input_context(&target, &tasks).unwrap();
+        assert!(ctx.contains("[[BRIEF]]\nB\n"), "brief anchor is the subject:\n{ctx}");
+        assert!(ctx.contains("- A: oldest result"), "{ctx}");
+        assert!(ctx.contains("- X: newest result"), "{ctx}");
+        assert!(!ctx.contains("truncated"), "no overflow, nothing dropped:\n{ctx}");
+    }
+
+    #[test]
+    fn compute_input_context_is_none_without_a_completed_result_dep() {
+        let target = ttask("B", 0, TaskStatus::Pending, vec![], None);
+        // The real runtime state right after the completion tool returns: A is
+        // completed but its result is not captured yet.
+        let tasks = vec![
+            ttask("A", 1, TaskStatus::Completed, vec!["B".into()], None),
+            target.clone(),
+        ];
+        assert!(compute_input_context(&target, &tasks).is_none());
+    }
+
+    #[test]
+    fn cap_keeps_newest_dep_and_drops_oldest_on_overflow() {
+        let big = "y".repeat(MAX_INPUT_CONTEXT_CHARS);
+        let target = ttask("B", 0, TaskStatus::Pending, vec![], None);
+        let tasks = vec![
+            ttask("A", 1, TaskStatus::Completed, vec!["B".into()], Some(&big)),
+            ttask("X", 2, TaskStatus::Completed, vec!["B".into()], Some("newest short")),
+            target.clone(),
+        ];
+        let ctx = compute_input_context(&target, &tasks).unwrap();
+        assert!(ctx.len() <= MAX_INPUT_CONTEXT_CHARS, "cap respected: {}", ctx.len());
+        assert!(ctx.contains("newest short"), "newest dep kept:\n{ctx}");
+        assert!(!ctx.contains('y'), "oldest (huge) dep dropped:\n{ctx}");
+        assert!(ctx.contains("truncated"), "overflow recorded:\n{ctx}");
     }
 }

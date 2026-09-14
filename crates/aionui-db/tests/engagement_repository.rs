@@ -142,3 +142,38 @@ async fn delete_by_team_is_scoped_and_respects_member_fk_order() {
     repo.delete_engagements_by_team("u1", "team-legacy").await.unwrap();
     assert!(repo.list_engagements("u1", "team-legacy").await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn find_engagement_by_id_reads_process_and_is_user_scoped() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteTeamRepository::new(db.pool().clone());
+    seed_team(db.pool(), "team-p", "u1").await;
+    seed_team(db.pool(), "team-q", "u2").await;
+
+    let mine = repo
+        .find_or_create_engagement("u1", "team-p", "proj", "/ws")
+        .await
+        .unwrap();
+    let theirs = repo
+        .find_or_create_engagement("u2", "team-q", "proj", "/ws")
+        .await
+        .unwrap();
+
+    // Default process is hierarchical.
+    let found = repo.find_engagement_by_id("u1", &mine.id).await.unwrap().expect("row");
+    assert_eq!(found.process, "hierarchical");
+
+    // Flip to sequential and re-read by id.
+    sqlx::query("UPDATE team_engagements SET process = 'sequential' WHERE id = ?")
+        .bind(&mine.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let seq = repo.find_engagement_by_id("u1", &mine.id).await.unwrap().expect("row");
+    assert_eq!(seq.process, "sequential");
+
+    // Cross-user isolation: u1 cannot read u2's engagement id.
+    assert!(repo.find_engagement_by_id("u1", &theirs.id).await.unwrap().is_none());
+    // Unknown id -> None (not an error).
+    assert!(repo.find_engagement_by_id("u1", "nope").await.unwrap().is_none());
+}

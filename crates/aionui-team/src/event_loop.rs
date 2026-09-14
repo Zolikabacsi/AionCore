@@ -383,6 +383,9 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
 }
 
 async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
+    // Phase 3a: capture completed task results from the turn's final assistant
+    // message before the idle/leader-wake bookkeeping runs.
+    ctx.session.capture_turn_results(&ctx.slot_id).await;
     match ctx.scheduler.finalize_turn(&ctx.slot_id).await {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
             if let Err(error) = ctx

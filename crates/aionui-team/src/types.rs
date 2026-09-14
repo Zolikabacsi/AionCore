@@ -282,6 +282,12 @@ pub struct TeamTask {
     pub metadata: Option<serde_json::Value>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +384,9 @@ impl TeamTask {
             metadata,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            expected_output: row.expected_output.clone(),
+            result: row.result.clone(),
+            input_context: row.input_context.clone(),
         })
     }
 }
@@ -395,6 +404,50 @@ impl TeamEngagement {
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskProcess — per-engagement scheduling mode (Phase 3b)
+// ---------------------------------------------------------------------------
+
+/// How a team's tasks are scheduled within an engagement.
+///
+/// `Hierarchical` is the default (leader orchestrates, teammates run in
+/// parallel). `Sequential` is the DAG/gate mode threaded in from the
+/// engagement row; the actual gating behavior lives in the scheduler.
+/// Anything other than `"sequential"` parses to `Hierarchical` so a missing,
+/// legacy, or malformed value is always the safe, pre-existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskProcess {
+    #[default]
+    Hierarchical,
+    Sequential,
+}
+
+impl fmt::Display for TaskProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hierarchical => write!(f, "hierarchical"),
+            Self::Sequential => write!(f, "sequential"),
+        }
+    }
+}
+
+impl From<&str> for TaskProcess {
+    fn from(s: &str) -> Self {
+        if s == "sequential" {
+            Self::Sequential
+        } else {
+            Self::Hierarchical
+        }
+    }
+}
+
+impl From<String> for TaskProcess {
+    fn from(s: String) -> Self {
+        Self::from(s.as_str())
     }
 }
 
@@ -492,6 +545,22 @@ mod tests {
     fn teammate_role_serde_leader_alias() {
         let leader: TeammateRole = serde_json::from_str(r#""leader""#).unwrap();
         assert_eq!(leader, TeammateRole::Lead);
+    }
+
+    // -- TaskProcess ----------------------------------------------------------
+
+    #[test]
+    fn task_process_from_str_sequential_only() {
+        assert_eq!(TaskProcess::from("sequential"), TaskProcess::Sequential);
+        assert_eq!(TaskProcess::from("hierarchical"), TaskProcess::Hierarchical);
+        assert_eq!(TaskProcess::from("unknown"), TaskProcess::Hierarchical);
+        assert_eq!(TaskProcess::from(""), TaskProcess::Hierarchical);
+    }
+
+    #[test]
+    fn task_process_display() {
+        assert_eq!(TaskProcess::Sequential.to_string(), "sequential");
+        assert_eq!(TaskProcess::Hierarchical.to_string(), "hierarchical");
     }
 
     // -- MailboxMessageType ---------------------------------------------------
@@ -878,6 +947,9 @@ mod tests {
             created_at: 1000,
             updated_at: 2000,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::InProgress);
@@ -901,6 +973,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -924,6 +999,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -944,6 +1022,9 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         assert!(TeamTask::from_row(&row).is_err());
     }

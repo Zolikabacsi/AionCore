@@ -476,8 +476,9 @@ impl ITeamRepository for SqliteTeamRepository {
         let result = sqlx::query(
             "INSERT INTO team_tasks \
                 (id, team_id, subject, description, status, owner, \
-                 blocked_by, blocks, metadata, created_at, updated_at, engagement_id) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                 blocked_by, blocks, metadata, created_at, updated_at, engagement_id, \
+                 expected_output, result, input_context) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
         )
         .bind(&row.id)
@@ -492,6 +493,9 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.created_at)
         .bind(row.updated_at)
         .bind(row.engagement_id.as_deref())
+        .bind(row.expected_output.as_deref())
+        .bind(row.result.as_deref())
+        .bind(row.input_context.as_deref())
         .bind(&row.team_id)
         .bind(user_id)
         .execute(&self.pool)
@@ -763,6 +767,27 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
+    async fn set_task_result(&self, user_id: &str, task_id: &str, result: &str) -> Result<(), DbError> {
+        // User-scoped like `update_task`'s ownership guard; task ids are
+        // globally unique, and the caller (task board) engagement-gates the
+        // row through `find_task` before reaching here.
+        let updated = sqlx::query(
+            "UPDATE team_tasks SET result = ?, updated_at = ? \
+             WHERE id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_tasks.team_id AND t.user_id = ?)",
+        )
+        .bind(result)
+        .bind(now_ms())
+        .bind(task_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("task {task_id}")));
+        }
+        Ok(())
+    }
+
     // ── Engagements ──────────────────────────────────────────────────
 
     async fn create_engagement(
@@ -826,6 +851,19 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(project_id)
         .fetch_optional(&self.pool)
         .await?;
+        Ok(row)
+    }
+
+    async fn find_engagement_by_id(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamEngagementRow>("SELECT * FROM team_engagements WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(engagement_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row)
     }
 
