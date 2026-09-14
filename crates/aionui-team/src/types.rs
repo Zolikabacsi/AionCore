@@ -308,6 +308,17 @@ pub struct TeamEngagement {
     pub updated_at: TimestampMs,
 }
 
+/// Result of the delegation bridge's "convene engagement" seam: the
+/// find-or-created engagement, the root task created on its board (owned by
+/// the lead), and the lead's slot id the envelope was mailed to. In-process
+/// only; never serialized (the bridge adapter maps it to its own type).
+#[derive(Debug, Clone)]
+pub struct TeamEngagementConvened {
+    pub engagement_id: String,
+    pub root_task_id: String,
+    pub lead_slot_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // Conversion helpers: DB rows ↔ domain types
 // ---------------------------------------------------------------------------

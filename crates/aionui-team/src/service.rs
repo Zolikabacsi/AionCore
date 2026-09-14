@@ -38,6 +38,7 @@ use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
     TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
+use crate::mailbox::Mailbox;
 use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
 };
@@ -55,8 +56,11 @@ use crate::session::{
     AgentMessageQueueResult, TeamSession, attach_member_runtime, attach_member_runtime_after_kill,
     spawn_attach_agent_process_bg,
 };
+use crate::task_board::TaskBoard;
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeamEngagement, TeamTask, TeammateRole};
+use crate::types::{
+    MailboxMessageType, Team, TeamAgent, TeamEngagement, TeamEngagementConvened, TeamTask, TeammateRole,
+};
 use crate::work_coordinator::{
     McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
 };
@@ -824,6 +828,80 @@ impl TeamSessionService {
             .ensure_engagement_members(user_id, &row, &team)
             .await?;
         Ok(TeamEngagement::from_row(&row))
+    }
+
+    /// "Convene engagement" seam for the delegation bridge (Phase 4a): bind the
+    /// team to the project's engagement (find-or-create, members materialized),
+    /// create the root task on that engagement's board owned by the lead, and
+    /// enqueue the caller-composed `[[AION_DELEGATE]]` envelope into the lead's
+    /// engagement mailbox. `envelope_payload` is pre-composed by the caller
+    /// (via `compose_delivery_body`) — this seam never formats envelopes.
+    ///
+    /// Ownership: the team is loaded user-scoped FIRST, so a missing team and
+    /// another user's team both surface as `TeamNotFound` (existence is never
+    /// leaked, same convention as the read paths).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn convene_delegated_task(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+        subject: &str,
+        description: &str,
+        expected_output: Option<&str>,
+        envelope_payload: &str,
+    ) -> Result<TeamEngagementConvened, TeamError> {
+        self.load_owned_team_row(user_id, team_id).await?;
+        let engagement = self.ensure_engagement(user_id, team_id, project_id).await?;
+        let members = self.repo.list_engagement_members(user_id, &engagement.id).await?;
+        let lead = members
+            .iter()
+            .find(|member| member.role == "lead")
+            .ok_or_else(|| TeamError::InvalidRequest(format!("engagement {} has no lead member", engagement.id)))?;
+
+        let emitter = Arc::new(TeamEventEmitter::new(
+            team_id.to_owned(),
+            user_id.to_owned(),
+            self.broadcaster.clone(),
+        ));
+        let task = TaskBoard::new_for_user(self.repo.clone(), user_id)
+            .with_events(emitter.clone())
+            .with_engagement(engagement.id.clone())
+            .create_task(
+                team_id,
+                subject,
+                Some(description),
+                Some(lead.slot_id.as_str()),
+                &[],
+                expected_output,
+            )
+            .await?;
+        Mailbox::new_for_user(self.repo.clone(), user_id)
+            .with_events(emitter)
+            .with_engagement(engagement.id.clone())
+            .write(
+                team_id,
+                &lead.slot_id,
+                "user",
+                MailboxMessageType::Message,
+                envelope_payload,
+                Some(subject),
+            )
+            .await?;
+
+        info!(
+            kind = "team",
+            team_id,
+            engagement_id = %engagement.id,
+            task_id = %task.id,
+            lead_slot_id = %lead.slot_id,
+            "delegated task convened on engagement"
+        );
+        Ok(TeamEngagementConvened {
+            engagement_id: engagement.id,
+            root_task_id: task.id,
+            lead_slot_id: lead.slot_id.clone(),
+        })
     }
 
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
