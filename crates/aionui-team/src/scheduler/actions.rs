@@ -27,8 +27,25 @@ impl TeammateManager {
         use crate::task_board::TaskUpdate;
         use crate::types::TaskStatus;
 
+        let parsed_status = status.and_then(TaskStatus::parse);
+
+        // Sequential gate (spec §7.2): at most one task may be `InProgress` in the
+        // engagement at a time. Reject a start of a *different* task while another
+        // is already in progress. The same task re-marking itself in-progress is
+        // idempotent and allowed; `hierarchical` skips this check entirely.
+        if self.is_sequential()
+            && parsed_status == Some(TaskStatus::InProgress)
+            && let Some(current) = self.task_board.in_progress_task(&self.team_id).await?
+            && current.id != task_id
+        {
+            return Err(TeamError::SequentialBusy {
+                task_id: task_id.to_owned(),
+                current_task_id: current.id,
+            });
+        }
+
         let update = TaskUpdate {
-            status: status.and_then(TaskStatus::parse),
+            status: parsed_status,
             description,
             owner,
             blocked_by,

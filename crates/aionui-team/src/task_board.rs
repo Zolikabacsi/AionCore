@@ -254,6 +254,29 @@ impl TaskBoard {
         Ok(tasks)
     }
 
+    /// The oldest task currently `InProgress` in this board's engagement, if any.
+    /// `sequential` gating (spec §7.2) uses this to forbid a second concurrent
+    /// in-progress task; in `hierarchical` mode it is simply the first in-progress
+    /// task found (informational).
+    pub async fn in_progress_task(&self, team_id: &str) -> Result<Option<TeamTask>, TeamError> {
+        let tasks = self.list_tasks(team_id).await?;
+        Ok(tasks
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .min_by_key(|t| t.created_at))
+    }
+
+    /// The next task to start in `sequential` mode: the oldest `Pending` task
+    /// with no outstanding blockers (ready), i.e. dependency-then-`created_at`
+    /// order. `None` when nothing is startable (all done / in-progress / blocked).
+    pub async fn next_sequential_ready(&self, team_id: &str) -> Result<Option<TeamTask>, TeamError> {
+        let tasks = self.list_tasks(team_id).await?;
+        Ok(tasks
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::Pending && t.blocked_by.is_empty())
+            .min_by_key(|t| t.created_at))
+    }
+
     /// Unblocks every downstream task listed in `completed_row.blocks`.
     ///
     /// Engagement scoping (defense-in-depth): task ids are globally unique, so

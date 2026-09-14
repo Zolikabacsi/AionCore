@@ -31,6 +31,9 @@ pub enum TeamError {
     #[error("Cyclic task dependency: {task_id} cannot be blocked by {dependency}")]
     CyclicDependency { task_id: String, dependency: String },
 
+    #[error("Sequential engagement busy: task {task_id} cannot start while {current_task_id} is in progress")]
+    SequentialBusy { task_id: String, current_task_id: String },
+
     #[error("Backend not allowed: {0}")]
     BackendNotAllowed(String),
 
@@ -184,6 +187,14 @@ mod tests {
             }
             .to_string(),
             "Cyclic task dependency: A cannot be blocked by B"
+        );
+        assert_eq!(
+            TeamError::SequentialBusy {
+                task_id: "B".into(),
+                current_task_id: "A".into()
+            }
+            .to_string(),
+            "Sequential engagement busy: task B cannot start while A is in progress"
         );
     }
 

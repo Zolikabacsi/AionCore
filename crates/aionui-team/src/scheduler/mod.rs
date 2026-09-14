@@ -183,6 +183,12 @@ impl TeammateManager {
         self.process
     }
 
+    /// True when this engagement runs in `sequential` mode (spec §7.2): at most
+    /// one task may be `InProgress` at a time.
+    pub fn is_sequential(&self) -> bool {
+        self.process == TaskProcess::Sequential
+    }
+
     pub async fn get_agent(&self, slot_id: &str) -> Result<TeamAgent, TeamError> {
         let slots = self.slots.lock().await;
         let slot = slots

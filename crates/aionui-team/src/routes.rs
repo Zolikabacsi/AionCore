@@ -68,6 +68,20 @@ impl From<TeamError> for ApiError {
             ),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
+            TeamError::SequentialBusy {
+                task_id,
+                current_task_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_SEQUENTIAL_BUSY",
+                format!(
+                    "Sequential engagement busy: task {task_id} cannot start while {current_task_id} is in progress"
+                ),
+                Some(serde_json::json!({
+                    "task_id": task_id,
+                    "current_task_id": current_task_id,
+                })),
+            ),
             TeamError::RuntimeNotReady { conversation_id } => ApiError::coded(
                 StatusCode::CONFLICT,
                 "TEAM_RUNTIME_NOT_READY",
