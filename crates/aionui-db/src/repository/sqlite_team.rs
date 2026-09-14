@@ -854,6 +854,19 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(row)
     }
 
+    async fn find_engagement_by_id(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamEngagementRow>("SELECT * FROM team_engagements WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(engagement_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
     async fn list_engagements(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError> {
         let rows = sqlx::query_as::<_, TeamEngagementRow>(
             "SELECT * FROM team_engagements WHERE user_id = ? AND team_id = ? ORDER BY created_at ASC",

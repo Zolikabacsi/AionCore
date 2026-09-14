@@ -38,7 +38,7 @@ use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
-use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, MailboxMessageType, TaskProcess, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
     MAX_MESSAGE_DELIVERY_FAILURES, ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
@@ -222,6 +222,32 @@ impl TeamSession {
         }
     }
 
+    /// Resolve the engagement's scheduling `process` mode for session start.
+    ///
+    /// Reads the resolved engagement row and maps its `process` string to a
+    /// [`TaskProcess`]. Any failure to obtain the row — a miss (`Ok(None)`),
+    /// the `NotFound` stub of a test double / legacy team, or a genuine DB
+    /// error — falls back to [`TaskProcess::Hierarchical`] so session start
+    /// never fails on the lookup and pre-Phase-3b behavior stays byte-identical.
+    pub(crate) async fn resolve_process(
+        repo: &Arc<dyn ITeamRepository>,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> TaskProcess {
+        match repo.find_engagement_by_id(user_id, engagement_id).await {
+            Ok(Some(row)) => TaskProcess::from(row.process.as_str()),
+            Ok(None) => TaskProcess::Hierarchical,
+            Err(err) => {
+                warn!(
+                    engagement_id,
+                    error = %err,
+                    "engagement process lookup failed; defaulting to hierarchical"
+                );
+                TaskProcess::Hierarchical
+            }
+        }
+    }
+
     /// Build the runtime member roster the scheduler drives: overlay each
     /// engagement's materialized member rows (fresh `slot_id` /
     /// `conversation_id`) on top of the `teams.agents` template, taking
@@ -292,6 +318,11 @@ impl TeamSession {
         // (send, projection, wake, MCP, runtime-status events) carries the
         // engagement's own `slot_id`/`conversation_id`.
         let member_agents = Self::engagement_member_agents(&repo, &user_id, &engagement_id, &team.agents).await;
+        // Per-engagement scheduling mode, resolved before `repo` is moved into
+        // the task board. Missing/legacy/unimplemented lookups default to
+        // Hierarchical (see `resolve_process`), so this never changes behavior
+        // for teams that have no `process` row yet.
+        let process = Self::resolve_process(&repo, &user_id, &engagement_id).await;
         // Single emitter shared by mailbox, task board, and the run manager so
         // all team events reuse the same team-scoped subscription/delivery.
         let emitter = Arc::new(TeamEventEmitter::new(
@@ -324,6 +355,7 @@ impl TeamSession {
             mailbox.clone(),
             task_board.clone(),
             broadcaster.clone(),
+            process,
         ));
 
         let auth_token = aionui_common::generate_id();
@@ -388,6 +420,11 @@ impl TeamSession {
     /// write in this session is stamped with. Resolved once at `start`.
     pub fn engagement_id(&self) -> &str {
         &self.engagement_id
+    }
+
+    /// The engagement's scheduling mode the scheduler was built with.
+    pub fn process(&self) -> TaskProcess {
+        self.scheduler.process()
     }
 
     pub fn user_id(&self) -> &str {
@@ -4732,6 +4769,35 @@ mod tests {
         assert!(
             !logs.contains("ERROR"),
             "the expected NotFound must stay a warn, not error: {logs}"
+        );
+    }
+
+    // ── resolve_process: per-engagement mode + default-hierarchical fallback ──
+
+    async fn process_for(lookup: crate::test_utils::EngagementLookup) -> TaskProcess {
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_lookup(lookup);
+        let repo: Arc<dyn ITeamRepository> = repo;
+        TeamSession::resolve_process(&repo, "u1", "eng-1").await
+    }
+
+    #[tokio::test]
+    async fn resolve_process_reads_sequential_from_row() {
+        let p = process_for(crate::test_utils::EngagementLookup::Process("sequential".into())).await;
+        assert_eq!(p, TaskProcess::Sequential);
+    }
+
+    #[tokio::test]
+    async fn resolve_process_defaults_hierarchical_on_miss_and_stub() {
+        // Real miss (Ok(None)).
+        assert_eq!(
+            process_for(crate::test_utils::EngagementLookup::Missing).await,
+            TaskProcess::Hierarchical
+        );
+        // Unimplemented double / legacy team (trait default NotFound stub).
+        assert_eq!(
+            process_for(crate::test_utils::EngagementLookup::Unimplemented).await,
+            TaskProcess::Hierarchical
         );
     }
 }

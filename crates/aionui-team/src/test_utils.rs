@@ -13,6 +13,18 @@ pub enum EngagementResolveError {
     Other,
 }
 
+#[derive(Default, Clone, PartialEq, Eq)]
+pub enum EngagementLookup {
+    /// Mirrors the trait default stub: `find_engagement_by_id` reports the row
+    /// as absent (legacy / never-engaged teams and doubles that never wired it).
+    #[default]
+    Unimplemented,
+    /// A real miss: the row genuinely does not exist (`Ok(None)`).
+    Missing,
+    /// A row exists with the given `process` string.
+    Process(String),
+}
+
 #[derive(Default)]
 pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
@@ -21,6 +33,8 @@ pub struct MockState {
     pub fail_task_lists: bool,
     /// Error kind returned by `find_or_create_engagement`.
     pub engagement_resolve_error: EngagementResolveError,
+    /// How `find_engagement_by_id` answers the session-start process lookup.
+    pub engagement_lookup: EngagementLookup,
 }
 
 pub struct MockTeamRepo {
@@ -49,6 +63,10 @@ impl MockTeamRepo {
 
     pub fn set_engagement_resolve_error(&self, kind: EngagementResolveError) {
         self.state.lock().unwrap().engagement_resolve_error = kind;
+    }
+
+    pub fn set_engagement_lookup(&self, lookup: EngagementLookup) {
+        self.state.lock().unwrap().engagement_lookup = lookup;
     }
 }
 
@@ -106,6 +124,34 @@ impl ITeamRepository for MockTeamRepo {
             EngagementResolveError::NotFound => DbError::NotFound("engagement not found".to_owned()),
             EngagementResolveError::Other => DbError::Init("forced engagement failure".to_owned()),
         })
+    }
+
+    async fn find_engagement_by_id(
+        &self,
+        _user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamEngagementRow>, DbError> {
+        match self.state.lock().unwrap().engagement_lookup.clone() {
+            EngagementLookup::Unimplemented => {
+                Err(DbError::NotFound("find_engagement_by_id not implemented".to_owned()))
+            }
+            EngagementLookup::Missing => Ok(None),
+            EngagementLookup::Process(process) => Ok(Some(aionui_db::models::TeamEngagementRow {
+                id: engagement_id.to_owned(),
+                user_id: "u1".to_owned(),
+                team_id: "t1".to_owned(),
+                project_id: "proj".to_owned(),
+                workspace: String::new(),
+                process,
+                status: "active".to_owned(),
+                created_at: now_ms(),
+                updated_at: now_ms(),
+                folder_id: None,
+                origin: "user".to_owned(),
+                created_by_conversation_id: None,
+                reply_to: None,
+            })),
+        }
     }
 
     // ── Mailbox ─────────────────────────────────────────────────────

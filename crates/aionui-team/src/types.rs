@@ -408,6 +408,50 @@ impl TeamEngagement {
 }
 
 // ---------------------------------------------------------------------------
+// TaskProcess — per-engagement scheduling mode (Phase 3b)
+// ---------------------------------------------------------------------------
+
+/// How a team's tasks are scheduled within an engagement.
+///
+/// `Hierarchical` is the default (leader orchestrates, teammates run in
+/// parallel). `Sequential` is the DAG/gate mode threaded in from the
+/// engagement row; the actual gating behavior lives in the scheduler.
+/// Anything other than `"sequential"` parses to `Hierarchical` so a missing,
+/// legacy, or malformed value is always the safe, pre-existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskProcess {
+    #[default]
+    Hierarchical,
+    Sequential,
+}
+
+impl fmt::Display for TaskProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hierarchical => write!(f, "hierarchical"),
+            Self::Sequential => write!(f, "sequential"),
+        }
+    }
+}
+
+impl From<&str> for TaskProcess {
+    fn from(s: &str) -> Self {
+        if s == "sequential" {
+            Self::Sequential
+        } else {
+            Self::Hierarchical
+        }
+    }
+}
+
+impl From<String> for TaskProcess {
+    fn from(s: String) -> Self {
+        Self::from(s.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -501,6 +545,22 @@ mod tests {
     fn teammate_role_serde_leader_alias() {
         let leader: TeammateRole = serde_json::from_str(r#""leader""#).unwrap();
         assert_eq!(leader, TeammateRole::Lead);
+    }
+
+    // -- TaskProcess ----------------------------------------------------------
+
+    #[test]
+    fn task_process_from_str_sequential_only() {
+        assert_eq!(TaskProcess::from("sequential"), TaskProcess::Sequential);
+        assert_eq!(TaskProcess::from("hierarchical"), TaskProcess::Hierarchical);
+        assert_eq!(TaskProcess::from("unknown"), TaskProcess::Hierarchical);
+        assert_eq!(TaskProcess::from(""), TaskProcess::Hierarchical);
+    }
+
+    #[test]
+    fn task_process_display() {
+        assert_eq!(TaskProcess::Sequential.to_string(), "sequential");
+        assert_eq!(TaskProcess::Hierarchical.to_string(), "hierarchical");
     }
 
     // -- MailboxMessageType ---------------------------------------------------
