@@ -137,6 +137,12 @@ pub struct TeammateManager {
     /// sequential gate is applied by wake/scheduling (Task 3b.3). Default is
     /// `Hierarchical`, so pre-Phase-3b behavior is byte-identical.
     process: TaskProcess,
+    /// Serializes a `sequential` task start: guards the read `in_progress_task`
+    /// → decide → write `in_progress` critical section so two concurrent member
+    /// turns cannot both observe "no in-progress" and both start (spec §7.2
+    /// invariant). Held ONLY for a sequential Pending→InProgress transition —
+    /// `hierarchical` and all other updates never touch it (no added latency).
+    sequential_start_lock: Mutex<()>,
 }
 
 impl TeammateManager {
@@ -175,6 +181,7 @@ impl TeammateManager {
             wake_timeouts: Arc::new(DashMap::new()),
             pending_task_results: Mutex::new(HashMap::new()),
             process,
+            sequential_start_lock: Mutex::new(()),
         }
     }
 

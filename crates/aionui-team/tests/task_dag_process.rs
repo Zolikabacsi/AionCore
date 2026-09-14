@@ -416,3 +416,140 @@ async fn hierarchical_default_allows_concurrent_in_progress_tasks() {
         "both tasks run concurrently under the default process"
     );
 }
+
+// -- Review fix #1: completion feeds the next (independent) ready task ---------
+
+/// Exercises the EXACT production feed function `TeammateManager::
+/// sequential_feed_candidate` (the selection `exec_task_update` runs on a real
+/// completion, before reusing `maybe_notify_task_owner` to wake). The gap it
+/// covers: two INDEPENDENT ready tasks have no `blocked_by`/`blocks` edge, so
+/// the `blocks`-driven unblock notify never reaches B — only this feed does.
+#[tokio::test]
+async fn sequential_completion_feeds_the_independent_next_ready_task() {
+    let (mgr, board, _db) = sequential_setup(TaskProcess::Sequential).await;
+
+    // A and B are fully independent (no edges between them), both owned.
+    let a = board
+        .create_task(TEAM, "A", None, Some("worker-1"), &[], None)
+        .await
+        .unwrap();
+    let b = board
+        .create_task(TEAM, "B", None, Some("worker-1"), &[], None)
+        .await
+        .unwrap();
+    assert!(
+        a.blocks.is_empty() && b.blocked_by.is_empty(),
+        "A and B must be independent"
+    );
+
+    // While A is in progress: nothing to feed (slot busy), and B is gated out.
+    mgr.update_task(&a.id, Some("in_progress"), None, None, None)
+        .await
+        .unwrap();
+    assert!(
+        mgr.sequential_feed_candidate(&a.id, &[]).await.unwrap().is_none(),
+        "no feed while a task still holds the in-progress slot"
+    );
+    assert!(
+        matches!(
+            mgr.update_task(&b.id, Some("in_progress"), None, None, None).await,
+            Err(TeamError::SequentialBusy { .. })
+        ),
+        "B must not start while A is in progress"
+    );
+
+    // A completes (the transition that frees the slot). The production feed now
+    // picks B — the sole next-ready task — even though it has no edge to A.
+    mgr.update_task(&a.id, Some("completed"), None, None, None)
+        .await
+        .unwrap();
+    let feed = mgr.sequential_feed_candidate(&a.id, &[]).await.unwrap();
+    assert_eq!(
+        feed.as_ref().map(|t| t.id.as_str()),
+        Some(b.id.as_str()),
+        "B must be fed after A completes"
+    );
+
+    // Dedup: a task already woken by the unblock path (chain case) is fed once.
+    assert!(
+        mgr.sequential_feed_candidate(&a.id, std::slice::from_ref(&b.id))
+            .await
+            .unwrap()
+            .is_none(),
+        "already-notified successor must not be fed twice"
+    );
+
+    // After the feed, B can actually start.
+    let started = mgr
+        .update_task(&b.id, Some("in_progress"), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(started.status, TaskStatus::InProgress);
+}
+
+#[tokio::test]
+async fn hierarchical_completion_produces_no_sequential_feed() {
+    let (mgr, board, _db) = sequential_setup(TaskProcess::Hierarchical).await;
+    let a = board
+        .create_task(TEAM, "A", None, Some("worker-1"), &[], None)
+        .await
+        .unwrap();
+    board
+        .create_task(TEAM, "B", None, Some("worker-1"), &[], None)
+        .await
+        .unwrap();
+
+    // Hierarchical (default): the feed function is inert — nothing new happens.
+    assert!(
+        mgr.sequential_feed_candidate(&a.id, &[]).await.unwrap().is_none(),
+        "hierarchical must never produce a sequential feed"
+    );
+}
+
+// -- Review fix #2: concurrent starts cannot both go in_progress ---------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequential_concurrent_starts_allow_only_one_in_progress() {
+    let (mgr, board, _db) = sequential_setup(TaskProcess::Sequential).await;
+    let a = board
+        .create_task(TEAM, "A", None, Some("worker-1"), &[], None)
+        .await
+        .unwrap();
+    let b = board
+        .create_task(TEAM, "B", None, Some("worker-1"), &[], None)
+        .await
+        .unwrap();
+
+    // Two member turns racing to start their task simultaneously (separate MCP
+    // connections share one Arc<TeammateManager>). The start lock serializes
+    // them: exactly one wins, the other is rejected and stays Pending.
+    let (ra, rb) = tokio::join!(
+        mgr.update_task(&a.id, Some("in_progress"), None, None, None),
+        mgr.update_task(&b.id, Some("in_progress"), None, None, None),
+    );
+
+    let winners = [ra.is_ok(), rb.is_ok()];
+    assert_eq!(
+        winners.iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one concurrent start must win"
+    );
+    let loser = if ra.is_ok() { rb } else { ra };
+    assert!(
+        matches!(loser, Err(TeamError::SequentialBusy { .. })),
+        "the losing concurrent start must be rejected with SequentialBusy, got {loser:?}"
+    );
+
+    // The board invariant holds: exactly one task ends up in progress.
+    let in_progress_count = board
+        .list_tasks(TEAM)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.status == TaskStatus::InProgress)
+        .count();
+    assert_eq!(
+        in_progress_count, 1,
+        "sequential start must leave exactly one in-progress task"
+    );
+}

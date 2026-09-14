@@ -1227,13 +1227,29 @@ async fn exec_task_update(
     }
 
     // Completing a task can unblock downstream tasks; wake each downstream owner
-    // whose task is now fully unblocked and actionable.
-    if completed
-        && !task.blocks.is_empty()
-        && let Ok(all_tasks) = scheduler.list_tasks().await
-    {
-        for downstream in all_tasks.iter().filter(|t| task.blocks.contains(&t.id)) {
-            maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, downstream, "unblock").await;
+    // whose task is now fully unblocked and actionable. `notified` records those
+    // ids so the sequential feed below does not wake a chain successor twice.
+    if completed {
+        let mut notified: Vec<String> = Vec::new();
+        if !task.blocks.is_empty()
+            && let Ok(all_tasks) = scheduler.list_tasks().await
+        {
+            for downstream in all_tasks.iter().filter(|t| task.blocks.contains(&t.id)) {
+                maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, downstream, "unblock").await;
+                notified.push(downstream.id.clone());
+            }
+        }
+
+        // Sequential feed (spec §7.2): an INDEPENDENT ready task (no `blocks`
+        // edge to the one just completed) is never reached by the unblock loop
+        // above, so it would starve with no successor to start. Once the
+        // in-progress slot is free, wake the sole next-ready task's owner — the
+        // same mailbox-write + wake path as an unblock, deduped against it so a
+        // chain successor fires exactly once. `hierarchical` is guarded inside
+        // `sequential_feed_candidate` (returns `None`), so the default mode gets
+        // nothing new here.
+        if let Ok(Some(next)) = scheduler.sequential_feed_candidate(&task.id, &notified).await {
+            maybe_notify_task_owner(scheduler, service, team_id, caller_slot_id, &next, "sequential-feed").await;
         }
     }
 
