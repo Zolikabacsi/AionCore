@@ -14,14 +14,14 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{
-    AssistantConversationRequest, ChatFileRef, CreateConversationRequest, DelegateAskRequest,
-    DelegateAskResponse, DelegateDispatchRequest, DelegateDispatchResponse, DelegateDeliveryStatus,
-    DelegateEnvelopeBlock, DelegateEnvelopeKind, DelegateTarget, DelegateTargetsQuery,
-    DelegateTargetsResponse, SendMessageRequest,
-};
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
-use aionui_common::{now_ms, AgentType, ConversationSource};
+use aionui_api_types::{
+    AssistantConversationRequest, ChatFileRef, CreateConversationRequest, DelegateAskRequest, DelegateAskResponse,
+    DelegateDeliveryStatus, DelegateDispatchRequest, DelegateDispatchResponse, DelegateEnvelopeBlock,
+    DelegateEnvelopeKind, DelegateTarget, DelegateTargetKind, DelegateTargetsQuery, DelegateTargetsResponse,
+    ResolvedDelegateTarget, SendMessageRequest,
+};
+use aionui_common::{AgentType, ConversationSource, now_ms};
 use aionui_conversation::service::ConversationService;
 use aionui_db::{IConversationRepository, ISettingsRepository};
 use aionui_realtime::EventBroadcaster;
@@ -135,11 +135,7 @@ impl DelegateService {
     // Name resolution
     // -----------------------------------------------------------------------
 
-    pub async fn resolve_target(
-        &self,
-        user_id: &str,
-        query: &str,
-    ) -> Result<String, DelegateError> {
+    pub async fn resolve_target(&self, user_id: &str, query: &str) -> Result<ResolvedDelegateTarget, DelegateError> {
         let q = query.trim();
         if q.is_empty() {
             return Err(DelegateError::SchemaValidation {
@@ -153,31 +149,87 @@ impl DelegateService {
             .await
             .map_err(|e| DelegateError::TransportUnavailable { reason: e.to_string() })?;
 
-        let mut exact: Vec<(String, String)> = Vec::new();
-        let mut prefix: Vec<(String, String)> = Vec::new();
+        let mut exact: Vec<ResolvedDelegateTarget> = Vec::new();
+        let mut prefix: Vec<ResolvedDelegateTarget> = Vec::new();
         for row in rows {
             let id = row.try_get::<String, _>("id").unwrap_or_default();
             let name = row.try_get::<String, _>("name").unwrap_or_default();
             if id == q {
                 // Direct assistant_id hit wins over name match.
-                return Ok(id);
+                return Ok(ResolvedDelegateTarget {
+                    kind: DelegateTargetKind::Assistant,
+                    id,
+                    name,
+                });
             }
             if name == q {
-                exact.push((id, name));
+                exact.push(ResolvedDelegateTarget {
+                    kind: DelegateTargetKind::Assistant,
+                    id,
+                    name,
+                });
             } else if name.to_lowercase().starts_with(&q.to_lowercase()) {
-                prefix.push((id, name));
+                prefix.push(ResolvedDelegateTarget {
+                    kind: DelegateTargetKind::Assistant,
+                    id,
+                    name,
+                });
             }
         }
+
+        // Team targets: same exact/case-insensitive-prefix matching, appended to
+        // the assistant candidate lists so the (exact, prefix) match arms below
+        // behave identically for assistant-only users (teams add zero rows) and
+        // resolve a team name to `kind=Team`.
+        let team_sql = "SELECT id, name FROM teams WHERE user_id = ?1 AND archived_at IS NULL";
+        let team_rows = self
+            .conversation_repo
+            .raw_query(team_sql, vec![user_id.to_owned()])
+            .await
+            .map_err(|e| DelegateError::TransportUnavailable { reason: e.to_string() })?;
+        for row in team_rows {
+            let id = row.try_get::<String, _>("id").unwrap_or_default();
+            let name = row.try_get::<String, _>("name").unwrap_or_default();
+            if name == q {
+                exact.push(ResolvedDelegateTarget {
+                    kind: DelegateTargetKind::Team,
+                    id,
+                    name,
+                });
+            } else if name.to_lowercase().starts_with(&q.to_lowercase()) {
+                prefix.push(ResolvedDelegateTarget {
+                    kind: DelegateTargetKind::Team,
+                    id,
+                    name,
+                });
+            }
+        }
+
         match (exact.len(), prefix.len()) {
             (0, 0) => Err(DelegateError::TargetNotFound { query: q.to_owned() }),
-            (1, _) => Ok(exact.into_iter().next().unwrap().0),
-            (_, 1) => Ok(prefix.into_iter().next().unwrap().0),
+            (1, _) => Ok(exact.into_iter().next().unwrap()),
+            (_, 1) => Ok(prefix.into_iter().next().unwrap()),
             (_, n) if n > 1 => Err(DelegateError::AmbiguousTarget {
                 query: q.to_owned(),
-                candidates: prefix.into_iter().map(|(_, n)| n).collect(),
+                candidates: prefix.into_iter().map(|t| t.name).collect(),
             }),
             _ => Err(DelegateError::TargetNotFound { query: q.to_owned() }),
         }
+    }
+
+    /// Dispatch/ask route only to assistants for now: a `Team` target resolves
+    /// in the roster (Phase 4a Task 2) but the dispatch→bridge wiring is
+    /// Task 3, so keep the observable dispatch behavior identical to pre-4a
+    /// (where a team name was never resolvable) by reporting it not found.
+    /// ponytail: delete this guard in Task 3 once routing to the bridge lands.
+    async fn assistant_target(&self, user_id: &str, query: &str) -> Result<String, DelegateError> {
+        let resolved = self.resolve_target(user_id, query).await?;
+        if resolved.kind != DelegateTargetKind::Assistant {
+            return Err(DelegateError::TargetNotFound {
+                query: query.trim().to_owned(),
+            });
+        }
+        Ok(resolved.id)
     }
 
     pub async fn list_targets(
@@ -185,6 +237,10 @@ impl DelegateService {
         user_id: &str,
         query: DelegateTargetsQuery,
     ) -> Result<DelegateTargetsResponse, DelegateError> {
+        // LIMIT is applied per source (assistant definitions, then teams); the
+        // merged list can therefore exceed `limit`. Assistants are emitted first
+        // so an assistant-only user's roster is byte-identical to the pre-4a
+        // single-source result (the teams query adds zero rows).
         let limit = query.limit.unwrap_or(50).min(500);
         let sql = "SELECT id, name, description, agent_id FROM assistant_definitions WHERE user_id = ?1 AND allow_delegation = 1 ORDER BY name LIMIT ?2";
         let rows = self
@@ -192,7 +248,7 @@ impl DelegateService {
             .raw_query(sql, vec![user_id.to_owned(), limit.to_string()])
             .await
             .map_err(|e| DelegateError::TransportUnavailable { reason: e.to_string() })?;
-        let items: Vec<DelegateTarget> = rows
+        let mut items: Vec<DelegateTarget> = rows
             .into_iter()
             .filter_map(|r| {
                 let assistant_id = r.try_get::<String, _>("id").ok()?;
@@ -204,6 +260,8 @@ impl DelegateService {
                     name,
                     backend,
                     description,
+                    kind: DelegateTargetKind::Assistant,
+                    team_id: None,
                 })
             })
             .filter(|t| {
@@ -214,6 +272,40 @@ impl DelegateService {
                     .unwrap_or(true)
             })
             .collect();
+
+        let team_sql = "SELECT id, name FROM teams WHERE user_id = ?1 AND archived_at IS NULL ORDER BY name LIMIT ?2";
+        let team_rows = self
+            .conversation_repo
+            .raw_query(team_sql, vec![user_id.to_owned(), limit.to_string()])
+            .await
+            .map_err(|e| DelegateError::TransportUnavailable { reason: e.to_string() })?;
+        let teams: Vec<DelegateTarget> = team_rows
+            .into_iter()
+            .filter_map(|r| {
+                let id = r.try_get::<String, _>("id").ok()?;
+                let name = r.try_get::<String, _>("name").ok()?;
+                Some(DelegateTarget {
+                    // The team id doubles as `assistant_id` so existing consumers
+                    // that read a single id field stay usable; `kind=Team` +
+                    // `team_id` disambiguate.
+                    assistant_id: id.clone(),
+                    name,
+                    backend: String::new(),
+                    description: None,
+                    kind: DelegateTargetKind::Team,
+                    team_id: Some(id),
+                })
+            })
+            .filter(|t| {
+                query
+                    .q
+                    .as_ref()
+                    .map(|q| t.name.to_lowercase().contains(&q.to_lowercase()))
+                    .unwrap_or(true)
+            })
+            .collect();
+        items.extend(teams);
+
         Ok(DelegateTargetsResponse { items })
     }
 
@@ -251,7 +343,7 @@ impl DelegateService {
             });
         }
 
-        let target_assistant_id = self.resolve_target(user_id, &req.to).await?;
+        let target_assistant_id = self.assistant_target(user_id, &req.to).await?;
         if !self
             .is_delegation_enabled_for_assistant(user_id, &target_assistant_id)
             .await?
@@ -261,9 +353,9 @@ impl DelegateService {
             });
         }
 
-        if let RateVerdict::Tripped { .. } =
-            self.rate_limiter
-                .check_and_record(from_conversation_id, &target_assistant_id)
+        if let RateVerdict::Tripped { .. } = self
+            .rate_limiter
+            .check_and_record(from_conversation_id, &target_assistant_id)
         {
             return Err(DelegateError::RateLimited {
                 from: from_conversation_id.to_owned(),
@@ -271,10 +363,7 @@ impl DelegateService {
             });
         }
 
-        let reply_to = req
-            .reply_to
-            .clone()
-            .unwrap_or_else(|| from_conversation_id.to_owned());
+        let reply_to = req.reply_to.clone().unwrap_or_else(|| from_conversation_id.to_owned());
         if reply_to != from_conversation_id {
             let reply_row = self
                 .conversation_repo
@@ -328,12 +417,7 @@ impl DelegateService {
         let composed = compose_delivery_body(&block, &req.message);
 
         let deliver_result = self
-            .deliver_now(
-                user_id,
-                &target_conversation_id,
-                composed.clone(),
-                req.files.clone(),
-            )
+            .deliver_now(user_id, &target_conversation_id, composed.clone(), req.files.clone())
             .await;
 
         match deliver_result {
@@ -368,17 +452,16 @@ impl DelegateService {
                 })
             }
             Err(transient_reason) => {
-                self.queue
-                    .push(crate::queue::PendingDelegate {
-                        envelope_id: envelope_id.clone(),
-                        to_conversation_id: target_conversation_id.clone(),
-                        to_assistant_id: target_assistant_id.clone(),
-                        user_id: user_id.to_owned(),
-                        from_conversation_id: from_conversation_id.to_owned(),
-                        message: composed,
-                        depth,
-                        expires_at_ms: now_ms() + QUEUE_TTL_MS,
-                    })?;
+                self.queue.push(crate::queue::PendingDelegate {
+                    envelope_id: envelope_id.clone(),
+                    to_conversation_id: target_conversation_id.clone(),
+                    to_assistant_id: target_assistant_id.clone(),
+                    user_id: user_id.to_owned(),
+                    from_conversation_id: from_conversation_id.to_owned(),
+                    message: composed,
+                    depth,
+                    expires_at_ms: now_ms() + QUEUE_TTL_MS,
+                })?;
                 self.persist_envelope(
                     &envelope_id,
                     user_id,
@@ -391,8 +474,7 @@ impl DelegateService {
                 .await?;
                 warn!(
                     envelope_id,
-                    transient_reason,
-                    "delegate dispatch queued; target not ready"
+                    transient_reason, "delegate dispatch queued; target not ready"
                 );
                 Ok(DelegateDispatchResponse {
                     status: DelegateDeliveryStatus::Queued,
@@ -422,7 +504,7 @@ impl DelegateService {
         }
         let timeout_seconds = req.timeout_seconds.unwrap_or(DEFAULT_SYNC_TIMEOUT_SECONDS);
 
-        let target_assistant_id = self.resolve_target(user_id, &req.to).await?;
+        let target_assistant_id = self.assistant_target(user_id, &req.to).await?;
         if !self
             .is_delegation_enabled_for_assistant(user_id, &target_assistant_id)
             .await?
@@ -432,10 +514,7 @@ impl DelegateService {
             });
         }
 
-        let depth = self
-            .current_chain_depth(from_conversation_id)
-            .await
-            .unwrap_or(0);
+        let depth = self.current_chain_depth(from_conversation_id).await.unwrap_or(0);
         if depth + 1 > MAX_DEPTH {
             return Err(DelegateError::DepthExceeded {
                 depth: depth + 1,
@@ -615,11 +694,7 @@ impl DelegateService {
             )
             .await
             .map_err(|e| DelegateError::TransportUnavailable { reason: e.to_string() })?;
-        if let Some(id) = rows
-            .into_iter()
-            .next()
-            .and_then(|r| r.try_get::<String, _>("id").ok())
-        {
+        if let Some(id) = rows.into_iter().next().and_then(|r| r.try_get::<String, _>("id").ok()) {
             return Ok((id, false));
         }
 
@@ -651,7 +726,10 @@ impl DelegateService {
             .ok()
             .and_then(|rows| {
                 rows.into_iter().next().and_then(|r| {
-                    r.try_get::<Option<String>, _>("ws").ok().flatten().filter(|s| !s.is_empty())
+                    r.try_get::<Option<String>, _>("ws")
+                        .ok()
+                        .flatten()
+                        .filter(|s| !s.is_empty())
                 })
             });
         let mut req_extra = serde_json::json!({
@@ -783,21 +861,13 @@ impl DelegateService {
     ) -> Result<(), String> {
         let request = SendMessageRequest {
             content,
-            files: files
-                .into_iter()
-                .map(|path| ChatFileRef::Local { path })
-                .collect(),
+            files: files.into_iter().map(|path| ChatFileRef::Local { path }).collect(),
             sessions: Vec::new(),
             inject_skills: Vec::new(),
             hidden: false,
         };
         self.conversation_service
-            .send_message(
-                user_id,
-                target_conversation_id,
-                request,
-                &self.task_manager,
-            )
+            .send_message(user_id, target_conversation_id, request, &self.task_manager)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())

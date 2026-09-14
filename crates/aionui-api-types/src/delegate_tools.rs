@@ -201,12 +201,41 @@ pub struct DelegateTargetsQuery {
     pub limit: Option<u32>,
 }
 
+/// Discriminates a delegation roster entry. `Assistant` is the original
+/// (and default) kind; `Team` targets were added in Phase 4a as a non-breaking
+/// superset so a caller can resolve/list a team by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegateTargetKind {
+    #[default]
+    Assistant,
+    Team,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateTarget {
     pub assistant_id: String,
     pub name: String,
     pub backend: String,
     pub description: Option<String>,
+    /// Target kind. Defaults to `Assistant` so pre-4a serialized payloads
+    /// (which lack the field) deserialize unchanged.
+    #[serde(default)]
+    pub kind: DelegateTargetKind,
+    /// Populated only for `Team` entries; `None` for assistants. Omitted from
+    /// the wire when absent so assistant responses stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+}
+
+/// Outcome of `resolve_target`: the matched roster entry with its kind, so a
+/// caller can tell an assistant definition id from a team id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedDelegateTarget {
+    pub kind: DelegateTargetKind,
+    /// Assistant definition id (`asstdef_*`) for `Assistant`; team id for `Team`.
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
