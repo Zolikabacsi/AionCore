@@ -783,6 +783,35 @@ pub struct TeamTaskResponse {
     pub input_context: Option<String>,
 }
 
+/// Read-only projection of a `team_engagements` row for the engagement API.
+///
+/// Field/timing conventions mirror [`TeamTaskResponse`]: snake_case field names
+/// serialized verbatim, `TimestampMs` epoch-millis timestamps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamEngagement {
+    pub id: String,
+    pub team_id: String,
+    pub project_id: String,
+    pub workspace: String,
+    /// Process mode: `'sequential'` or `'hierarchical'`.
+    pub process: String,
+    /// Lifecycle status: `'active'` or `'archived'`.
+    pub status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Read-only projection of a `team_engagement_members` row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamEngagementMember {
+    pub slot_id: String,
+    pub template_slot: String,
+    pub role: String,
+    pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
 /// Discriminates a unified activity item.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -910,6 +939,50 @@ mod tests {
         let back: TeamActivityPageResponse = serde_json::from_str(&json).unwrap();
         assert!(back.has_more);
         assert_eq!(back.next_cursor.unwrap().ts, 42);
+    }
+
+    // -- Engagement response DTOs --------------------------------------------
+
+    #[test]
+    fn serialize_team_engagement_snake_case() {
+        let eng = TeamEngagement {
+            id: "eng-1".into(),
+            team_id: "team-1".into(),
+            project_id: "proj-1".into(),
+            workspace: "/ws".into(),
+            process: "sequential".into(),
+            status: "active".into(),
+            created_at: 1700000000000,
+            updated_at: 1700000000001,
+        };
+        let json = serde_json::to_value(&eng).unwrap();
+        assert_eq!(json["id"], "eng-1");
+        assert_eq!(json["team_id"], "team-1");
+        assert_eq!(json["project_id"], "proj-1");
+        assert_eq!(json["workspace"], "/ws");
+        assert_eq!(json["process"], "sequential");
+        assert_eq!(json["status"], "active");
+        assert_eq!(json["created_at"], 1700000000000_i64);
+        assert_eq!(json["updated_at"], 1700000000001_i64);
+    }
+
+    #[test]
+    fn serialize_team_engagement_member_omits_none_status() {
+        let with = TeamEngagementMember {
+            slot_id: "slot-1".into(),
+            template_slot: "tpl-1".into(),
+            role: "teammate".into(),
+            conversation_id: "conv-1".into(),
+            status: Some("idle".into()),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["slot_id"], "slot-1");
+        assert_eq!(json["template_slot"], "tpl-1");
+        assert_eq!(json["conversation_id"], "conv-1");
+        assert_eq!(json["status"], "idle");
+
+        let without = TeamEngagementMember { status: None, ..with };
+        assert!(serde_json::to_value(&without).unwrap().get("status").is_none());
     }
 
     // -- A. Team management requests ------------------------------------------

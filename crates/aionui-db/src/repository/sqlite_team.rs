@@ -891,6 +891,47 @@ impl ITeamRepository for SqliteTeamRepository {
         self.create_engagement(user_id, team_id, project_id, workspace).await
     }
 
+    async fn update_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        process: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<(), DbError> {
+        // Dynamic SET mirrors `update_team`: only present columns are written,
+        // `updated_at` always advances. `updated_at` is unconditional, so the
+        // SET clause is never empty (no early `Ok(())` short-circuit).
+        let mut set_clauses = Vec::new();
+        if process.is_some() {
+            set_clauses.push("process = ?");
+        }
+        if status.is_some() {
+            set_clauses.push("status = ?");
+        }
+        set_clauses.push("updated_at = ?");
+        let sql = format!(
+            "UPDATE team_engagements SET {} WHERE id = ? AND user_id = ?",
+            set_clauses.join(", ")
+        );
+
+        let mut query = sqlx::query(&sql);
+        if let Some(process) = process {
+            query = query.bind(process);
+        }
+        if let Some(status) = status {
+            query = query.bind(status);
+        }
+        query = query.bind(now_ms());
+        query = query.bind(engagement_id);
+        query = query.bind(user_id);
+
+        let result = query.execute(&self.pool).await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("engagement {engagement_id}")));
+        }
+        Ok(())
+    }
+
     async fn list_tasks_by_engagement(&self, user_id: &str, engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
         // SELECT * is fine: sqlx FromRow ignores the engagement_id column the
         // row struct intentionally does not declare in Phase 1. The EXISTS

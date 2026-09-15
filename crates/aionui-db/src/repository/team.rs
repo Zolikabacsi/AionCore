@@ -286,6 +286,23 @@ pub trait ITeamRepository: Send + Sync {
         ))
     }
 
+    /// Updates an engagement's mutable lifecycle columns (`process`, `status`),
+    /// identified by `engagement_id` and scoped to `user_id` for data isolation.
+    /// Pass `None` to leave a column unchanged. `updated_at` always advances.
+    /// Returns `NotFound` when no row matches `(engagement_id, user_id)` — i.e.
+    /// a wrong/other-user id is a no-op surfaced as an error, never a silent
+    /// success. Invalid `process`/`status` values are rejected by the column
+    /// CHECK constraints and surface as a `DbError`.
+    async fn update_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _process: Option<&str>,
+        _status: Option<&str>,
+    ) -> Result<(), DbError> {
+        Err(DbError::NotFound("update_engagement not implemented".to_string()))
+    }
+
     /// Returns all tasks bound to `engagement_id` owned by `user_id`, oldest
     /// first. Scoped via the engagement's owner (`team_engagements.user_id`).
     async fn list_tasks_by_engagement(

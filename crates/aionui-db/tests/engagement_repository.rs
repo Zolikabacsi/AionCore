@@ -177,3 +177,47 @@ async fn find_engagement_by_id_reads_process_and_is_user_scoped() {
     // Unknown id -> None (not an error).
     assert!(repo.find_engagement_by_id("u1", "nope").await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn update_engagement_sets_process_and_status_user_scoped() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteTeamRepository::new(db.pool().clone());
+    seed_team(db.pool(), "team-p", "u1").await;
+    seed_team(db.pool(), "team-q", "u2").await;
+
+    let mine = repo
+        .find_or_create_engagement("u1", "team-p", "proj", "/ws")
+        .await
+        .unwrap();
+    assert_eq!(mine.process, "hierarchical", "default process");
+
+    // Flip process only; status untouched.
+    repo.update_engagement("u1", &mine.id, Some("sequential"), None)
+        .await
+        .unwrap();
+    let after = repo.find_engagement_by_id("u1", &mine.id).await.unwrap().expect("row");
+    assert_eq!(after.process, "sequential");
+    assert_eq!(after.status, "active");
+    assert!(after.updated_at >= mine.updated_at);
+
+    // Archive; process preserved.
+    repo.update_engagement("u1", &mine.id, None, Some("archived"))
+        .await
+        .unwrap();
+    let after = repo.find_engagement_by_id("u1", &mine.id).await.unwrap().expect("row");
+    assert_eq!(after.process, "sequential");
+    assert_eq!(after.status, "archived");
+
+    // Cross-user update -> NotFound and the row is unchanged.
+    let err = repo
+        .update_engagement("u2", &mine.id, Some("hierarchical"), None)
+        .await
+        .expect_err("other user must not update");
+    assert!(matches!(err, aionui_db::DbError::NotFound(_)));
+    let untouched = repo.find_engagement_by_id("u1", &mine.id).await.unwrap().expect("row");
+    assert_eq!(untouched.process, "sequential");
+
+    // Invalid process value rejected by the CHECK constraint (a DbError, not Ok).
+    let bad = repo.update_engagement("u1", &mine.id, Some("bogus"), None).await;
+    assert!(bad.is_err(), "CHECK must reject an invalid process value");
+}
