@@ -896,6 +896,77 @@ impl TeamSessionService {
         Ok(TeamEngagement::from_row(&row))
     }
 
+    /// Lists the caller's engagements for a team they own, oldest first.
+    /// Ownership is enforced first via `load_owned_team`, so a missing team and
+    /// another user's team both surface as `TeamNotFound` (existence never
+    /// leaks). The repo read is itself user-scoped.
+    pub async fn list_engagements_for_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<aionui_api_types::TeamEngagement>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let rows = self.repo.list_engagements(user_id, team_id).await?;
+        Ok(rows
+            .iter()
+            .map(TeamEngagement::from_row)
+            .map(aionui_api_types::TeamEngagement::from)
+            .collect())
+    }
+
+    /// Updates an engagement's mutable lifecycle (`process`, `status`) for the
+    /// manage (PATCH) route. Returns the updated public engagement.
+    ///
+    /// Ownership is enforced in the order the security surface requires:
+    /// 1. invalid `process`/`status` are rejected as `InvalidRequest` before any
+    ///    DB write (the column `CHECK` would otherwise surface as a 500);
+    /// 2. `load_owned_team_row` confirms the caller owns the `:id` team;
+    /// 3. `find_engagement_by_id` (user-scoped) confirms the engagement belongs
+    ///    to the caller AND its `team_id` equals `:id`. A wrong id, another
+    ///    user's engagement, or another team's engagement all surface as
+    ///    `TeamNotFound` — no cross-team/cross-user write, no existence leak.
+    pub async fn update_team_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        engagement_id: &str,
+        process: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<aionui_api_types::TeamEngagement, TeamError> {
+        if let Some(value) = process
+            && !matches!(value, "sequential" | "hierarchical")
+        {
+            return Err(TeamError::InvalidRequest(format!(
+                "invalid process: {value} (expected sequential or hierarchical)"
+            )));
+        }
+        if let Some(value) = status
+            && !matches!(value, "active" | "archived")
+        {
+            return Err(TeamError::InvalidRequest(format!(
+                "invalid status: {value} (expected active or archived)"
+            )));
+        }
+        self.load_owned_team_row(user_id, team_id).await?;
+        let owned = self
+            .repo
+            .find_engagement_by_id(user_id, engagement_id)
+            .await?
+            .filter(|row| row.team_id == team_id)
+            .ok_or_else(|| TeamError::TeamNotFound(format!("engagement {engagement_id}")))?;
+        self.repo
+            .update_engagement(user_id, engagement_id, process, status)
+            .await?;
+        let updated = self
+            .repo
+            .find_engagement_by_id(user_id, engagement_id)
+            .await?
+            .unwrap_or(owned);
+        Ok(aionui_api_types::TeamEngagement::from(TeamEngagement::from_row(
+            &updated,
+        )))
+    }
+
     /// "Convene engagement" seam for the delegation bridge (Phase 4a): bind the
     /// team to the project's engagement (find-or-create, members materialized),
     /// create the root task on that engagement's board owned by the lead, and

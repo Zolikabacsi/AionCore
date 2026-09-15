@@ -127,6 +127,26 @@ pub struct UpdateTeamProjectRequest {
     pub project_id: String,
 }
 
+/// Request body for `POST /api/teams/:id/engagements`.
+///
+/// Find-or-create the engagement binding the team to `project_id`.
+#[derive(Debug, Deserialize)]
+pub struct CreateEngagementRequest {
+    pub project_id: String,
+}
+
+/// Request body for `PATCH /api/teams/:id/engagements/:engagement_id`.
+///
+/// Both fields are optional; `None`/absent leaves the column unchanged. Values
+/// are validated server-side against the `process`/`status` domain.
+#[derive(Debug, Deserialize)]
+pub struct UpdateEngagementRequest {
+    #[serde(default)]
+    pub process: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // B. Agent management — Request DTOs
 // ---------------------------------------------------------------------------
@@ -1148,6 +1168,36 @@ mod tests {
         let raw = json!({});
         let result = serde_json::from_value::<RenameTeamRequest>(raw);
         assert!(result.is_err());
+    }
+
+    // -- Engagement management requests ---------------------------------------
+
+    #[test]
+    fn deserialize_create_engagement_request() {
+        let req: CreateEngagementRequest = serde_json::from_value(json!({ "project_id": "proj-1" })).unwrap();
+        assert_eq!(req.project_id, "proj-1");
+    }
+
+    #[test]
+    fn deserialize_create_engagement_request_missing_project() {
+        assert!(serde_json::from_value::<CreateEngagementRequest>(json!({})).is_err());
+    }
+
+    #[test]
+    fn deserialize_update_engagement_request_optional_fields() {
+        let both: UpdateEngagementRequest =
+            serde_json::from_value(json!({ "process": "sequential", "status": "archived" })).unwrap();
+        assert_eq!(both.process.as_deref(), Some("sequential"));
+        assert_eq!(both.status.as_deref(), Some("archived"));
+
+        let empty: UpdateEngagementRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.process.is_none());
+        assert!(empty.status.is_none());
+
+        let process_only: UpdateEngagementRequest =
+            serde_json::from_value(json!({ "process": "hierarchical" })).unwrap();
+        assert_eq!(process_only.process.as_deref(), Some("hierarchical"));
+        assert!(process_only.status.is_none());
     }
 
     // -- B. Agent management requests -----------------------------------------

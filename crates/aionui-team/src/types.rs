@@ -418,6 +418,23 @@ impl TeamEngagement {
     }
 }
 
+/// Maps the domain engagement to its public response DTO (drops `user_id`, the
+/// internal ownership column).
+impl From<TeamEngagement> for aionui_api_types::TeamEngagement {
+    fn from(e: TeamEngagement) -> Self {
+        Self {
+            id: e.id,
+            team_id: e.team_id,
+            project_id: e.project_id,
+            workspace: e.workspace,
+            process: e.process,
+            status: e.status,
+            created_at: e.created_at,
+            updated_at: e.updated_at,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TaskProcess — per-engagement scheduling mode (Phase 3b)
 // ---------------------------------------------------------------------------
