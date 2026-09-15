@@ -3,9 +3,12 @@
 //! Keeps the projection out of `aionui-api-types` (which must not depend on
 //! domain types) and out of the repository layer.
 
-use aionui_api_types::{TeamActivityItemResponse, TeamActivityKind, TeamMailboxMessageResponse, TeamTaskResponse};
+use aionui_api_types::{
+    TeamActivityItemResponse, TeamActivityKind, TeamEngagement as TeamEngagementResponse,
+    TeamEngagementMember as TeamEngagementMemberResponse, TeamMailboxMessageResponse, TeamTaskResponse,
+};
 use aionui_db::PageDirection;
-use aionui_db::models::{MailboxMessageRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamEngagementMemberRow, TeamEngagementRow, TeamTaskRow};
 use tracing::warn;
 
 use crate::types::TeamTask;
@@ -59,6 +62,35 @@ pub fn task_to_response(task: &TeamTask) -> TeamTaskResponse {
         expected_output: task.expected_output.clone(),
         result: task.result.clone(),
         input_context: task.input_context.clone(),
+    }
+}
+
+/// Maps a `team_engagements` row to its public response DTO.
+///
+/// The ownership `user_id` and lifecycle-only columns (`origin`,
+/// `created_by_conversation_id`, `reply_to`, `folder_id`) are intentionally
+/// dropped — the engagement API exposes only the read fields in §11.
+pub fn engagement_row_to_response(row: &TeamEngagementRow) -> TeamEngagementResponse {
+    TeamEngagementResponse {
+        id: row.id.clone(),
+        team_id: row.team_id.clone(),
+        project_id: row.project_id.clone(),
+        workspace: row.workspace.clone(),
+        process: row.process.clone(),
+        status: row.status.clone(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+/// Maps a `team_engagement_members` row to its public response DTO.
+pub fn engagement_member_row_to_response(row: &TeamEngagementMemberRow) -> TeamEngagementMemberResponse {
+    TeamEngagementMemberResponse {
+        slot_id: row.slot_id.clone(),
+        template_slot: row.template_slot.clone(),
+        role: row.role.clone(),
+        conversation_id: row.conversation_id.clone(),
+        status: row.status.clone(),
     }
 }
 

@@ -31,8 +31,8 @@ use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
 use crate::activity_mapping::{
-    mailbox_row_to_response, message_row_to_activity_item, sort_activity_items, task_row_to_activity_item,
-    task_to_response,
+    engagement_member_row_to_response, mailbox_row_to_response, message_row_to_activity_item, sort_activity_items,
+    task_row_to_activity_item, task_to_response,
 };
 use crate::error::TeamError;
 use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
@@ -606,6 +606,28 @@ impl TeamSessionService {
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))
     }
 
+    /// Shared ownership + team-binding guard for every engagement-scoped route
+    /// (PATCH and the members/tasks/mailbox reads). Verifies the caller owns the
+    /// `:id` team, then that `engagement_id` resolves (user-scoped) to an
+    /// engagement whose `team_id` equals `:id`. Returns the bound engagement row.
+    /// A wrong id, another user's engagement, or another team's engagement all
+    /// surface as `TeamNotFound` — no cross-team/cross-user read or write, and
+    /// engagement existence is never leaked. Callers MUST route through this
+    /// before touching an engagement's rows.
+    async fn load_owned_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        engagement_id: &str,
+    ) -> Result<aionui_db::models::TeamEngagementRow, TeamError> {
+        self.load_owned_team_row(user_id, team_id).await?;
+        self.repo
+            .find_engagement_by_id(user_id, engagement_id)
+            .await?
+            .filter(|row| row.team_id == team_id)
+            .ok_or_else(|| TeamError::TeamNotFound(format!("engagement {engagement_id}")))
+    }
+
     pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
         let row = self
             .repo
@@ -894,6 +916,116 @@ impl TeamSessionService {
             .ensure_engagement_members(user_id, &row, &team)
             .await?;
         Ok(TeamEngagement::from_row(&row))
+    }
+
+    /// Lists the caller's engagements for a team they own, oldest first.
+    /// Ownership is enforced first via `load_owned_team`, so a missing team and
+    /// another user's team both surface as `TeamNotFound` (existence never
+    /// leaks). The repo read is itself user-scoped.
+    pub async fn list_engagements_for_team(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Vec<aionui_api_types::TeamEngagement>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let rows = self.repo.list_engagements(user_id, team_id).await?;
+        Ok(rows
+            .iter()
+            .map(TeamEngagement::from_row)
+            .map(aionui_api_types::TeamEngagement::from)
+            .collect())
+    }
+
+    /// Engagement-scoped members for the `.../engagements/:engagement_id/members`
+    /// route. Ownership + team binding (T2's `load_owned_engagement`) run FIRST,
+    /// so a cross-team/cross-user/unknown engagement is `TeamNotFound` before any
+    /// row is read. Reuses the existing `list_engagement_members` repo read, which
+    /// is itself scoped to the engagement's owning user (data isolation, §12).
+    pub async fn list_engagement_members(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<aionui_api_types::TeamEngagementMember>, TeamError> {
+        self.load_owned_engagement(user_id, team_id, engagement_id).await?;
+        let rows = self.repo.list_engagement_members(user_id, engagement_id).await?;
+        Ok(rows.iter().map(engagement_member_row_to_response).collect())
+    }
+
+    /// Engagement-scoped tasks for the `.../engagements/:engagement_id/tasks`
+    /// route (includes `expected_output`/`result`). Same ownership + binding guard
+    /// as `list_engagement_members`; reuses `list_tasks_by_engagement`.
+    pub async fn list_engagement_tasks(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<TeamTaskResponse>, TeamError> {
+        self.load_owned_engagement(user_id, team_id, engagement_id).await?;
+        let rows = self.repo.list_tasks_by_engagement(user_id, engagement_id).await?;
+        let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
+        Ok(tasks.iter().map(task_to_response).collect())
+    }
+
+    /// Engagement-scoped mailbox for the `.../engagements/:engagement_id/mailbox`
+    /// route (reuses the team mailbox response shape). Same ownership + binding
+    /// guard; reuses `list_messages_by_engagement`.
+    pub async fn list_engagement_mailbox(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<TeamMailboxMessageResponse>, TeamError> {
+        self.load_owned_engagement(user_id, team_id, engagement_id).await?;
+        let rows = self.repo.list_messages_by_engagement(user_id, engagement_id).await?;
+        Ok(rows.iter().map(mailbox_row_to_response).collect())
+    }
+
+    /// Updates an engagement's mutable lifecycle (`process`, `status`) for the
+    /// manage (PATCH) route. Returns the updated public engagement.
+    ///
+    /// Ownership is enforced in the order the security surface requires:
+    /// 1. invalid `process`/`status` are rejected as `InvalidRequest` before any
+    ///    DB write (the column `CHECK` would otherwise surface as a 500);
+    /// 2. `load_owned_team_row` confirms the caller owns the `:id` team;
+    /// 3. `find_engagement_by_id` (user-scoped) confirms the engagement belongs
+    ///    to the caller AND its `team_id` equals `:id`. A wrong id, another
+    ///    user's engagement, or another team's engagement all surface as
+    ///    `TeamNotFound` — no cross-team/cross-user write, no existence leak.
+    pub async fn update_team_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        engagement_id: &str,
+        process: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<aionui_api_types::TeamEngagement, TeamError> {
+        if let Some(value) = process
+            && !matches!(value, "sequential" | "hierarchical")
+        {
+            return Err(TeamError::InvalidRequest(format!(
+                "invalid process: {value} (expected sequential or hierarchical)"
+            )));
+        }
+        if let Some(value) = status
+            && !matches!(value, "active" | "archived")
+        {
+            return Err(TeamError::InvalidRequest(format!(
+                "invalid status: {value} (expected active or archived)"
+            )));
+        }
+        let owned = self.load_owned_engagement(user_id, team_id, engagement_id).await?;
+        self.repo
+            .update_engagement(user_id, engagement_id, process, status)
+            .await?;
+        let updated = self
+            .repo
+            .find_engagement_by_id(user_id, engagement_id)
+            .await?
+            .unwrap_or(owned);
+        Ok(aionui_api_types::TeamEngagement::from(TeamEngagement::from_row(
+            &updated,
+        )))
     }
 
     /// "Convene engagement" seam for the delegation bridge (Phase 4a): bind the

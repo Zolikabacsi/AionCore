@@ -127,6 +127,26 @@ pub struct UpdateTeamProjectRequest {
     pub project_id: String,
 }
 
+/// Request body for `POST /api/teams/:id/engagements`.
+///
+/// Find-or-create the engagement binding the team to `project_id`.
+#[derive(Debug, Deserialize)]
+pub struct CreateEngagementRequest {
+    pub project_id: String,
+}
+
+/// Request body for `PATCH /api/teams/:id/engagements/:engagement_id`.
+///
+/// Both fields are optional; `None`/absent leaves the column unchanged. Values
+/// are validated server-side against the `process`/`status` domain.
+#[derive(Debug, Deserialize)]
+pub struct UpdateEngagementRequest {
+    #[serde(default)]
+    pub process: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // B. Agent management — Request DTOs
 // ---------------------------------------------------------------------------
@@ -783,6 +803,35 @@ pub struct TeamTaskResponse {
     pub input_context: Option<String>,
 }
 
+/// Read-only projection of a `team_engagements` row for the engagement API.
+///
+/// Field/timing conventions mirror [`TeamTaskResponse`]: snake_case field names
+/// serialized verbatim, `TimestampMs` epoch-millis timestamps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamEngagement {
+    pub id: String,
+    pub team_id: String,
+    pub project_id: String,
+    pub workspace: String,
+    /// Process mode: `'sequential'` or `'hierarchical'`.
+    pub process: String,
+    /// Lifecycle status: `'active'` or `'archived'`.
+    pub status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Read-only projection of a `team_engagement_members` row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamEngagementMember {
+    pub slot_id: String,
+    pub template_slot: String,
+    pub role: String,
+    pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
 /// Discriminates a unified activity item.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -910,6 +959,50 @@ mod tests {
         let back: TeamActivityPageResponse = serde_json::from_str(&json).unwrap();
         assert!(back.has_more);
         assert_eq!(back.next_cursor.unwrap().ts, 42);
+    }
+
+    // -- Engagement response DTOs --------------------------------------------
+
+    #[test]
+    fn serialize_team_engagement_snake_case() {
+        let eng = TeamEngagement {
+            id: "eng-1".into(),
+            team_id: "team-1".into(),
+            project_id: "proj-1".into(),
+            workspace: "/ws".into(),
+            process: "sequential".into(),
+            status: "active".into(),
+            created_at: 1700000000000,
+            updated_at: 1700000000001,
+        };
+        let json = serde_json::to_value(&eng).unwrap();
+        assert_eq!(json["id"], "eng-1");
+        assert_eq!(json["team_id"], "team-1");
+        assert_eq!(json["project_id"], "proj-1");
+        assert_eq!(json["workspace"], "/ws");
+        assert_eq!(json["process"], "sequential");
+        assert_eq!(json["status"], "active");
+        assert_eq!(json["created_at"], 1700000000000_i64);
+        assert_eq!(json["updated_at"], 1700000000001_i64);
+    }
+
+    #[test]
+    fn serialize_team_engagement_member_omits_none_status() {
+        let with = TeamEngagementMember {
+            slot_id: "slot-1".into(),
+            template_slot: "tpl-1".into(),
+            role: "teammate".into(),
+            conversation_id: "conv-1".into(),
+            status: Some("idle".into()),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["slot_id"], "slot-1");
+        assert_eq!(json["template_slot"], "tpl-1");
+        assert_eq!(json["conversation_id"], "conv-1");
+        assert_eq!(json["status"], "idle");
+
+        let without = TeamEngagementMember { status: None, ..with };
+        assert!(serde_json::to_value(&without).unwrap().get("status").is_none());
     }
 
     // -- A. Team management requests ------------------------------------------
@@ -1075,6 +1168,36 @@ mod tests {
         let raw = json!({});
         let result = serde_json::from_value::<RenameTeamRequest>(raw);
         assert!(result.is_err());
+    }
+
+    // -- Engagement management requests ---------------------------------------
+
+    #[test]
+    fn deserialize_create_engagement_request() {
+        let req: CreateEngagementRequest = serde_json::from_value(json!({ "project_id": "proj-1" })).unwrap();
+        assert_eq!(req.project_id, "proj-1");
+    }
+
+    #[test]
+    fn deserialize_create_engagement_request_missing_project() {
+        assert!(serde_json::from_value::<CreateEngagementRequest>(json!({})).is_err());
+    }
+
+    #[test]
+    fn deserialize_update_engagement_request_optional_fields() {
+        let both: UpdateEngagementRequest =
+            serde_json::from_value(json!({ "process": "sequential", "status": "archived" })).unwrap();
+        assert_eq!(both.process.as_deref(), Some("sequential"));
+        assert_eq!(both.status.as_deref(), Some("archived"));
+
+        let empty: UpdateEngagementRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.process.is_none());
+        assert!(empty.status.is_none());
+
+        let process_only: UpdateEngagementRequest =
+            serde_json::from_value(json!({ "process": "hierarchical" })).unwrap();
+        assert_eq!(process_only.process.as_deref(), Some("hierarchical"));
+        assert!(process_only.status.is_none());
     }
 
     // -- B. Agent management requests -----------------------------------------

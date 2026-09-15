@@ -202,20 +202,20 @@ pub use system::{
     FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
-    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,
-    PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    TeamActivityCursor, TeamActivityItemResponse, TeamActivityKind, TeamActivityPageResponse, TeamAgentInput,
-    TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
+    AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateEngagementRequest, CreateTeamRequest,
+    InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
+    SendTeamMessageRequest, TeamActivityCursor, TeamActivityItemResponse, TeamActivityKind, TeamActivityPageResponse,
+    TeamAgentInput, TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
     TeamContextResetAvailability, TeamContextResetCapability, TeamContextResetNotice, TeamContextResetResponse,
-    TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse, TeamInterruptOutcome,
-    TeamListResponse, TeamMailboxChange, TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamMcpRuntimeConfig,
-    TeamMcpSelection, TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamResponse, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
-    TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange,
-    TeamTaskChangedPayload, TeamTaskResponse, TeammateMessagePayload, UpdateTeamProjectRequest,
-    assistant_mcp_binding_fingerprint,
+    TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamEngagement, TeamEngagementMember,
+    TeamInterruptAgentResponse, TeamInterruptOutcome, TeamListResponse, TeamMailboxChange, TeamMailboxChangedPayload,
+    TeamMailboxMessageResponse, TeamMcpRuntimeConfig, TeamMcpSelection, TeamMessageEnqueueStatus, TeamQueuedPolicy,
+    TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus,
+    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
+    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
+    TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange, TeamTaskChangedPayload, TeamTaskResponse,
+    TeammateMessagePayload, UpdateEngagementRequest, UpdateTeamProjectRequest, assistant_mcp_binding_fingerprint,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{

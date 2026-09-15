@@ -10,12 +10,13 @@ use axum::routing::{get, post, put};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
-    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
-    SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
-    SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse, UpdateTeamProjectRequest,
+    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateEngagementRequest,
+    CreateTeamRequest, GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest,
+    RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest,
+    SetConfigOptionResponse, SetModeRequest, SetModelRequest, TeamActivityPageResponse, TeamAgentResponse,
+    TeamContextResetAvailability, TeamContextResetResponse, TeamEngagement, TeamEngagementMember,
+    TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamTaskResponse, UpdateEngagementRequest, UpdateTeamProjectRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -209,6 +210,26 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/activity", get(list_activity))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/project", axum::routing::patch(update_team_project))
+        .route(
+            "/api/teams/{id}/engagements",
+            get(list_engagements).post(create_engagement),
+        )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}",
+            axum::routing::patch(update_engagement),
+        )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}/members",
+            get(list_engagement_members),
+        )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}/tasks",
+            get(list_engagement_tasks),
+        )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}/mailbox",
+            get(list_engagement_mailbox),
+        )
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
         .route(
@@ -429,6 +450,103 @@ async fn update_team_project(
         .update_team_project(&user.id, &id, &req.project_id)
         .await?;
     Ok(Json(ApiResponse::ok(team)))
+}
+
+#[derive(serde::Deserialize)]
+struct EngagementPathParams {
+    id: String,
+    engagement_id: String,
+}
+
+/// Lists the caller's engagements for team `:id` (ownership enforced in the
+/// service). Read-only → no CSRF.
+async fn list_engagements(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<TeamEngagement>>>, ApiError> {
+    let engagements = state.service.list_engagements_for_team(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(engagements)))
+}
+
+/// Find-or-create the team's engagement for `project_id` (materializes its
+/// members). Ownership + team binding enforced by `ensure_engagement`.
+/// State-changing → auth + CSRF via the team router middleware, same as
+/// `create_team`/`update_team_project`.
+async fn create_engagement(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<CreateEngagementRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamEngagement>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let engagement = state.service.ensure_engagement(&user.id, &id, &req.project_id).await?;
+    Ok(Json(ApiResponse::ok(engagement.into())))
+}
+
+/// Updates an engagement's process/status. The service verifies the engagement
+/// belongs to BOTH team `:id` AND the caller before any write (404 otherwise).
+/// State-changing → auth + CSRF via middleware.
+async fn update_engagement(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+    body: Result<Json<UpdateEngagementRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamEngagement>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let engagement = state
+        .service
+        .update_team_engagement(
+            &user.id,
+            &params.id,
+            &params.engagement_id,
+            req.process.as_deref(),
+            req.status.as_deref(),
+        )
+        .await?;
+    Ok(Json(ApiResponse::ok(engagement)))
+}
+
+/// Engagement-scoped members. Same ownership+team-binding guard as the PATCH
+/// route (service `load_owned_engagement`). Read-only → no CSRF.
+async fn list_engagement_members(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+) -> Result<Json<ApiResponse<Vec<TeamEngagementMember>>>, ApiError> {
+    let members = state
+        .service
+        .list_engagement_members(&user.id, &params.id, &params.engagement_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(members)))
+}
+
+/// Engagement-scoped tasks. Same guard; engagement-scoped `list_tasks`
+/// projection. Read-only → no CSRF.
+async fn list_engagement_tasks(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+) -> Result<Json<ApiResponse<Vec<TeamTaskResponse>>>, ApiError> {
+    let tasks = state
+        .service
+        .list_engagement_tasks(&user.id, &params.id, &params.engagement_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(tasks)))
+}
+
+/// Engagement-scoped mailbox. Same guard; same `TeamMailboxMessageResponse`
+/// shape as the team-scoped route, scoped to one engagement's rows.
+async fn list_engagement_mailbox(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+) -> Result<Json<ApiResponse<Vec<TeamMailboxMessageResponse>>>, ApiError> {
+    let messages = state
+        .service
+        .list_engagement_mailbox(&user.id, &params.id, &params.engagement_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(messages)))
 }
 
 #[derive(serde::Deserialize)]
