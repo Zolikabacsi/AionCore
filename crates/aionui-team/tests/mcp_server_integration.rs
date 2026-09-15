@@ -5,7 +5,9 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
-use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeamPromptDumpConfig, TeammateManager, TeammateRole};
+use aionui_team::{
+    Mailbox, TaskBoard, TaskProcess, TeamAgent, TeamMcpServer, TeamPromptDumpConfig, TeammateManager, TeammateRole,
+};
 use common::MockTeamRepo;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -88,6 +90,7 @@ async fn setup_with_prompt_dump(prompt_dump: Option<TeamPromptDumpConfig>) -> Te
         mailbox,
         task_board,
         broadcaster.clone(),
+        TaskProcess::Hierarchical,
     ));
 
     // W5-D29e: standalone MCP server without a live TeamSessionService —

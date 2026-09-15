@@ -38,7 +38,14 @@ impl TeamSessionService {
         team_id: &str,
         agent: &TeamAgent,
     ) -> Result<aionui_api_types::TeamContextResetCapability, TeamError> {
-        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        // Engagement-keyed map: resolve the live session by team via scan (read
+        // path; must not re-resolve the engagement, which would create a row on
+        // every list/get-team read).
+        let session = self
+            .sessions
+            .iter()
+            .find(|entry| entry.session.team_id() == team_id)
+            .map(|entry| Arc::clone(&entry.session));
         self.context_reset_capability_for_session(user_id, agent, session.as_deref())
             .await
     }

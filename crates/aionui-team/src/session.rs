@@ -10,9 +10,10 @@ use aionui_api_types::{
     TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
+use aionui_db::DbError;
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -33,11 +34,12 @@ use crate::ports::{
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
 use crate::provisioning::PersistSpawnedAgentRequest;
+use crate::result_delivery::{delegated_engagement_id, delegated_reply_to};
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
-use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, MailboxMessageType, TaskProcess, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
     MAX_MESSAGE_DELIVERY_FAILURES, ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
@@ -96,6 +98,12 @@ pub struct SpawnAgentRequest {
 
 pub struct TeamSession {
     team: Team,
+    /// Active engagement (`team × project` binding) that this session's mailbox
+    /// and task-board writes are stamped with. Resolved once at session start
+    /// from the team's current project (legacy single-project teams resolve to
+    /// the backfilled default, i.e. `engagement_id == team_id`, so behavior is
+    /// unchanged). Used by the service to key `sessions`/`*_locks` maps.
+    engagement_id: String,
     scheduler: Arc<TeammateManager>,
     mailbox: Arc<Mailbox>,
     task_board: Arc<TaskBoard>,
@@ -172,6 +180,124 @@ impl TeamSession {
         .await
     }
 
+    /// Resolve the active engagement id for `team`, stamped on every mailbox and
+    /// task-board write this session performs:
+    /// - no project bound → `team.id` (the migration-045 backfilled default;
+    ///   identical to Phase 1 behavior, so legacy single-engagement teams are
+    ///   unaffected).
+    /// - project bound → `find_or_create_engagement(user, team, project).id`.
+    ///
+    /// Falls back to `team.id` if the repository can't resolve an engagement
+    /// (test doubles whose `find_or_create_engagement` is unimplemented).
+    pub(crate) async fn resolve_engagement_id(repo: &Arc<dyn ITeamRepository>, user_id: &str, team: &Team) -> String {
+        let Some(project_id) = team.project_id.clone() else {
+            return team.id.clone();
+        };
+        match repo
+            .find_or_create_engagement(user_id, &team.id, &project_id, &team.workspace)
+            .await
+        {
+            Ok(engagement) => engagement.id,
+            Err(err) => {
+                // `NotFound` is the expected result for test doubles whose
+                // `find_or_create_engagement` is unimplemented (and for the
+                // legacy no-engagement case): a safe, low-severity fallback. Any
+                // other error is a genuine DB failure that silently mis-stamps
+                // every write this session makes, so escalate it. (I2)
+                match err {
+                    DbError::NotFound(_) => warn!(
+                        team_id = %team.id,
+                        project_id,
+                        error = %err,
+                        "team engagement resolution failed; falling back to team_id key"
+                    ),
+                    other => error!(
+                        team_id = %team.id,
+                        project_id,
+                        error = %other,
+                        "team engagement resolution failed; falling back to team_id key"
+                    ),
+                }
+                team.id.clone()
+            }
+        }
+    }
+
+    /// Resolve the engagement's scheduling `process` mode for session start.
+    ///
+    /// Reads the resolved engagement row and maps its `process` string to a
+    /// [`TaskProcess`]. Any failure to obtain the row — a miss (`Ok(None)`),
+    /// the `NotFound` stub of a test double / legacy team, or a genuine DB
+    /// error — falls back to [`TaskProcess::Hierarchical`] so session start
+    /// never fails on the lookup and pre-Phase-3b behavior stays byte-identical.
+    pub(crate) async fn resolve_process(
+        repo: &Arc<dyn ITeamRepository>,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> TaskProcess {
+        match repo.find_engagement_by_id(user_id, engagement_id).await {
+            Ok(Some(row)) => TaskProcess::from(row.process.as_str()),
+            Ok(None) => TaskProcess::Hierarchical,
+            Err(err) => {
+                warn!(
+                    engagement_id,
+                    error = %err,
+                    "engagement process lookup failed; defaulting to hierarchical"
+                );
+                TaskProcess::Hierarchical
+            }
+        }
+    }
+
+    /// Build the runtime member roster the scheduler drives: overlay each
+    /// engagement's materialized member rows (fresh `slot_id` /
+    /// `conversation_id`) on top of the `teams.agents` template, taking
+    /// name/role/backend/model/assistant_id/cli_path/conversation_type from the
+    /// template and overriding only the two runtime ids.
+    ///
+    /// Non-breaking fallback: when the engagement has no materialized members —
+    /// a legacy team (`engagement_id == team_id`, never engaged) or a repo
+    /// double that doesn't implement `list_engagement_members` — the template
+    /// agents are returned unchanged so runtime behavior stays byte-identical
+    /// to pre-Phase-2b. A genuine DB read error also falls back (never gate the
+    /// runtime on member reads), logged for diagnosability since a silent
+    /// fallback would mis-route member messages.
+    async fn engagement_member_agents(
+        repo: &Arc<dyn ITeamRepository>,
+        user_id: &str,
+        engagement_id: &str,
+        template_agents: &[TeamAgent],
+    ) -> Vec<TeamAgent> {
+        let members = match repo.list_engagement_members(user_id, engagement_id).await {
+            Ok(m) if !m.is_empty() => m,
+            Ok(_) => return template_agents.to_vec(),
+            Err(err) => {
+                warn!(
+                    engagement_id,
+                    error = %err,
+                    "engagement member read failed; falling back to template agents"
+                );
+                return template_agents.to_vec();
+            }
+        };
+        let by_slot: std::collections::HashMap<&str, _> =
+            members.iter().map(|m| (m.template_slot.as_str(), m)).collect();
+        template_agents
+            .iter()
+            .map(|agent| match by_slot.get(agent.slot_id.as_str()) {
+                Some(member) => {
+                    let mut merged = agent.clone();
+                    merged.slot_id = member.slot_id.clone();
+                    merged.conversation_id = member.conversation_id.clone();
+                    merged
+                }
+                // Template slot not present in this engagement's members: keep
+                // the template row so the member is never dropped from runtime.
+                None => agent.clone(),
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_prompt_dump(
         team: Team,
@@ -186,6 +312,18 @@ impl TeamSession {
         service: Weak<TeamSessionService>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
+        let engagement_id = Self::resolve_engagement_id(&repo, &user_id, &team).await;
+        // Runtime member roster: engagement-materialized members when present,
+        // otherwise the `teams.agents` template (legacy fallback). The scheduler
+        // drives THIS list, so every downstream `get_agent`/`list_agents` consumer
+        // (send, projection, wake, MCP, runtime-status events) carries the
+        // engagement's own `slot_id`/`conversation_id`.
+        let member_agents = Self::engagement_member_agents(&repo, &user_id, &engagement_id, &team.agents).await;
+        // Per-engagement scheduling mode, resolved before `repo` is moved into
+        // the task board. Missing/legacy/unimplemented lookups default to
+        // Hierarchical (see `resolve_process`), so this never changes behavior
+        // for teams that have no `process` row yet.
+        let process = Self::resolve_process(&repo, &user_id, &engagement_id).await;
         // Single emitter shared by mailbox, task board, and the run manager so
         // all team events reuse the same team-scoped subscription/delivery.
         let emitter = Arc::new(TeamEventEmitter::new(
@@ -193,8 +331,16 @@ impl TeamSession {
             user_id.clone(),
             broadcaster.clone(),
         ));
-        let mailbox = Arc::new(Mailbox::new_for_user(repo.clone(), user_id.clone()).with_events(emitter.clone()));
-        let task_board = Arc::new(TaskBoard::new_for_user(repo, user_id.clone()).with_events(emitter.clone()));
+        let mailbox = Arc::new(
+            Mailbox::new_for_user(repo.clone(), user_id.clone())
+                .with_events(emitter.clone())
+                .with_engagement(engagement_id.clone()),
+        );
+        let task_board = Arc::new(
+            TaskBoard::new_for_user(repo, user_id.clone())
+                .with_events(emitter.clone())
+                .with_engagement(engagement_id.clone()),
+        );
         let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
         let team_run_manager = Arc::new(TeamRunManager::new(team.id.clone(), emitter.clone()));
         let work_coordinator = Arc::new(SlotWorkCoordinator::new(
@@ -206,10 +352,11 @@ impl TeamSession {
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
             user_id.clone(),
-            &team.agents,
+            &member_agents,
             mailbox.clone(),
             task_board.clone(),
             broadcaster.clone(),
+            process,
         ));
 
         let auth_token = aionui_common::generate_id();
@@ -233,6 +380,7 @@ impl TeamSession {
 
         Ok(Self {
             team,
+            engagement_id,
             scheduler,
             mailbox,
             task_board,
@@ -267,6 +415,17 @@ impl TeamSession {
 
     pub fn team_id(&self) -> &str {
         &self.team.id
+    }
+
+    /// Active engagement (`team × project` binding) that every mailbox/task
+    /// write in this session is stamped with. Resolved once at `start`.
+    pub fn engagement_id(&self) -> &str {
+        &self.engagement_id
+    }
+
+    /// The engagement's scheduling mode the scheduler was built with.
+    pub fn process(&self) -> TaskProcess {
+        self.scheduler.process()
     }
 
     pub fn user_id(&self) -> &str {
@@ -441,7 +600,14 @@ impl TeamSession {
                         .unwrap_or_default();
                     (command, false)
                 } else {
-                    let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                    let input_context = crate::prompts::input_context_for_slot(&tasks, &agent.slot_id);
+                    let wake_body = build_wake_payload(
+                        &agent,
+                        &tasks,
+                        &claimed_unread,
+                        &current_slot_ids,
+                        input_context.as_deref(),
+                    );
                     let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                     let first_message = if needs_role_prompt {
                         let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
@@ -549,6 +715,8 @@ impl TeamSession {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
         }
 
+        self.capture_turn_results(&slot_id).await;
+
         let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
 
         // Clear the dedup window unconditionally once finalize has run.
@@ -566,6 +734,147 @@ impl TeamSession {
         }
 
         Ok(wake_target)
+    }
+
+    /// Captures the task results for `slot_id` at turn finalize (Phase 3a):
+    /// every task the assignee completed during its turn gets its `result`
+    /// from the slot's latest assistant message. Best-effort side effect only
+    /// — never fails the finalize/wake/idle path: when no assistant text is
+    /// readable (legacy/hierarchical teams, a resume with no message yet, a
+    /// test double without the service) the capture is a no-op.
+    ///
+    /// Phase 4b §8 addendum: when the captured task carries the convene-stamped
+    /// `delegate_reply_to` metadata (it is a delegated engagement root), the
+    /// consolidated result is also returned to the caller through the
+    /// `DelegatedResultDelivery` port — asynchronously (spawned) and
+    /// best-effort (a delivery failure warns, it never blocks the finalize).
+    /// Tasks without that metadata never reach the port: ordinary and legacy
+    /// completions are byte-identical to Phase 3a.
+    pub(crate) async fn capture_turn_results(&self, slot_id: &str) {
+        let pending = self.scheduler.take_pending_task_results(slot_id).await;
+        if pending.is_empty() {
+            return;
+        }
+        let Some(text) = self.latest_assistant_text_for_slot(slot_id).await else {
+            debug!(
+                team_id = %self.team.id,
+                slot_id,
+                task_count = pending.len(),
+                "task result capture skipped: no final assistant text available"
+            );
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        for task_id in &pending {
+            let metadata = match self.task_board.set_task_result(&self.team.id, task_id, text).await {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warn!(
+                        team_id = %self.team.id,
+                        slot_id,
+                        task_id = %task_id,
+                        error = %error,
+                        "task result capture failed"
+                    );
+                    continue;
+                }
+            };
+            self.deliver_delegated_result(task_id, metadata.as_ref(), text);
+        }
+    }
+
+    /// Spec §8 return leg: a task whose metadata carries `delegate_reply_to`
+    /// is a delegated engagement root and owes the caller its consolidated
+    /// result. Fire-and-forget via `tokio::spawn` so delivery latency/failure
+    /// can never block or fail the turn finalize that just captured the
+    /// result; ownership/validation (spec §10) lives in the adapter. No
+    /// metadata → nothing happens (the Phase 3a path is untouched).
+    fn deliver_delegated_result(&self, task_id: &str, metadata: Option<&serde_json::Value>, text: &str) {
+        let Some(caller_conversation_id) = delegated_reply_to(metadata) else {
+            return;
+        };
+        let Some(service) = self.service.upgrade() else {
+            warn!(
+                team_id = %self.team.id,
+                task_id,
+                "delegated result not returned: no service to resolve the delivery port"
+            );
+            return;
+        };
+        let Some(port) = service.result_delivery() else {
+            warn!(
+                team_id = %self.team.id,
+                task_id,
+                caller_conversation_id,
+                "delegated result not returned: delivery port not wired"
+            );
+            return;
+        };
+        let engagement_id = delegated_engagement_id(metadata, &self.engagement_id);
+        let (user_id, team_id) = (self.user_id.clone(), self.team.id.clone());
+        let task_id = task_id.to_owned();
+        let text = text.to_owned();
+        tokio::spawn(async move {
+            match port
+                .deliver_result(&user_id, &caller_conversation_id, &engagement_id, &text)
+                .await
+            {
+                Ok(()) => info!(
+                    kind = "team",
+                    team_id,
+                    task_id,
+                    engagement_id,
+                    caller_conversation_id,
+                    "delegated engagement result returned to caller"
+                ),
+                Err(error) => warn!(
+                    kind = "team",
+                    team_id,
+                    task_id,
+                    engagement_id,
+                    caller_conversation_id,
+                    error = %error,
+                    "delegated engagement result delivery failed; result stays on the task"
+                ),
+            }
+        });
+    }
+
+    async fn latest_assistant_text_for_slot(&self, slot_id: &str) -> Option<String> {
+        let agent = self.scheduler.get_agent(slot_id).await.ok()?;
+        let service = self.service.upgrade()?;
+        service
+            .conversation_port()
+            .latest_assistant_text(&agent.conversation_id)
+            .await
+            .ok()?
+    }
+
+    /// Phase 4c final-fix (§8/§10): best-effort WAKE for a delegated child
+    /// result already written into `slot_id`'s engagement mailbox by the service
+    /// (`deliver_child_result` does the 4a-style `Mailbox::write`). This only
+    /// needs to make the parent member's runtime act on the row NOW rather than
+    /// at its next drain: bring up a dormant member runtime
+    /// (`ensure_member_runtime_lazy`) and signal the event loop (`notify`).
+    /// `prepare_next_batch` peeks unread mailbox rows directly, so a row written
+    /// outside the coordinator is still claimed — the wake is additive, never a
+    /// second post. Failures are swallowed (log-not-throw): the durable row is
+    /// already persisted, so surfacing a wake error would invite a retry that
+    /// double-writes it.
+    pub(crate) async fn wake_slot_for_delivery(&self, slot_id: &str) {
+        if let Err(error) = self.ensure_member_runtime_lazy(slot_id, true).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id,
+                error = %error,
+                "delegated child result mailbox row persisted but member runtime wake failed"
+            );
+            return;
+        }
+        self.event_loops.notify(slot_id);
     }
 
     /// Write a user message to the lead's mailbox and trigger a wake.
@@ -4456,5 +4765,134 @@ mod tests {
             recorder.names()
         );
         session.stop();
+    }
+
+    // ── I2: resolve_engagement_id error-kind handling ──────────────────────
+    //
+    // A genuine (non-`NotFound`) repository failure must be escalated to `error!`
+    // (a DB fault silently mis-stamping every session write is a contract
+    // violation), while the expected `NotFound` from unimplemented test doubles
+    // stays a `warn!` fallback. Both keep returning `team.id`. The only
+    // observable difference is the log LEVEL, so a capturing subscriber asserts it.
+    thread_local! {
+        static RESOLVE_LOG_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ResolveLogWriter;
+    impl std::io::Write for ResolveLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ResolveLogWriter {
+        type Writer = ResolveLogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            ResolveLogWriter
+        }
+    }
+
+    fn install_resolve_capture() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            // ONE process-global capturing subscriber (rebuilds the interest
+            // cache) routing to a thread-local buffer, so parallel tests never
+            // observe each other's events.
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ResolveLogWriter)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    fn resolve_team_with_project() -> Team {
+        Team {
+            id: "team-i2".into(),
+            name: "i2".into(),
+            workspace: "/tmp/i2".into(),
+            agents: vec![],
+            lead_agent_id: None,
+            project_id: Some("proj-a".into()),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_engagement_id_logs_error_on_non_notfound_db_failure() {
+        install_resolve_capture();
+        RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_resolve_error(crate::test_utils::EngagementResolveError::Other);
+        let repo: Arc<dyn ITeamRepository> = repo;
+
+        let resolved = TeamSession::resolve_engagement_id(&repo, "u1", &resolve_team_with_project()).await;
+
+        assert_eq!(resolved, "team-i2", "non-NotFound must still fall back to team.id");
+        let logs = RESOLVE_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).unwrap());
+        assert!(
+            logs.contains("falling back to team_id key"),
+            "the fallback must be logged: {logs}"
+        );
+        assert!(
+            logs.contains("ERROR"),
+            "a genuine DB failure must be escalated to ERROR: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_engagement_id_logs_warn_on_notfound() {
+        install_resolve_capture();
+        RESOLVE_LOG_BUF.with(|cell| cell.borrow_mut().clear());
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_resolve_error(crate::test_utils::EngagementResolveError::NotFound);
+        let repo: Arc<dyn ITeamRepository> = repo;
+
+        let resolved = TeamSession::resolve_engagement_id(&repo, "u1", &resolve_team_with_project()).await;
+
+        assert_eq!(resolved, "team-i2", "NotFound must fall back to team.id");
+        let logs = RESOLVE_LOG_BUF.with(|cell| String::from_utf8(cell.borrow().clone()).unwrap());
+        assert!(
+            logs.contains("falling back to team_id key"),
+            "the fallback must be logged: {logs}"
+        );
+        assert!(
+            !logs.contains("ERROR"),
+            "the expected NotFound must stay a warn, not error: {logs}"
+        );
+    }
+
+    // ── resolve_process: per-engagement mode + default-hierarchical fallback ──
+
+    async fn process_for(lookup: crate::test_utils::EngagementLookup) -> TaskProcess {
+        let repo = Arc::new(MockTeamRepo::new());
+        repo.set_engagement_lookup(lookup);
+        let repo: Arc<dyn ITeamRepository> = repo;
+        TeamSession::resolve_process(&repo, "u1", "eng-1").await
+    }
+
+    #[tokio::test]
+    async fn resolve_process_reads_sequential_from_row() {
+        let p = process_for(crate::test_utils::EngagementLookup::Process("sequential".into())).await;
+        assert_eq!(p, TaskProcess::Sequential);
+    }
+
+    #[tokio::test]
+    async fn resolve_process_defaults_hierarchical_on_miss_and_stub() {
+        // Real miss (Ok(None)).
+        assert_eq!(
+            process_for(crate::test_utils::EngagementLookup::Missing).await,
+            TaskProcess::Hierarchical
+        );
+        // Unimplemented double / legacy team (trait default NotFound stub).
+        assert_eq!(
+            process_for(crate::test_utils::EngagementLookup::Unimplemented).await,
+            TaskProcess::Hierarchical
+        );
     }
 }

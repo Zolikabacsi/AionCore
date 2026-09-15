@@ -15,7 +15,7 @@ use aionui_team::message_projection::{
 };
 use aionui_team::prompts::{AvailableAssistant, build_lead_prompt, build_teammate_prompt, build_wake_payload};
 use aionui_team::types::{
-    MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
+    MailboxMessage, MailboxMessageType, TaskProcess, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
 };
 use aionui_team::visibility::TeamVisibilityPolicy;
 use aionui_team::{Mailbox, TaskBoard, TeammateManager};
@@ -442,7 +442,7 @@ fn wp1_wake_payload_includes_unread_messages() {
             created_at: 0,
         },
     ];
-    let payload = build_wake_payload(&agent, &[], &messages, &roster(&["lead-1", "w1", "w2"]));
+    let payload = build_wake_payload(&agent, &[], &messages, &roster(&["lead-1", "w1", "w2"]), None);
 
     assert!(payload.contains("Feature X is done"));
     assert!(payload.contains("`w1`"));
@@ -470,6 +470,9 @@ fn wp2_wake_payload_includes_task_list() {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            expected_output: None,
+            result: None,
+            input_context: None,
         },
         TeamTask {
             id: "bbbbbbbb-1111-2222-3333-444444444444".into(),
@@ -483,9 +486,12 @@ fn wp2_wake_payload_includes_task_list() {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            expected_output: None,
+            result: None,
+            input_context: None,
         },
     ];
-    let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]));
+    let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]), None);
 
     assert!(payload.contains("Current Task Board Summary"));
     assert!(payload.contains("Showing 2 of 2 tasks."));
@@ -507,7 +513,7 @@ fn wp2_wake_payload_includes_task_list() {
 #[test]
 fn wp3_wake_payload_empty_builds_normally() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]));
+    let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]), None);
 
     assert!(payload.contains("No new messages"));
     assert!(payload.contains("No tasks on the board"));
@@ -531,7 +537,15 @@ async fn we1_agent_status_change_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board,
+        bc.clone(),
+        TaskProcess::Hierarchical,
+    );
 
     mgr.set_status("w1", TeammateStatus::Working).await.unwrap();
 
@@ -554,7 +568,15 @@ async fn we2_agent_spawned_event() {
     let task_board = Arc::new(TaskBoard::new(repo));
     let bc = Arc::new(RecordingBroadcaster::new());
     let agents = vec![make_agent("lead-1", "Lead", TeammateRole::Lead)];
-    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board,
+        bc.clone(),
+        TaskProcess::Hierarchical,
+    );
 
     let new_agent = make_agent("w2", "NewWorker", TeammateRole::Teammate);
     mgr.add_agent(&new_agent).await;
@@ -584,7 +606,15 @@ async fn we3_agent_removed_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board,
+        bc.clone(),
+        TaskProcess::Hierarchical,
+    );
 
     mgr.remove_agent("w1").await.unwrap();
 
@@ -612,7 +642,15 @@ async fn we4_agent_renamed_event() {
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), "user-1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new(
+        "t1".into(),
+        "user-1".into(),
+        &agents,
+        mailbox,
+        task_board,
+        bc.clone(),
+        TaskProcess::Hierarchical,
+    );
 
     mgr.rename_agent("w1", "SuperWorker").await.unwrap();
 

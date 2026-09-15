@@ -46,6 +46,7 @@ use super::fs_monitor::spawn_fs_monitor;
 use super::health::health_check;
 use aionui_session_message::{session_message_routes, session_message_user_routes};
 use aionui_skill_runtime::skill_runtime_routes;
+use aionui_delegate::routes::delegate_routes;
 
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
 use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
@@ -372,6 +373,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // Channel A. Same runtime-token self-authentication: the caller is an agent
     // process holding a conversation-scoped token, not a browser session.
     let skill_runtime = skill_runtime_routes(states.skill_runtime);
+    // CrewAI-style hierarchical delegation (aionui-delegate). Same auth channel
+    // as `session_message`.
+    let delegate_runtime = delegate_routes(states.delegate.clone());
     // The `@@` picker's outlet goes through ordinary user auth.
     let session_message_authenticated = session_message_user_routes(states.session_message)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -428,6 +432,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     .merge(ws_routes)
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
+    .merge(delegate_runtime)
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));

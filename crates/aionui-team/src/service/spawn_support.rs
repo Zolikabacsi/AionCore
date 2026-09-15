@@ -211,11 +211,8 @@ impl TeamSessionService {
         caller_slot_id: &str,
         req: crate::session::SpawnAgentRequest,
     ) -> Result<TeamAgent, TeamError> {
-        let entry = self
-            .sessions
-            .get(team_id)
-            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        entry.session.spawn_agent(caller_slot_id, req).await
+        let session = self.published_session(team_id)?;
+        session.spawn_agent(caller_slot_id, req).await
     }
 
     pub fn dispose_all(&self) {
@@ -236,6 +233,9 @@ impl TeamSessionService {
     /// (`TeamSession::spawn_agent`) wire that up separately so a slow
     /// `warmup` never stalls other spawns against the same team.
     pub(crate) async fn persist_spawned_agent(&self, req: PersistSpawnedAgentRequest) -> Result<TeamAgent, TeamError> {
+        // `add_agent_locks` guards the shared `teams.agents` roster RMW, so it is
+        // intentionally team-keyed (not per-engagement) and must match every other
+        // membership mutation path (add_agent/remove_agent/...).
         let lock = self
             .add_agent_locks
             .entry(req.team_id.clone())

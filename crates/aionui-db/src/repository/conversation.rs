@@ -343,6 +343,22 @@ pub trait IConversationRepository: Send + Sync {
     ) -> Result<Vec<MessageRow>, DbError> {
         Ok(Vec::new())
     }
+
+    // ── Raw escape hatches ───────────────────────────────────────────
+    //
+    // Added for `aionui-delegate` (Phase 2, migration 044). Other callers
+    // should prefer the typed methods above; these exist so feature crates
+    // can do auxiliary queries against their own tables without forcing a
+    // schema-shape change every time.
+
+    /// Run an arbitrary SELECT and return the resulting rows.
+    ///
+    /// `params` are positional bind values (rendered as `?1`, `?2`, ...).
+    /// Each row exposes `sqlx::Row::get::<T, _>("column")` for typed access.
+    async fn raw_query(&self, sql: &str, params: Vec<String>) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError>;
+
+    /// Run an arbitrary INSERT/UPDATE/DELETE and return rows affected.
+    async fn raw_execute(&self, sql: &str, params: Vec<String>) -> Result<u64, DbError>;
 }
 
 // ── Supporting types ────────────────────────────────────────────────

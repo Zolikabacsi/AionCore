@@ -366,6 +366,9 @@ mod tests {
             metadata: None,
             created_at,
             updated_at,
+            expected_output: None,
+            result: None,
+            input_context: None,
         }
     }
 

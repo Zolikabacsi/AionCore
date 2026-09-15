@@ -24,6 +24,7 @@ use aionui_db::{
     SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
     SqliteSettingsRepository,
 };
+use aionui_delegate::state::DelegateRouterState;
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
@@ -55,6 +56,7 @@ use aionui_team::{
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::delegate_team_bridge::TeamEngagementBridgeAdapter;
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
@@ -144,6 +146,7 @@ pub struct ModuleStates {
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
     pub session_message: SessionMessageRouterState,
+    pub delegate: DelegateRouterState,
     pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
@@ -297,6 +300,20 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
     );
+    // The team state is built before the bundle (not inside the literal) so the
+    // delegate state can receive the team-engagement bridge adapter: delegate
+    // and team are same-layer crates and only meet through the port, which the
+    // adapter here implements over the team service.
+    let team = build_module_state_phase(&boot, "team", || {
+        build_team_state(
+            services,
+            Some(cron.cron_service.clone()),
+            backend_binary_path.clone(),
+            assistant.service.clone(),
+        )
+    });
+    let team_bridge: Arc<dyn aionui_delegate::bridge::TeamEngagementBridge> =
+        Arc::new(TeamEngagementBridgeAdapter::new(team.service.clone()));
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
@@ -320,15 +337,11 @@ pub async fn build_module_states(
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
-        team: build_module_state_phase(&boot, "team", || {
-            build_team_state(
-                services,
-                Some(cron.cron_service.clone()),
-                backend_binary_path.clone(),
-                assistant.service.clone(),
-            )
-        }),
+        team,
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
+        delegate: build_module_state_phase(&boot, "delegate", || {
+            build_delegate_state(services, team_bridge.clone())
+        }),
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
@@ -412,6 +425,42 @@ pub fn build_session_message_state(services: &AppServices) -> SessionMessageRout
     .spawn(services.session_message_notify.clone());
 
     state
+}
+
+/// Build the `aionui-delegate` router state. Mirrors the `session-message`
+/// shape: queue + rate limiter + suspend registry + service + repo wiring.
+/// The team-engagement bridge is injected by the caller because the team
+/// service is constructed just before this in the module-states sequence.
+pub fn build_delegate_state(
+    services: &AppServices,
+    team_bridge: Arc<dyn aionui_delegate::bridge::TeamEngagementBridge>,
+) -> DelegateRouterState {
+    use aionui_delegate::service::DelegateService;
+
+    let service = Arc::new(DelegateService::new(
+        services.conversation_service.clone(),
+        services.conversation_repo.clone(),
+        services.settings_repo.clone(),
+        services.event_broadcaster.clone(),
+        services.worker_task_manager.clone(),
+        team_bridge.clone(),
+    ));
+
+    DelegateRouterState {
+        service: service.clone(),
+        conversation_service: services.conversation_service.clone(),
+        conversation_repo: services.conversation_repo.clone(),
+        settings_repo: services.settings_repo.clone(),
+        broadcaster: services.event_broadcaster.clone(),
+        runtime_token_service: services.runtime_token_service.clone(),
+        task_manager: services.worker_task_manager.clone(),
+        team_bridge,
+        // queue/rate_limiter/suspend are exposed via the service's
+        // `Arc` clone — the router only needs `service` to dispatch.
+        queue: service.queue.clone(),
+        rate_limiter: service.rate_limiter.clone(),
+        suspend: service.suspend.clone(),
+    }
 }
 
 /// Build the default `AssistantRouterState` from application services.
@@ -997,6 +1046,18 @@ pub fn build_team_state(
     service.with_project_service(Arc::new(services.project_service.clone()));
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
     service.with_user_order_store(services.user_order_store.clone());
+    // Phase 4b §8: a convened engagement's root-task result returns to the
+    // delegating caller through the app's conversation write. Phase 4c
+    // final-fix: when that caller is a TEAM MEMBER, the adapter routes the
+    // result into the member's engagement mailbox (via the team seam) instead of
+    // the team-rejecting `send_message`, so a team-parent result actually lands.
+    service.with_result_delivery(Arc::new(
+        crate::router::team_result_delivery::DelegatedResultDeliveryAdapter::new(
+            services.conversation_service.clone(),
+            services.worker_task_manager.clone(),
+        )
+        .with_team_service(&service),
+    ));
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),

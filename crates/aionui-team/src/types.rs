@@ -161,6 +161,11 @@ pub struct Team {
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
+    /// The team's DEFAULT/active project: it marks which engagement the session
+    /// treats as active (see `resolve_engagement_id`). Not an authoritative
+    /// single binding — the shared `agents` member conversations must never be
+    /// mutated to "follow" this value; per-engagement members own their own
+    /// project binding. Per-request project selection is a later UI concern.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     pub created_at: TimestampMs,
@@ -277,13 +282,48 @@ pub struct TeamTask {
     pub metadata: Option<serde_json::Value>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_context: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// TeamEngagement
+// ---------------------------------------------------------------------------
+
+/// Domain view of a `team_engagements` row: a team bound to one project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TeamEngagement {
+    pub id: String,
+    pub user_id: String,
+    pub team_id: String,
+    pub project_id: String,
+    pub workspace: String,
+    pub process: String,
+    pub status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Result of the delegation bridge's "convene engagement" seam: the
+/// find-or-created engagement, the root task created on its board (owned by
+/// the lead), and the lead's slot id the envelope was mailed to. In-process
+/// only; never serialized (the bridge adapter maps it to its own type).
+#[derive(Debug, Clone)]
+pub struct TeamEngagementConvened {
+    pub engagement_id: String,
+    pub root_task_id: String,
+    pub lead_slot_id: String,
 }
 
 // ---------------------------------------------------------------------------
 // Conversion helpers: DB rows ↔ domain types
 // ---------------------------------------------------------------------------
 
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 
 impl Team {
     pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
@@ -355,7 +395,87 @@ impl TeamTask {
             metadata,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            expected_output: row.expected_output.clone(),
+            result: row.result.clone(),
+            input_context: row.input_context.clone(),
         })
+    }
+}
+
+impl TeamEngagement {
+    pub fn from_row(row: &TeamEngagementRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            user_id: row.user_id.clone(),
+            team_id: row.team_id.clone(),
+            project_id: row.project_id.clone(),
+            workspace: row.workspace.clone(),
+            process: row.process.clone(),
+            status: row.status.clone(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// Maps the domain engagement to its public response DTO (drops `user_id`, the
+/// internal ownership column).
+impl From<TeamEngagement> for aionui_api_types::TeamEngagement {
+    fn from(e: TeamEngagement) -> Self {
+        Self {
+            id: e.id,
+            team_id: e.team_id,
+            project_id: e.project_id,
+            workspace: e.workspace,
+            process: e.process,
+            status: e.status,
+            created_at: e.created_at,
+            updated_at: e.updated_at,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskProcess — per-engagement scheduling mode (Phase 3b)
+// ---------------------------------------------------------------------------
+
+/// How a team's tasks are scheduled within an engagement.
+///
+/// `Hierarchical` is the default (leader orchestrates, teammates run in
+/// parallel). `Sequential` is the DAG/gate mode threaded in from the
+/// engagement row; the actual gating behavior lives in the scheduler.
+/// Anything other than `"sequential"` parses to `Hierarchical` so a missing,
+/// legacy, or malformed value is always the safe, pre-existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskProcess {
+    #[default]
+    Hierarchical,
+    Sequential,
+}
+
+impl fmt::Display for TaskProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hierarchical => write!(f, "hierarchical"),
+            Self::Sequential => write!(f, "sequential"),
+        }
+    }
+}
+
+impl From<&str> for TaskProcess {
+    fn from(s: &str) -> Self {
+        if s == "sequential" {
+            Self::Sequential
+        } else {
+            Self::Hierarchical
+        }
+    }
+}
+
+impl From<String> for TaskProcess {
+    fn from(s: String) -> Self {
+        Self::from(s.as_str())
     }
 }
 
@@ -453,6 +573,22 @@ mod tests {
     fn teammate_role_serde_leader_alias() {
         let leader: TeammateRole = serde_json::from_str(r#""leader""#).unwrap();
         assert_eq!(leader, TeammateRole::Lead);
+    }
+
+    // -- TaskProcess ----------------------------------------------------------
+
+    #[test]
+    fn task_process_from_str_sequential_only() {
+        assert_eq!(TaskProcess::from("sequential"), TaskProcess::Sequential);
+        assert_eq!(TaskProcess::from("hierarchical"), TaskProcess::Hierarchical);
+        assert_eq!(TaskProcess::from("unknown"), TaskProcess::Hierarchical);
+        assert_eq!(TaskProcess::from(""), TaskProcess::Hierarchical);
+    }
+
+    #[test]
+    fn task_process_display() {
+        assert_eq!(TaskProcess::Sequential.to_string(), "sequential");
+        assert_eq!(TaskProcess::Hierarchical.to_string(), "hierarchical");
     }
 
     // -- MailboxMessageType ---------------------------------------------------
@@ -757,6 +893,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 1000,
+            engagement_id: None,
         };
         let msg = MailboxMessage::from_row(&row).unwrap();
         assert_eq!(msg.msg_type, MailboxMessageType::Message);
@@ -776,6 +913,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 2000,
+            engagement_id: None,
         };
         let msg = MailboxMessage::from_row(&row).unwrap();
         assert_eq!(msg.msg_type, MailboxMessageType::IdleNotification);
@@ -795,6 +933,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 0,
+            engagement_id: None,
         };
         assert!(MailboxMessage::from_row(&row).is_none());
     }
@@ -835,6 +974,10 @@ mod tests {
             metadata: Some(r#"{"priority":"high"}"#.into()),
             created_at: 1000,
             updated_at: 2000,
+            engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::InProgress);
@@ -857,6 +1000,10 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -879,6 +1026,10 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let task = TeamTask::from_row(&row).unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -898,6 +1049,10 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         assert!(TeamTask::from_row(&row).is_err());
     }

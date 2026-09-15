@@ -13,14 +13,14 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
-    SqliteUserRepository,
+    IProjectStore, ISettingsRepository, ISkillRepository, IUserOrderStore, IUserRepository,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
+    SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSettingsRepository,
+    SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
-use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_realtime::{BroadcastEventBus, EventBroadcaster, WebSocketManager};
 use aionui_session_message::QueueClearingCancelHook;
 use aionui_session_message::queue::{DeliveryQueue, SystemClock};
 use aionui_session_message::rate_limit::RateLimiter;
@@ -36,6 +36,8 @@ pub struct AppServices {
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
+    pub event_broadcaster: Arc<dyn EventBroadcaster>,
+    pub settings_repo: Arc<dyn ISettingsRepository>,
     pub worker_task_manager: Arc<dyn IWorkerTaskManager>,
     pub active_lease_registry: Arc<ActiveLeaseRegistry>,
     pub runtime_token_service: Arc<RuntimeTokenService>,
@@ -424,6 +426,7 @@ impl AppServices {
         conversation_service
             .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
 
+        let pool = database.pool().clone();
         Ok(Self {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
@@ -432,7 +435,9 @@ impl AppServices {
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),
-            event_bus,
+            event_bus: event_bus.clone(),
+            event_broadcaster: event_bus.clone(),
+            settings_repo: Arc::new(SqliteSettingsRepository::new(pool)),
             worker_task_manager,
             active_lease_registry,
             runtime_token_service,

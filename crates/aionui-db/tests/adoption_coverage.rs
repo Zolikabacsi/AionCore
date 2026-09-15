@@ -26,6 +26,8 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("cron_job_runs", "job_id", "cron_jobs"),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
+    ("team_engagement_members", "engagement_id", "team_engagements"),
+    ("suspended_turns", "envelope_id", "delegation_envelopes"),
     ("team_tasks", "team_id", "teams"),
 ];
 

@@ -2,6 +2,7 @@
 
 mod antigravity_hook;
 mod clipboard_writer;
+mod delegate_team_bridge;
 mod fs_monitor;
 mod health;
 mod item_revealer;
@@ -12,7 +13,10 @@ mod state;
 mod system_file_opener;
 mod team_capability_resolver;
 mod team_conversation_adapters;
+mod team_result_delivery;
 mod trace;
+
+pub use team_result_delivery::DelegatedResultDeliveryAdapter;
 
 pub use routes::{
     RouterRuntime, create_router, create_router_with_all_state, create_router_with_runtime, create_router_with_states,

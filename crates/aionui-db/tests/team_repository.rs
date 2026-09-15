@@ -63,6 +63,7 @@ fn make_mailbox_msg(id: &str, team_id: &str, to: &str, from: &str, msg_type: &st
         files: None,
         read: false,
         created_at: now_ms(),
+        engagement_id: None,
     }
 }
 
@@ -80,6 +81,10 @@ fn make_task(id: &str, team_id: &str, subject: &str) -> TeamTaskRow {
         metadata: None,
         created_at: now,
         updated_at: now,
+        engagement_id: None,
+        expected_output: None,
+        result: None,
+        input_context: None,
     }
 }
 
@@ -685,6 +690,38 @@ async fn update_task_description_and_owner() {
         .unwrap();
     assert_eq!(updated.description.as_deref(), Some("New description"));
     assert_eq!(updated.owner.as_deref(), Some("agent-2"));
+}
+
+#[tokio::test]
+async fn set_task_result_writes_and_rejects_cross_user() {
+    let (repo, _db) = repo().await;
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    repo.create_task(DEFAULT_USER_ID, &make_task("tk1", "t1", "Task"))
+        .await
+        .unwrap();
+
+    repo.set_task_result(DEFAULT_USER_ID, "tk1", "final answer")
+        .await
+        .unwrap();
+    let updated = repo
+        .find_task_by_id(DEFAULT_USER_ID, "t1", "tk1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.result.as_deref(), Some("final answer"));
+
+    // Data isolation: another user cannot stamp a row they do not own.
+    let intruder = repo
+        .set_task_result("intruder", "tk1", "hijacked")
+        .await
+        .expect_err("cross-user result write must fail");
+    assert!(matches!(intruder, DbError::NotFound(_)), "got {intruder:?}");
+    let after = repo
+        .find_task_by_id(DEFAULT_USER_ID, "t1", "tk1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.result.as_deref(), Some("final answer"));
 }
 
 #[tokio::test]

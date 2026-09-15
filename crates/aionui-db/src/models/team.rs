@@ -43,6 +43,8 @@ pub struct MailboxMessageRow {
     pub files: Option<String>,
     pub read: bool,
     pub created_at: TimestampMs,
+    /// Engagement (team+project) that owns this message; NULL for legacy rows.
+    pub engagement_id: Option<String>,
 }
 
 /// Row mapping for the `team_tasks` table.
@@ -64,6 +66,64 @@ pub struct TeamTaskRow {
     pub blocks: String,
     /// JSON object: arbitrary extension metadata.
     pub metadata: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+    /// Engagement (team+project) that owns this task; NULL for legacy rows.
+    pub engagement_id: Option<String>,
+    /// CrewAI expected deliverable for the task; set on create, NULL if unset.
+    pub expected_output: Option<String>,
+    /// Task outcome, captured on completion; NULL until result capture.
+    pub result: Option<String>,
+    /// Upstream inputs fed to the task; NULL until input-context wiring.
+    pub input_context: Option<String>,
+}
+
+/// Row mapping for the `team_engagements` table.
+///
+/// One engagement per `(team_id, project_id)`; owns the runtime state for a
+/// team bound to a single project.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamEngagementRow {
+    pub id: String,
+    pub user_id: String,
+    pub team_id: String,
+    pub project_id: String,
+    pub workspace: String,
+    /// Process mode: 'sequential' or 'hierarchical'.
+    pub process: String,
+    /// Lifecycle status: 'active' or 'archived'.
+    pub status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+    /// Optional drive folder backing the engagement.
+    pub folder_id: Option<String>,
+    /// Creation path: 'user' (default) or 'delegated'.
+    pub origin: String,
+    /// Originating conversation when delegated.
+    pub created_by_conversation_id: Option<String>,
+    /// Correlation id for reply-driven engagements.
+    pub reply_to: Option<String>,
+}
+
+/// Row mapping for the `team_engagement_members` table.
+///
+/// One member slot instance bound to a single engagement; the unique key is
+/// `(engagement_id, template_slot)`, so each template slot materializes at most
+/// once per engagement with its own isolated `slot_id` / `conversation_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamEngagementMemberRow {
+    pub engagement_id: String,
+    pub team_id: String,
+    /// Template-defined slot this row instantiates (unique per engagement).
+    pub template_slot: String,
+    /// Runtime slot instance id.
+    pub slot_id: String,
+    /// Conversation backing this member's runtime.
+    pub conversation_id: String,
+    /// Member role within the engagement.
+    pub role: String,
+    /// Optional member status.
+    pub status: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -106,6 +166,7 @@ mod tests {
             files: None,
             read: false,
             created_at: 0,
+            engagement_id: None,
         };
         assert_eq!(row.msg_type, "message");
     }
@@ -124,6 +185,10 @@ mod tests {
             metadata: None,
             created_at: 0,
             updated_at: 0,
+            engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let blocked: Vec<String> = serde_json::from_str(&row.blocked_by).expect("blocked_by should be valid JSON");
         assert!(blocked.is_empty());
@@ -145,6 +210,10 @@ mod tests {
             metadata: Some(r#"{"priority":"high"}"#.into()),
             created_at: 1000,
             updated_at: 2000,
+            engagement_id: None,
+            expected_output: None,
+            result: None,
+            input_context: None,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         let restored: TeamTaskRow = serde_json::from_str(&json).expect("deserialize");

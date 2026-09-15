@@ -1,8 +1,8 @@
-use aionui_common::now_ms;
+use aionui_common::{generate_id, now_ms};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamEngagementMemberRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
@@ -22,6 +22,7 @@ impl ITeamRepository for SqliteTeamRepository {
     // ── Team CRUD ────────────────────────────────────────────────────
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -39,8 +40,28 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.updated_at)
         .bind(&row.project_id)
         .bind(&row.folder_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // Every team owns a default (sentinel) engagement row with id == team_id and
+        // the reserved project, mirroring migration 045's backfill shape. Engagement-
+        // scoped runtime reads (peek_unread_by_engagement, list_*_by_engagement) are
+        // gated on `EXISTS(team_engagements …)`; without this row a newly created
+        // no-project team could never see its own mailbox/task rows.
+        sqlx::query(
+            "INSERT OR IGNORE INTO team_engagements \
+             (id, user_id, team_id, project_id, workspace, process, status, created_at, updated_at) \
+             VALUES (?, ?, ?, COALESCE(?, '__none__'), ?, 'hierarchical', 'active', ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.id)
+        .bind(&row.project_id)
+        .bind(&row.workspace)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -164,8 +185,8 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn write_message(&self, user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError> {
         let result = sqlx::query(
             "INSERT INTO mailbox \
-                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at, engagement_id) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
         )
         .bind(&row.id)
@@ -178,6 +199,7 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.files)
         .bind(row.read)
         .bind(row.created_at)
+        .bind(row.engagement_id.as_deref())
         .bind(&row.team_id)
         .bind(user_id)
         .execute(&self.pool)
@@ -204,7 +226,7 @@ impl ITeamRepository for SqliteTeamRepository {
 
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -241,7 +263,7 @@ impl ITeamRepository for SqliteTeamRepository {
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -271,7 +293,7 @@ impl ITeamRepository for SqliteTeamRepository {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                    AND id IN ({placeholders}) \
@@ -330,7 +352,7 @@ impl ITeamRepository for SqliteTeamRepository {
         let rows = if let Some(limit) = limit {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
                    AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -346,7 +368,7 @@ impl ITeamRepository for SqliteTeamRepository {
         } else {
             sqlx::query_as::<_, MailboxMessageRow>(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? \
                    AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
@@ -364,7 +386,7 @@ impl ITeamRepository for SqliteTeamRepository {
     async fn list_messages_by_team(&self, team_id: &str, limit: i64) -> Result<Vec<MailboxMessageRow>, DbError> {
         let rows = sqlx::query_as::<_, MailboxMessageRow>(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? \
              ORDER BY created_at DESC \
@@ -395,7 +417,7 @@ impl ITeamRepository for SqliteTeamRepository {
         };
         let sql = format!(
             "SELECT id, team_id, to_agent_id, from_agent_id, \
-                    type, content, summary, files, read, created_at \
+                    type, content, summary, files, read, created_at, engagement_id \
              FROM mailbox \
              WHERE team_id = ? {cursor_clause}\
              ORDER BY created_at {order}, id {order} \
@@ -420,7 +442,7 @@ impl ITeamRepository for SqliteTeamRepository {
             let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT id, team_id, to_agent_id, from_agent_id, \
-                        type, content, summary, files, read, created_at \
+                        type, content, summary, files, read, created_at, engagement_id \
                  FROM mailbox \
                  WHERE id IN ({placeholders}) \
                  ORDER BY created_at DESC"
@@ -454,8 +476,9 @@ impl ITeamRepository for SqliteTeamRepository {
         let result = sqlx::query(
             "INSERT INTO team_tasks \
                 (id, team_id, subject, description, status, owner, \
-                 blocked_by, blocks, metadata, created_at, updated_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                 blocked_by, blocks, metadata, created_at, updated_at, engagement_id, \
+                 expected_output, result, input_context) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
         )
         .bind(&row.id)
@@ -469,6 +492,10 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.metadata)
         .bind(row.created_at)
         .bind(row.updated_at)
+        .bind(row.engagement_id.as_deref())
+        .bind(row.expected_output.as_deref())
+        .bind(row.result.as_deref())
+        .bind(row.input_context.as_deref())
         .bind(&row.team_id)
         .bind(user_id)
         .execute(&self.pool)
@@ -737,6 +764,489 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(user_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn set_task_result(&self, user_id: &str, task_id: &str, result: &str) -> Result<(), DbError> {
+        // User-scoped like `update_task`'s ownership guard; task ids are
+        // globally unique, and the caller (task board) engagement-gates the
+        // row through `find_task` before reaching here.
+        let updated = sqlx::query(
+            "UPDATE team_tasks SET result = ?, updated_at = ? \
+             WHERE id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_tasks.team_id AND t.user_id = ?)",
+        )
+        .bind(result)
+        .bind(now_ms())
+        .bind(task_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("task {task_id}")));
+        }
+        Ok(())
+    }
+
+    // ── Engagements ──────────────────────────────────────────────────
+
+    async fn create_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+        workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        let id = generate_id();
+        let now = now_ms();
+        // P2-1 ownership guard (fail closed): a `team_engagements` row is keyed
+        // on `team_id`, so reject before any write unless `user_id` owns that
+        // team. Mirrors the `create_task` ownership invariant (`NotFound`).
+        let owns: Option<i64> = sqlx::query_scalar("SELECT 1 FROM teams WHERE id = ? AND user_id = ?")
+            .bind(team_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if owns.is_none() {
+            return Err(DbError::NotFound(format!("team {team_id}")));
+        }
+        // ON CONFLICT DO NOTHING makes this idempotent under the unique
+        // (team_id, project_id) race; the read-back returns the winning row.
+        sqlx::query(
+            "INSERT INTO team_engagements (id, user_id, team_id, project_id, workspace, process, status, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 'hierarchical', 'active', ?, ?) \
+             ON CONFLICT (team_id, project_id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(team_id)
+        .bind(project_id)
+        .bind(workspace)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query_as::<_, TeamEngagementRow>(
+            "SELECT * FROM team_engagements WHERE user_id = ? AND team_id = ? AND project_id = ?",
+        )
+        .bind(user_id)
+        .bind(team_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("engagement for team {team_id} project {project_id}")))
+    }
+
+    async fn find_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamEngagementRow>(
+            "SELECT * FROM team_engagements WHERE user_id = ? AND team_id = ? AND project_id = ?",
+        )
+        .bind(user_id)
+        .bind(team_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn find_engagement_by_id(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamEngagementRow>("SELECT * FROM team_engagements WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(engagement_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    async fn list_engagements(&self, user_id: &str, team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError> {
+        let rows = sqlx::query_as::<_, TeamEngagementRow>(
+            "SELECT * FROM team_engagements WHERE user_id = ? AND team_id = ? ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .bind(team_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn find_or_create_engagement(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        project_id: &str,
+        workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        if let Some(engagement) = self.find_engagement(user_id, team_id, project_id).await? {
+            return Ok(engagement);
+        }
+        self.create_engagement(user_id, team_id, project_id, workspace).await
+    }
+
+    async fn update_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        process: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<(), DbError> {
+        // Dynamic SET mirrors `update_team`: only present columns are written,
+        // `updated_at` always advances. `updated_at` is unconditional, so the
+        // SET clause is never empty (no early `Ok(())` short-circuit).
+        let mut set_clauses = Vec::new();
+        if process.is_some() {
+            set_clauses.push("process = ?");
+        }
+        if status.is_some() {
+            set_clauses.push("status = ?");
+        }
+        set_clauses.push("updated_at = ?");
+        let sql = format!(
+            "UPDATE team_engagements SET {} WHERE id = ? AND user_id = ?",
+            set_clauses.join(", ")
+        );
+
+        let mut query = sqlx::query(&sql);
+        if let Some(process) = process {
+            query = query.bind(process);
+        }
+        if let Some(status) = status {
+            query = query.bind(status);
+        }
+        query = query.bind(now_ms());
+        query = query.bind(engagement_id);
+        query = query.bind(user_id);
+
+        let result = query.execute(&self.pool).await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("engagement {engagement_id}")));
+        }
+        Ok(())
+    }
+
+    async fn list_tasks_by_engagement(&self, user_id: &str, engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+        // SELECT * is fine: sqlx FromRow ignores the engagement_id column the
+        // row struct intentionally does not declare in Phase 1. The EXISTS
+        // guard scopes the read to the engagement's owning user (data isolation).
+        let rows = sqlx::query_as::<_, TeamTaskRow>(
+            "SELECT * FROM team_tasks \
+             WHERE engagement_id = ?1 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2) \
+             ORDER BY created_at ASC",
+        )
+        .bind(engagement_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_messages_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT * FROM mailbox \
+             WHERE engagement_id = ?1 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2) \
+             ORDER BY created_at ASC",
+        )
+        .bind(engagement_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn peek_unread_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at, engagement_id \
+             FROM mailbox \
+             WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(engagement_id)
+        .bind(to_agent_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, team_id, to_agent_id, from_agent_id, \
+                        type, content, summary, files, read, created_at, engagement_id \
+                 FROM mailbox \
+                 WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+                   AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+                 ORDER BY created_at ASC, id ASC"
+            );
+            let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql)
+                .bind(engagement_id)
+                .bind(to_agent_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            rows.extend(query.fetch_all(&self.pool).await?);
+        }
+        rows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(rows)
+    }
+
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        // Same `BEGIN IMMEDIATE` two-step as the team variant so concurrent
+        // readers of the same engagement cannot claim the same unread rows.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("PRAGMA read_uncommitted = false").execute(&mut *tx).await?;
+
+        let rows = sqlx::query_as::<_, MailboxMessageRow>(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at, engagement_id \
+             FROM mailbox \
+             WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+             ORDER BY created_at ASC",
+        )
+        .bind(engagement_id)
+        .bind(to_agent_id)
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !rows.is_empty() {
+            sqlx::query(
+                "UPDATE mailbox SET read = 1 \
+                 WHERE engagement_id = ? AND to_agent_id = ? AND read = 0 \
+                   AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?)",
+            )
+            .bind(engagement_id)
+            .bind(to_agent_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    async fn mark_read_batch_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        ids: &[String],
+    ) -> Result<(), DbError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for chunk in ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE mailbox SET read = 1 \
+                 WHERE engagement_id = ? AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?)"
+            );
+            let mut query = sqlx::query(&sql).bind(engagement_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            query.execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn get_history_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let limit_clause = if limit.is_some() { " LIMIT ?" } else { "" };
+        let sql = format!(
+            "SELECT id, team_id, to_agent_id, from_agent_id, \
+                    type, content, summary, files, read, created_at, engagement_id \
+             FROM mailbox \
+             WHERE engagement_id = ? AND to_agent_id = ? \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = mailbox.engagement_id AND e.user_id = ?) \
+             ORDER BY created_at ASC{limit_clause}"
+        );
+        let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql)
+            .bind(engagement_id)
+            .bind(to_agent_id)
+            .bind(user_id);
+        if let Some(limit) = limit {
+            query = query.bind(limit);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    async fn find_task_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamTaskRow>(
+            "SELECT * FROM team_tasks \
+             WHERE engagement_id = ?1 AND id = ?3 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2)",
+        )
+        .bind(engagement_id)
+        .bind(user_id)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    // ── Engagement members ───────────────────────────────────────────
+
+    async fn upsert_engagement_member(&self, row: &TeamEngagementMemberRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_engagement_members \
+                 (engagement_id, team_id, template_slot, slot_id, conversation_id, role, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT (engagement_id, template_slot) DO UPDATE SET \
+                 team_id = excluded.team_id, \
+                 slot_id = excluded.slot_id, \
+                 conversation_id = excluded.conversation_id, \
+                 role = excluded.role, \
+                 status = excluded.status, \
+                 updated_at = excluded.updated_at",
+        )
+        .bind(&row.engagement_id)
+        .bind(&row.team_id)
+        .bind(&row.template_slot)
+        .bind(&row.slot_id)
+        .bind(&row.conversation_id)
+        .bind(&row.role)
+        .bind(row.status.as_deref())
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_engagement_members(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Vec<TeamEngagementMemberRow>, DbError> {
+        // The EXISTS guard scopes the read to the engagement's owning user
+        // (data isolation), mirroring `list_tasks_by_engagement`.
+        let rows = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members \
+             WHERE engagement_id = ?1 \
+               AND EXISTS (SELECT 1 FROM team_engagements e WHERE e.id = ?1 AND e.user_id = ?2) \
+             ORDER BY created_at ASC",
+        )
+        .bind(engagement_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn get_engagement_member_by_slot(
+        &self,
+        engagement_id: &str,
+        slot_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        // Resolve by runtime `slot_id` (NOT `template_slot`); internal helper,
+        // so it is intentionally NOT ownership-checked.
+        let row = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members WHERE engagement_id = ? AND slot_id = ?",
+        )
+        .bind(engagement_id)
+        .bind(slot_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn get_engagement_member_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        // Internal resolve-by-key helper; intentionally NOT ownership-checked.
+        let row = sqlx::query_as::<_, TeamEngagementMemberRow>(
+            "SELECT * FROM team_engagement_members WHERE conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn delete_engagement_members_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        // Members carry no user_id; the EXISTS guard scopes the delete to rows
+        // whose team is owned by `user_id` (data isolation), mirroring
+        // `delete_mailbox_by_team` / `delete_tasks_by_team`. Must run BEFORE
+        // `delete_engagements_by_team` (FK to `team_engagements.id`).
+        sqlx::query(
+            "DELETE FROM team_engagement_members \
+             WHERE team_id = ? \
+               AND EXISTS (SELECT 1 FROM teams t WHERE t.id = team_engagement_members.team_id AND t.user_id = ?)",
+        )
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_engagements_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        // `team_engagements` owns a `user_id` column, so delete directly by
+        // (user_id, team_id) — fully scoped, no cross-team or cross-user reach.
+        sqlx::query("DELETE FROM team_engagements WHERE user_id = ? AND team_id = ?")
+            .bind(user_id)
+            .bind(team_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

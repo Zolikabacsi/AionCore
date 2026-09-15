@@ -3,12 +3,38 @@ use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 use aionui_db::{ActivityCursor, DbError, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
 use std::sync::Mutex;
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum EngagementResolveError {
+    /// Mirrors the trait default for test doubles that never wired engagement
+    /// CRUD: `find_or_create_engagement` reports the team/project as absent.
+    #[default]
+    NotFound,
+    /// A genuine repository failure (anything other than `NotFound`).
+    Other,
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
+pub enum EngagementLookup {
+    /// Mirrors the trait default stub: `find_engagement_by_id` reports the row
+    /// as absent (legacy / never-engaged teams and doubles that never wired it).
+    #[default]
+    Unimplemented,
+    /// A real miss: the row genuinely does not exist (`Ok(None)`).
+    Missing,
+    /// A row exists with the given `process` string.
+    Process(String),
+}
+
 #[derive(Default)]
 pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
     pub tasks: Vec<TeamTaskRow>,
     pub fail_message_writes: bool,
     pub fail_task_lists: bool,
+    /// Error kind returned by `find_or_create_engagement`.
+    pub engagement_resolve_error: EngagementResolveError,
+    /// How `find_engagement_by_id` answers the session-start process lookup.
+    pub engagement_lookup: EngagementLookup,
 }
 
 pub struct MockTeamRepo {
@@ -33,6 +59,14 @@ impl MockTeamRepo {
     ) {
         *self.peek_snapshot_tx.lock().unwrap() = Some(snapshot_tx);
         *self.peek_release_rx.lock().unwrap() = Some(release_rx);
+    }
+
+    pub fn set_engagement_resolve_error(&self, kind: EngagementResolveError) {
+        self.state.lock().unwrap().engagement_resolve_error = kind;
+    }
+
+    pub fn set_engagement_lookup(&self, lookup: EngagementLookup) {
+        self.state.lock().unwrap().engagement_lookup = lookup;
     }
 }
 
@@ -74,6 +108,50 @@ impl ITeamRepository for MockTeamRepo {
     }
     async fn delete_team(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
         Ok(())
+    }
+
+    // Engagement resolution is configurable so the session resolver's
+    // error-kind handling can be tested; the `NotFound` default reproduces the
+    // unimplemented trait behavior legacy single-project tests depend on.
+    async fn find_or_create_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        _workspace: &str,
+    ) -> Result<aionui_db::models::TeamEngagementRow, DbError> {
+        Err(match self.state.lock().unwrap().engagement_resolve_error {
+            EngagementResolveError::NotFound => DbError::NotFound("engagement not found".to_owned()),
+            EngagementResolveError::Other => DbError::Init("forced engagement failure".to_owned()),
+        })
+    }
+
+    async fn find_engagement_by_id(
+        &self,
+        _user_id: &str,
+        engagement_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamEngagementRow>, DbError> {
+        match self.state.lock().unwrap().engagement_lookup.clone() {
+            EngagementLookup::Unimplemented => {
+                Err(DbError::NotFound("find_engagement_by_id not implemented".to_owned()))
+            }
+            EngagementLookup::Missing => Ok(None),
+            EngagementLookup::Process(process) => Ok(Some(aionui_db::models::TeamEngagementRow {
+                id: engagement_id.to_owned(),
+                user_id: "u1".to_owned(),
+                team_id: "t1".to_owned(),
+                project_id: "proj".to_owned(),
+                workspace: String::new(),
+                process,
+                status: "active".to_owned(),
+                created_at: now_ms(),
+                updated_at: now_ms(),
+                folder_id: None,
+                origin: "user".to_owned(),
+                created_by_conversation_id: None,
+                reply_to: None,
+            })),
+        }
     }
 
     // ── Mailbox ─────────────────────────────────────────────────────
@@ -384,6 +462,70 @@ impl ITeamRepository for MockTeamRepo {
         self.state.lock().unwrap().tasks.retain(|t| t.team_id != team_id);
         Ok(())
     }
+
+    // Engagement-scoped runtime reads. Every mock session here is a legacy
+    // single-project team where the resolved engagement equals the team id, so
+    // each delegates to its team variant with the engagement id in the team
+    // slot — identical rows and ordering, barriers included.
+    async fn peek_unread_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.peek_unread(user_id, engagement_id, to_agent_id).await
+    }
+
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.peek_unread_by_ids(user_id, engagement_id, to_agent_id, ids).await
+    }
+
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.read_unread_and_mark(user_id, engagement_id, to_agent_id).await
+    }
+
+    async fn mark_read_batch_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        ids: &[String],
+    ) -> Result<(), DbError> {
+        self.mark_read_batch(user_id, engagement_id, ids).await
+    }
+
+    async fn get_history_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        to_agent_id: &str,
+        limit: Option<i64>,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        self.get_history(user_id, engagement_id, to_agent_id, limit).await
+    }
+
+    async fn find_task_by_engagement(
+        &self,
+        user_id: &str,
+        engagement_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        self.find_task_by_id(user_id, engagement_id, task_id).await
+    }
+
+    async fn list_tasks_by_engagement(&self, user_id: &str, engagement_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+        self.list_tasks(user_id, engagement_id).await
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +607,12 @@ pub(crate) mod workspace_harness {
 
     #[async_trait]
     impl IConversationRepository for MockConversationRepo {
+        async fn raw_query(&self, _sql: &str, _params: Vec<String>) -> Result<Vec<sqlx::sqlite::SqliteRow>, DbError> {
+            unimplemented!("raw_query is not exercised by aionui-team mocks")
+        }
+        async fn raw_execute(&self, _sql: &str, _params: Vec<String>) -> Result<u64, DbError> {
+            unimplemented!("raw_execute is not exercised by aionui-team mocks")
+        }
         async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
             Ok(self
                 .conversations
@@ -908,6 +1056,73 @@ pub(crate) mod workspace_harness {
         async fn delete_tasks_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
             Ok(())
         }
+
+        // Engagement-scoped runtime reads: every mock session here is a legacy
+        // single-project team (engagement == team id), so delegate to the team
+        // variant with the engagement id in the team slot.
+        async fn peek_unread_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.peek_unread(user_id, engagement_id, to_agent_id).await
+        }
+
+        async fn peek_unread_by_ids_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+            ids: &[String],
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.peek_unread_by_ids(user_id, engagement_id, to_agent_id, ids).await
+        }
+
+        async fn read_unread_and_mark_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.read_unread_and_mark(user_id, engagement_id, to_agent_id).await
+        }
+
+        async fn mark_read_batch_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            ids: &[String],
+        ) -> Result<(), DbError> {
+            self.mark_read_batch(user_id, engagement_id, ids).await
+        }
+
+        async fn get_history_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            to_agent_id: &str,
+            limit: Option<i64>,
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            self.get_history(user_id, engagement_id, to_agent_id, limit).await
+        }
+
+        async fn find_task_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+            task_id: &str,
+        ) -> Result<Option<TeamTaskRow>, DbError> {
+            self.find_task_by_id(user_id, engagement_id, task_id).await
+        }
+
+        async fn list_tasks_by_engagement(
+            &self,
+            user_id: &str,
+            engagement_id: &str,
+        ) -> Result<Vec<TeamTaskRow>, DbError> {
+            self.list_tasks(user_id, engagement_id).await
+        }
     }
 
     struct FakeConversationPorts {
@@ -1058,7 +1273,10 @@ pub(crate) mod workspace_harness {
             folder_id: Option<String>,
             workspace: Option<String>,
         ) -> Result<(), TeamError> {
-            let mut extra = self.repo.get_extra(conversation_id).unwrap_or_else(|| serde_json::json!({}));
+            let mut extra = self
+                .repo
+                .get_extra(conversation_id)
+                .unwrap_or_else(|| serde_json::json!({}));
             if let (Some(workspace), Some(obj)) = (workspace, extra.as_object_mut()) {
                 obj.insert("workspace".to_owned(), serde_json::Value::String(workspace));
                 obj.insert("custom_workspace".to_owned(), serde_json::Value::Bool(true));
@@ -1799,6 +2017,67 @@ pub(crate) mod workspace_harness {
             Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
         );
         (svc, team_repo, task_manager, conv_repo, broadcaster)
+    }
+
+    /// Build a [`TeamSessionService`] backed by a caller-supplied team repository
+    /// (e.g. a real `SqliteTeamRepository`, so `find_or_create_engagement` mints
+    /// distinct engagement ids for project-bound teams) wired to the same no-op
+    /// ports as the mock harness. Leader attach is driven by the fake conversation
+    /// port, so `ensure_session` succeeds without spawning real agent processes.
+    pub(crate) fn setup_with_team_repo(team_repo: Arc<dyn ITeamRepository>) -> Arc<TeamSessionService> {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster;
+        let conv_repo = Arc::new(MockConversationRepo::new());
+        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo));
+        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+        TeamSessionService::new(
+            team_repo,
+            Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            conversation_port,
+            projection_store,
+            broadcaster_dyn,
+            task_manager,
+            Arc::new(NoopTurnPort),
+            Arc::new(NoopCancellationPort),
+            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        )
+    }
+
+    /// Same wiring as [`setup_with_team_repo`] but also hands back the fake
+    /// conversation repo so destructive-path tests can assert which member
+    /// conversations a management op deleted / left intact.
+    pub(crate) fn setup_with_team_repo_and_conversation_repo(
+        team_repo: Arc<dyn ITeamRepository>,
+    ) -> (Arc<TeamSessionService>, Arc<MockConversationRepo>) {
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster;
+        let conv_repo = Arc::new(MockConversationRepo::new());
+        let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+        let conversation_port: Arc<dyn TeamConversationProvisioningPort> = conversation_ports.clone();
+        let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
+        let svc = TeamSessionService::new(
+            team_repo,
+            Arc::new(EmptyAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyAssistantDefinitionRepo),
+            Arc::new(EmptyAssistantOverlayRepo),
+            Arc::new(EmptyProviderRepo),
+            conversation_port,
+            projection_store,
+            broadcaster_dyn,
+            task_manager,
+            Arc::new(NoopTurnPort),
+            Arc::new(NoopCancellationPort),
+            Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        );
+        (svc, conv_repo)
     }
 
     pub(crate) async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {

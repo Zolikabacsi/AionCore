@@ -1,0 +1,29 @@
+[package]
+name = "aionui-delegate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-common.workspace = true
+aionui-conversation.workspace = true
+aionui-db.workspace = true
+aionui-ai-agent.workspace = true
+aionui-realtime.workspace = true
+aionui-auth.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower.workspace = true
+tempfile.workspace = true

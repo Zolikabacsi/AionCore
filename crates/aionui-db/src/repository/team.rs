@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamEngagementMemberRow, TeamEngagementRow, TeamRow, TeamTaskRow};
 
 /// Sort/paging direction for the activity feed cursor queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,4 +215,274 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Deletes all tasks belonging to a team.
     async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError>;
+
+    /// Stamps the `result` column of a task (additive capture at turn finalize;
+    /// Phase 3a task-context model). User-scoped: the row must belong to
+    /// `user_id`; returns `NotFound` otherwise. Default stub so non-SQLite test
+    /// doubles that never capture can skip it — mirrors `latest_message_of_type`.
+    async fn set_task_result(&self, _user_id: &str, _task_id: &str, _result: &str) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "set_task_result is not supported by this repository".into(),
+        ))
+    }
+
+    // ── Engagements ──────────────────────────────────────────────────
+    //
+    // Declared with default "not implemented" bodies so non-SQLite test doubles
+    // that don't exercise engagement CRUD still satisfy the trait; the real
+    // `SqliteTeamRepository` overrides every method and is authoritative.
+
+    /// Inserts a new engagement for a `(team, project)` pair. Fails with
+    /// `NotFound` unless `user_id` owns `team_id` (P2-1 ownership guard).
+    async fn create_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        _workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        Err(DbError::NotFound("create_engagement not implemented".to_string()))
+    }
+
+    /// Returns the engagement binding `team_id` to `project_id` owned by
+    /// `user_id`, or `None`. Scoped to `user_id` for data isolation.
+    async fn find_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
+        Err(DbError::NotFound("find_engagement not implemented".to_string()))
+    }
+
+    /// Returns the engagement identified by `engagement_id`, owned by `user_id`,
+    /// or `None`. Scoped to `user_id` for data isolation. Used to read the
+    /// engagement's `process` mode at session start (the id is already resolved,
+    /// so this is the by-primary-key counterpart to `find_engagement`).
+    async fn find_engagement_by_id(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+    ) -> Result<Option<TeamEngagementRow>, DbError> {
+        Err(DbError::NotFound("find_engagement_by_id not implemented".to_string()))
+    }
+
+    /// Returns all engagements for `user_id` in a team, oldest first.
+    async fn list_engagements(&self, _user_id: &str, _team_id: &str) -> Result<Vec<TeamEngagementRow>, DbError> {
+        Err(DbError::NotFound("list_engagements not implemented".to_string()))
+    }
+
+    /// Returns the engagement for `(team_id, project_id)`, creating it if absent.
+    /// Tolerant of the `uq_team_engagements_team_project` race.
+    async fn find_or_create_engagement(
+        &self,
+        _user_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+        _workspace: &str,
+    ) -> Result<TeamEngagementRow, DbError> {
+        Err(DbError::NotFound(
+            "find_or_create_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Updates an engagement's mutable lifecycle columns (`process`, `status`),
+    /// identified by `engagement_id` and scoped to `user_id` for data isolation.
+    /// Pass `None` to leave a column unchanged. `updated_at` always advances.
+    /// Returns `NotFound` when no row matches `(engagement_id, user_id)` — i.e.
+    /// a wrong/other-user id is a no-op surfaced as an error, never a silent
+    /// success. Invalid `process`/`status` values are rejected by the column
+    /// CHECK constraints and surface as a `DbError`.
+    async fn update_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _process: Option<&str>,
+        _status: Option<&str>,
+    ) -> Result<(), DbError> {
+        Err(DbError::NotFound("update_engagement not implemented".to_string()))
+    }
+
+    /// Returns all tasks bound to `engagement_id` owned by `user_id`, oldest
+    /// first. Scoped via the engagement's owner (`team_engagements.user_id`).
+    async fn list_tasks_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        Err(DbError::NotFound(
+            "list_tasks_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Returns all mailbox messages bound to `engagement_id` owned by `user_id`,
+    /// oldest first. Scoped via the engagement's owner (`team_engagements.user_id`).
+    async fn list_messages_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "list_messages_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    // ── Engagement-scoped runtime reads (Phase 2a Task 4b) ───────────────
+    //
+    // The session runtime must read ONLY the rows stamped with its own
+    // engagement, never every row in the team, so two projects' sessions of one
+    // team cannot observe each other's mail/tasks. These mirror the `team_id`
+    // read variants above but filter on `engagement_id`. Default bodies return
+    // `NotFound` (non-SQLite doubles that don't exercise them are unaffected);
+    // the real `SqliteTeamRepository` and the session mocks override them.
+    //
+    // For legacy single-engagement teams `engagement_id == team_id`, so these
+    // return the same rows the team-scoped variants would (no behavior change).
+
+    /// Engagement-scoped `peek_unread`: unread rows for `to_agent_id` bound to
+    /// `engagement_id`, ordered FIFO.
+    async fn peek_unread_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "peek_unread_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `peek_unread_by_ids`.
+    async fn peek_unread_by_ids_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+        _ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "peek_unread_by_ids_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `read_unread_and_mark`.
+    async fn read_unread_and_mark_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "read_unread_and_mark_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `mark_read_batch`.
+    async fn mark_read_batch_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _ids: &[String],
+    ) -> Result<(), DbError> {
+        Err(DbError::NotFound(
+            "mark_read_batch_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `get_history`.
+    async fn get_history_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _to_agent_id: &str,
+        _limit: Option<i64>,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "get_history_by_engagement not implemented".to_string(),
+        ))
+    }
+
+    /// Engagement-scoped `find_task_by_id`.
+    async fn find_task_by_engagement(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _task_id: &str,
+    ) -> Result<Option<TeamTaskRow>, DbError> {
+        Err(DbError::NotFound("find_task_by_engagement not implemented".to_string()))
+    }
+
+    // ── Engagement members (Phase 2b Task 1) ───────────────────────────
+    //
+    // Per-engagement member rows live in `team_engagement_members` (unique on
+    // `(engagement_id, template_slot)`). Default bodies return `NotFound` so
+    // non-SQLite doubles still satisfy the trait; the real
+    // `SqliteTeamRepository` overrides every method.
+
+    /// Inserts or updates a member row keyed on `(engagement_id, template_slot)`.
+    async fn upsert_engagement_member(&self, _row: &TeamEngagementMemberRow) -> Result<(), DbError> {
+        Err(DbError::NotFound(
+            "upsert_engagement_member not implemented".to_string(),
+        ))
+    }
+
+    /// Returns all member rows for `engagement_id` owned by `user_id`, oldest
+    /// first. Scoped via the engagement's owner (`team_engagements.user_id`).
+    async fn list_engagement_members(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+    ) -> Result<Vec<TeamEngagementMemberRow>, DbError> {
+        Err(DbError::NotFound("list_engagement_members not implemented".to_string()))
+    }
+
+    /// Resolves a member by `(engagement_id, slot_id)` (the runtime slot id).
+    ///
+    /// NOT ownership-checked: an internal resolve-by-key helper for use on
+    /// already-authorized paths only.
+    async fn get_engagement_member_by_slot(
+        &self,
+        _engagement_id: &str,
+        _slot_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        Err(DbError::NotFound(
+            "get_engagement_member_by_slot not implemented".to_string(),
+        ))
+    }
+
+    /// Resolves a member by `conversation_id`.
+    ///
+    /// NOT ownership-checked: an internal resolve-by-key helper for use on
+    /// already-authorized paths only.
+    async fn get_engagement_member_by_conversation(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<TeamEngagementMemberRow>, DbError> {
+        Err(DbError::NotFound(
+            "get_engagement_member_by_conversation not implemented".to_string(),
+        ))
+    }
+
+    /// Deletes every member row belonging to a team's engagements. Called by
+    /// `remove_team` BEFORE `delete_engagements_by_team` (the FK ceiling
+    /// `team_engagement_members.engagement_id -> team_engagements.id`), so a
+    /// removed team leaves no member-row leak. Scoped to `user_id` + `team_id`
+    /// (data isolation); a legacy team has no member rows and deletes cleanly.
+    /// Default `NotFound` so non-SQLite doubles that don't exercise teardown are
+    /// unaffected; `remove_team` treats the error as best-effort.
+    async fn delete_engagement_members_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
+        Err(DbError::NotFound(
+            "delete_engagement_members_by_team not implemented".to_string(),
+        ))
+    }
+
+    /// Deletes every engagement row bound to a team. Called by `remove_team`
+    /// AFTER `delete_engagement_members_by_team`. A legacy team's single default
+    /// engagement (id == team_id, minted by the 045 backfill) is removed with the
+    /// team, which is correct. Scoped to `user_id` + `team_id` (data isolation).
+    async fn delete_engagements_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
+        Err(DbError::NotFound(
+            "delete_engagements_by_team not implemented".to_string(),
+        ))
+    }
 }
