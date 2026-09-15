@@ -22,8 +22,11 @@ delegation: any agent whose `allow_delegation = 1` can address any other.
    variable.
 5. Commands must directly call `"$AIONUI_HELPER_BIN" delegate ...`. Pass
    payloads through stdin heredocs. Do not write payload JSON files to disk.
-6. If the current conversation belongs to a team, do NOT use this skill —
-   use `team send-message` instead.
+6. Team members: coordinate INSIDE your team with team tasks and
+   `team send-message`. This skill is for work outside your team — you MAY
+   dispatch to ANOTHER team's engagement (name the team in `to`) or to any
+   delegating agent. Cross-team loops are stopped server-side: a
+   `cycle_detected` or `depth_exceeded` response means stop (Rules 7/9).
 7. On `rate_limited`, STOP delivering. The two agents are spinning
    against each other. Tell the user, do not retry.
 8. Word results precisely. `delivered` means "delivered to the target's

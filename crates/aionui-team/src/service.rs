@@ -50,7 +50,7 @@ use crate::ports::{
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
-use crate::result_delivery::{DelegatedResultDelivery, delegated_result_metadata};
+use crate::result_delivery::{DelegatedResultDelivery, delegated_depth_from_metadata, delegated_result_metadata};
 use crate::runtime_tools::{
     ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
 };
@@ -911,10 +911,13 @@ impl TeamSessionService {
     ///
     /// `reply_to` (the delegating caller conversation from the 4a envelope) is
     /// correlated onto the ROOT task's `metadata` as
-    /// `{delegate_reply_to, engagement_id}` so the Phase 3a result-capture hook
-    /// can return the consolidated result to the caller without a second
-    /// lookup (spec §8, Phase 4b ruling 1). No reply target → no metadata →
-    /// the completion path is byte-identical to Phase 3a.
+    /// `{delegate_reply_to, engagement_id, delegate_depth}` so the Phase 3a
+    /// result-capture hook can return the consolidated result to the caller
+    /// without a second lookup (spec §8, Phase 4b ruling 1) and so a later
+    /// engagement hop resumes the caller's depth budget (Phase 4c, spec §5.9).
+    /// `depth` is the caller's current chain depth (0 for a top-level user
+    /// dispatch); it is persisted only alongside a reply target, so a no-reply
+    /// convene stays metadata-free and byte-identical to Phase 3a.
     #[allow(clippy::too_many_arguments)]
     pub async fn convene_delegated_task(
         &self,
@@ -926,6 +929,7 @@ impl TeamSessionService {
         expected_output: Option<&str>,
         envelope_payload: &str,
         reply_to: Option<&str>,
+        depth: u32,
     ) -> Result<TeamEngagementConvened, TeamError> {
         self.load_owned_team_row(user_id, team_id).await?;
         let engagement = self.ensure_engagement(user_id, team_id, project_id).await?;
@@ -943,7 +947,7 @@ impl TeamSessionService {
         let task = TaskBoard::new_for_user(self.repo.clone(), user_id)
             .with_events(emitter.clone())
             .with_engagement(engagement.id.clone())
-            .with_task_metadata(reply_to.map(|reply_to| delegated_result_metadata(reply_to, &engagement.id)))
+            .with_task_metadata(reply_to.map(|reply_to| delegated_result_metadata(reply_to, &engagement.id, depth)))
             .create_task(
                 team_id,
                 subject,
@@ -989,6 +993,136 @@ impl TeamSessionService {
             root_task_id: task.id,
             lead_slot_id: lead.slot_id.clone(),
         })
+    }
+
+    /// Cross-engagement cycle predicate (Phase 4c, spec §5.9): is
+    /// `conversation_id` already a member of `team_id`'s engagement for
+    /// `project_id`? Used by the delegating side to reject a caller that is
+    /// dispatching back into an engagement it already belongs to (`CycleDetected`).
+    ///
+    /// Resolves the target engagement with the SAME `ensure_engagement` the
+    /// convene path uses (so the `__none__` sentinel / project→default mapping is
+    /// shared, not forked) — which also ownership-checks `team_id` for `user_id`
+    /// — then compares the caller conversation's member row's engagement id. A
+    /// foreign user's member conversation resolves to a distinct engagement id,
+    /// so it is never reported as a member here (user-scoped) without a second
+    /// repo lookup. Read-only beyond the idempotent engagement/member
+    /// materialization `ensure_engagement` already performs.
+    pub async fn conversation_is_member_of_engagement(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        team_id: &str,
+        project_id: &str,
+    ) -> Result<bool, TeamError> {
+        let engagement = self.ensure_engagement(user_id, team_id, project_id).await?;
+        let member = self.repo.get_engagement_member_by_conversation(conversation_id).await?;
+        Ok(member.is_some_and(|member| member.engagement_id == engagement.id))
+    }
+
+    /// Current delegation-chain depth of `conversation_id` as a convened
+    /// engagement member (Phase 4c sender inversion, spec §5.9): the max
+    /// `delegate_depth` persisted on the engagement's delegated root tasks
+    /// (an engagement may serve several callers; the max is the conservative
+    /// bound — it can only OVER-count a hop, never let a loop slip past
+    /// `MAX_DEPTH`). `0` for a conversation that is not an engagement member
+    /// and for engagements with no delegated root: such a sender is its own
+    /// chain root. Read-only; the caller (delegate dispatch) has already
+    /// user-scoped the conversation, and the task read is engagement-owner
+    /// scoped via `list_tasks_by_engagement`.
+    pub async fn conversation_current_depth(&self, user_id: &str, conversation_id: &str) -> Result<u32, TeamError> {
+        let Some(member) = self.repo.get_engagement_member_by_conversation(conversation_id).await? else {
+            return Ok(0);
+        };
+        let tasks = self
+            .repo
+            .list_tasks_by_engagement(user_id, &member.engagement_id)
+            .await?;
+        Ok(tasks
+            .iter()
+            .map(|task| {
+                let metadata = task.metadata.as_ref().and_then(|raw| serde_json::from_str(raw).ok());
+                delegated_depth_from_metadata(metadata.as_ref())
+            })
+            .max()
+            .unwrap_or(0))
+    }
+
+    /// Whether `conversation_id` is a TEAM-MEMBER (engagement-owned) conversation,
+    /// returning the `(engagement_id, slot_id, team_id)` needed to deliver a
+    /// delegated child result back into that member's engagement (Phase 4c
+    /// final-fix, spec §8/§10). The app result-delivery adapter uses this to
+    /// choose the team mailbox over the user/assistant `send_message` write —
+    /// which rejects team-owned conversations — so a convene whose `reply_to` is
+    /// a team member actually lands. `Ok(None)` for a user/assistant (non-member)
+    /// caller, which keeps the existing `send_message` path byte-identical.
+    pub async fn delegated_parent_member(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, String, String)>, TeamError> {
+        Ok(self
+            .repo
+            .get_engagement_member_by_conversation(conversation_id)
+            .await?
+            .map(|member| (member.engagement_id, member.slot_id, member.team_id)))
+    }
+
+    /// App-adapter entrypoint for §10's team-parent return: deliver a delegated
+    /// child engagement's consolidated result into a TEAM-MEMBER parent slot's
+    /// engagement mailbox, mirroring how the 4a convene enqueues the caller
+    /// envelope (`Mailbox::write`, `from = "user"`, engagement-pinned) — so the
+    /// row lands with or without a live runtime — and then best-effort WAKE the
+    /// parent's running event loop so it acts on the result now rather than only
+    /// on its next drain. Ownership is enforced by `load_owned_team_row` (a
+    /// foreign/absent team surfaces as `TeamNotFound`, existence is never
+    /// leaked). Team-internal only — no conversation / delegate coupling; the
+    /// send_message-vs-mailbox routing decision lives in the app adapter.
+    ///
+    /// §10: the write is user-scoped to the parent's own engagement; if the
+    /// parent is gone (team not owned / engagement torn down) the mailbox row is
+    /// still the durable "store" and the caller's wake is a no-op — the result
+    /// already stays on the child task regardless, so there is never an orphan
+    /// post into a foreign conversation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn deliver_child_result(
+        &self,
+        user_id: &str,
+        parent_engagement_id: &str,
+        parent_slot_id: &str,
+        parent_team_id: &str,
+        envelope: &str,
+        subject: Option<&str>,
+    ) -> Result<(), TeamError> {
+        self.load_owned_team_row(user_id, parent_team_id).await?;
+        let emitter = Arc::new(TeamEventEmitter::new(
+            parent_team_id.to_owned(),
+            user_id.to_owned(),
+            self.broadcaster.clone(),
+        ));
+        Mailbox::new_for_user(self.repo.clone(), user_id)
+            .with_events(emitter)
+            .with_engagement(parent_engagement_id.to_owned())
+            .write(
+                parent_team_id,
+                parent_slot_id,
+                "user",
+                MailboxMessageType::Message,
+                envelope,
+                subject,
+            )
+            .await?;
+        // Best-effort wake: only meaningful while the parent's session is live
+        // (the normal case — the member delegated from its own running turn).
+        // A dormant/torn-down parent keeps the persisted row for its next drain.
+        if let Some(session) = self
+            .sessions
+            .get(parent_engagement_id)
+            .map(|entry| Arc::clone(&entry.session))
+            .filter(|session| session.user_id() == user_id)
+        {
+            session.wake_slot_for_delivery(parent_slot_id).await;
+        }
+        Ok(())
     }
 
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {

@@ -1047,12 +1047,16 @@ pub fn build_team_state(
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
     service.with_user_order_store(services.user_order_store.clone());
     // Phase 4b §8: a convened engagement's root-task result returns to the
-    // delegating caller through the app's conversation write.
+    // delegating caller through the app's conversation write. Phase 4c
+    // final-fix: when that caller is a TEAM MEMBER, the adapter routes the
+    // result into the member's engagement mailbox (via the team seam) instead of
+    // the team-rejecting `send_message`, so a team-parent result actually lands.
     service.with_result_delivery(Arc::new(
         crate::router::team_result_delivery::DelegatedResultDeliveryAdapter::new(
             services.conversation_service.clone(),
             services.worker_task_manager.clone(),
-        ),
+        )
+        .with_team_service(&service),
     ));
     TeamRouterState {
         service,

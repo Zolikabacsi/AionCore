@@ -41,7 +41,6 @@ pub(crate) fn data() -> Value {
             "ambiguous_target",
             "delegation_disabled_for_target",
             "delegation_disabled_for_sender",
-            "sender_is_team",
             "target_is_self",
             "reply_target_not_owned",
             "cycle_detected",

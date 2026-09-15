@@ -27,6 +27,10 @@ pub struct ConveneRootTask<'a> {
     pub subject: &'a str,
     pub description: &'a str,
     pub expected_output: Option<&'a str>,
+    /// Caller's current delegation-chain depth, threaded across the engagement
+    /// boundary so the seam can persist it and the lead's onward hop increment
+    /// it (Phase 4c, spec §5.9). `0` for a top-level user dispatch.
+    pub depth: u32,
 }
 
 /// Identifiers of the convened engagement, returned to the dispatch site.
@@ -50,6 +54,38 @@ pub trait TeamEngagementBridge: Send + Sync {
         root: ConveneRootTask<'_>,
         envelope: &DelegateEnvelopeBlock,
     ) -> Result<ConvenedEngagement, BridgeError>;
+
+    /// Cross-engagement cycle predicate (Phase 4c, spec §5.9): is
+    /// `conversation_id` (the caller about to dispatch) already a member of
+    /// `team_id`'s engagement for `project_id`? The dispatch site calls this
+    /// BEFORE convening and rejects a `true` with `CycleDetected`.
+    ///
+    /// Answered team-side via the composition adapter over the existing
+    /// `ITeamRepository::get_engagement_member_by_conversation` (no
+    /// delegate→team Cargo dep). The default `Ok(false)` keeps a bridge that
+    /// has not wired the resolution (Noop, non-team builds, existing doubles)
+    /// from ever reporting a cycle, so the additions are inert until Task 2.
+    async fn conversation_is_member_of_engagement(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _team_id: &str,
+        _project_id: &str,
+    ) -> Result<bool, BridgeError> {
+        Ok(false)
+    }
+
+    /// Server-side current delegation-chain depth of `conversation_id` when it
+    /// is a convened engagement member (Phase 4c, spec §5.9): the
+    /// `delegate_depth` persisted on the engagement's delegated root task(s).
+    /// A team-member onward dispatch must derive its depth from this instead
+    /// of the agent-supplied `req.depth` (a debug aid an LLM can drop or
+    /// lie about, which would let a loop slip past `MAX_DEPTH`). `Ok(0)` when
+    /// the conversation is not a convened member — it is its own chain root —
+    /// and as the trait default, so unwired doubles never shift depths.
+    async fn conversation_current_depth(&self, _user_id: &str, _conversation_id: &str) -> Result<u32, BridgeError> {
+        Ok(0)
+    }
 }
 
 /// Default double: the bridge is never wired for unit tests / non-team builds.
@@ -201,6 +237,7 @@ mod tests {
                     subject: "do the thing",
                     description: "",
                     expected_output: None,
+                    depth: 0,
                 },
                 &DelegateEnvelopeBlock {
                     kind: DelegateEnvelopeKind::Dispatch,
