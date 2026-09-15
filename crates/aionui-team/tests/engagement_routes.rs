@@ -29,7 +29,7 @@ use aionui_api_types::{
     CreateTeamRequest, GetConfigOptionsResponse, TeamAgentInput, TeamMcpSelection, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, TimestampMs};
-use aionui_db::models::{MessageRow, TeamEngagementMemberRow};
+use aionui_db::models::{MailboxMessageRow, MessageRow, TeamEngagementMemberRow, TeamTaskRow};
 use aionui_db::{
     ITeamRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteProjectStore, SqliteProviderRepository, SqliteTeamRepository,
@@ -574,4 +574,216 @@ async fn patch_unknown_engagement_is_not_found() {
         matches!(err, TeamError::TeamNotFound(_)),
         "unknown engagement must 404, got {err:?}"
     );
+}
+
+// ── engagement-scoped reads (members / tasks / mailbox) — Phase 5a Task 3 ────
+//
+// The point of the whole feature (spec §12): two engagements of ONE team must
+// never see each other's rows through the engagement-scoped reads. Every read
+// route goes through the SAME `load_owned_engagement` guard as the PATCH, so a
+// cross-team or cross-user `:engagement_id` is `TeamNotFound` before any row is
+// touched. Assertions compare SPECIFIC per-engagement ids (not just "non-empty")
+// so a shared-row leak fails the test.
+
+impl Harness {
+    /// Seeds one task on `engagement`'s board (with expected_output + result).
+    async fn seed_task(&self, user: &str, team_id: &str, engagement: &str, task_id: &str) {
+        self.repo
+            .create_task(
+                user,
+                &TeamTaskRow {
+                    id: task_id.into(),
+                    team_id: team_id.into(),
+                    subject: format!("task for {engagement}"),
+                    description: None,
+                    status: "pending".into(),
+                    owner: None,
+                    blocked_by: "[]".into(),
+                    blocks: "[]".into(),
+                    metadata: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    engagement_id: Some(engagement.into()),
+                    expected_output: Some(format!("expected of {task_id}")),
+                    result: Some(format!("result of {task_id}")),
+                    input_context: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds one mailbox message on `engagement`.
+    async fn seed_message(&self, user: &str, team_id: &str, engagement: &str, msg_id: &str) {
+        self.repo
+            .write_message(
+                user,
+                &MailboxMessageRow {
+                    id: msg_id.into(),
+                    team_id: team_id.into(),
+                    to_agent_id: format!("to-{engagement}"),
+                    from_agent_id: "lead".into(),
+                    msg_type: "message".into(),
+                    content: format!("mail for {engagement}"),
+                    summary: None,
+                    files: None,
+                    read: false,
+                    created_at: 1,
+                    engagement_id: Some(engagement.into()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Team engaged in two projects; returns the two engagement ids.
+    async fn two_engagements(&self, user: &str, name: &str) -> (String, String, String) {
+        let team = self.create_team(user, name).await;
+        let p1 = self.create_project(user).await;
+        let p2 = self.create_project(user).await;
+        let e1 = self.svc.ensure_engagement(user, &team.id, &p1).await.unwrap();
+        let e2 = self.svc.ensure_engagement(user, &team.id, &p2).await.unwrap();
+        assert_ne!(e1.id, e2.id, "two projects yield two distinct engagements");
+        (team.id, e1.id, e2.id)
+    }
+}
+
+#[tokio::test]
+async fn members_are_isolated_per_engagement() {
+    let user = "user-read-members";
+    let h = Harness::new(user).await;
+    let (team, e1, e2) = h.two_engagements(user, "IsoMembers").await;
+
+    let m1 = h.svc.list_engagement_members(user, &team, &e1).await.unwrap();
+    let m2 = h.svc.list_engagement_members(user, &team, &e2).await.unwrap();
+    assert!(!m1.is_empty() && !m2.is_empty(), "each engagement has members");
+
+    // e1's rows must be exactly e1's; none of e2's slot/conversation ids leak in.
+    let c1: std::collections::HashSet<_> = m1.iter().map(|m| m.conversation_id.clone()).collect();
+    let c2: std::collections::HashSet<_> = m2.iter().map(|m| m.conversation_id.clone()).collect();
+    let s1: std::collections::HashSet<_> = m1.iter().map(|m| m.slot_id.clone()).collect();
+    let s2: std::collections::HashSet<_> = m2.iter().map(|m| m.slot_id.clone()).collect();
+    assert!(
+        c1.is_disjoint(&c2),
+        "e1 and e2 conversation_ids must be disjoint: {c1:?} vs {c2:?}"
+    );
+    assert!(
+        s1.is_disjoint(&s2),
+        "e1 and e2 slot_ids must be disjoint: {s1:?} vs {s2:?}"
+    );
+
+    // Cross-check against the raw repo: each route returns ONLY its engagement.
+    let e1_convos = h.engagement_members(user, &e1).await;
+    assert_eq!(
+        c1,
+        e1_convos.iter().map(|r| r.conversation_id.clone()).collect(),
+        "e1 members route returns exactly e1's rows"
+    );
+}
+
+#[tokio::test]
+async fn tasks_are_isolated_per_engagement_and_include_expected_output_result() {
+    let user = "user-read-tasks";
+    let h = Harness::new(user).await;
+    let (team, e1, e2) = h.two_engagements(user, "IsoTasks").await;
+    h.seed_task(user, &team, &e1, "task-e1").await;
+    h.seed_task(user, &team, &e2, "task-e2").await;
+
+    let t1 = h.svc.list_engagement_tasks(user, &team, &e1).await.unwrap();
+    let t2 = h.svc.list_engagement_tasks(user, &team, &e2).await.unwrap();
+
+    assert_eq!(
+        t1.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        vec!["task-e1".to_string()],
+        "e1 tasks returns ONLY e1's task"
+    );
+    assert_eq!(
+        t2.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        vec!["task-e2".to_string()],
+        "e2 tasks returns ONLY e2's task"
+    );
+    // The engagement-scoped projection carries expected_output + result.
+    assert_eq!(t1[0].expected_output.as_deref(), Some("expected of task-e1"));
+    assert_eq!(t1[0].result.as_deref(), Some("result of task-e1"));
+}
+
+#[tokio::test]
+async fn mailbox_is_isolated_per_engagement() {
+    let user = "user-read-mailbox";
+    let h = Harness::new(user).await;
+    let (team, e1, e2) = h.two_engagements(user, "IsoMailbox").await;
+    h.seed_message(user, &team, &e1, "mail-e1").await;
+    h.seed_message(user, &team, &e2, "mail-e2").await;
+
+    let m1 = h.svc.list_engagement_mailbox(user, &team, &e1).await.unwrap();
+    let m2 = h.svc.list_engagement_mailbox(user, &team, &e2).await.unwrap();
+    assert_eq!(
+        m1.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        vec!["mail-e1".to_string()],
+        "e1 mailbox returns ONLY e1's message"
+    );
+    assert_eq!(
+        m2.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        vec!["mail-e2".to_string()],
+        "e2 mailbox returns ONLY e2's message"
+    );
+}
+
+#[tokio::test]
+async fn empty_engagement_reads_return_empty_lists() {
+    let user = "user-read-empty";
+    let h = Harness::new(user).await;
+    let (team, e1, _) = h.two_engagements(user, "EmptyReads").await;
+    // No tasks/mailbox seeded on e1.
+    assert!(h.svc.list_engagement_tasks(user, &team, &e1).await.unwrap().is_empty());
+    assert!(
+        h.svc
+            .list_engagement_mailbox(user, &team, &e1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn reads_reject_cross_user_and_foreign_team_engagement_id() {
+    let owner = "user-read-owner";
+    let attacker = "user-read-attacker";
+    let h = Harness::new(owner).await;
+    let (team, e1, _) = h.two_engagements(owner, "GuardedReads").await;
+    h.seed_task(owner, &team, &e1, "task-e1").await;
+
+    // Cross-user: attacker reads the victim's engagement under the victim's team.
+    for err in [
+        h.svc.list_engagement_members(attacker, &team, &e1).await.unwrap_err(),
+        h.svc.list_engagement_tasks(attacker, &team, &e1).await.unwrap_err(),
+        h.svc.list_engagement_mailbox(attacker, &team, &e1).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, TeamError::TeamNotFound(_)),
+            "cross-user read must 404, got {err:?}"
+        );
+    }
+
+    // Foreign team: same user, a different team id than the engagement's owner.
+    let other_team = h.create_team(owner, "Other").await;
+    for err in [
+        h.svc
+            .list_engagement_members(owner, &other_team.id, &e1)
+            .await
+            .unwrap_err(),
+        h.svc
+            .list_engagement_tasks(owner, &other_team.id, &e1)
+            .await
+            .unwrap_err(),
+        h.svc
+            .list_engagement_mailbox(owner, &other_team.id, &e1)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, TeamError::TeamNotFound(_)),
+            "engagement id bound to a foreign :id team must 404, got {err:?}"
+        );
+    }
 }

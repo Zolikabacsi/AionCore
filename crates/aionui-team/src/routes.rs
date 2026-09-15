@@ -14,9 +14,9 @@ use aionui_api_types::{
     CreateTeamRequest, GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest,
     RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest,
     SetConfigOptionResponse, SetModeRequest, SetModelRequest, TeamActivityPageResponse, TeamAgentResponse,
-    TeamContextResetAvailability, TeamContextResetResponse, TeamEngagement, TeamInterruptAgentResponse,
-    TeamListResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
-    TeamTaskResponse, UpdateEngagementRequest, UpdateTeamProjectRequest,
+    TeamContextResetAvailability, TeamContextResetResponse, TeamEngagement, TeamEngagementMember,
+    TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamTaskResponse, UpdateEngagementRequest, UpdateTeamProjectRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -217,6 +217,18 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route(
             "/api/teams/{id}/engagements/{engagement_id}",
             axum::routing::patch(update_engagement),
+        )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}/members",
+            get(list_engagement_members),
+        )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}/tasks",
+            get(list_engagement_tasks),
+        )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}/mailbox",
+            get(list_engagement_mailbox),
         )
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -493,6 +505,48 @@ async fn update_engagement(
         )
         .await?;
     Ok(Json(ApiResponse::ok(engagement)))
+}
+
+/// Engagement-scoped members. Same ownership+team-binding guard as the PATCH
+/// route (service `load_owned_engagement`). Read-only → no CSRF.
+async fn list_engagement_members(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+) -> Result<Json<ApiResponse<Vec<TeamEngagementMember>>>, ApiError> {
+    let members = state
+        .service
+        .list_engagement_members(&user.id, &params.id, &params.engagement_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(members)))
+}
+
+/// Engagement-scoped tasks. Same guard; engagement-scoped `list_tasks`
+/// projection. Read-only → no CSRF.
+async fn list_engagement_tasks(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+) -> Result<Json<ApiResponse<Vec<TeamTaskResponse>>>, ApiError> {
+    let tasks = state
+        .service
+        .list_engagement_tasks(&user.id, &params.id, &params.engagement_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(tasks)))
+}
+
+/// Engagement-scoped mailbox. Same guard; same `TeamMailboxMessageResponse`
+/// shape as the team-scoped route, scoped to one engagement's rows.
+async fn list_engagement_mailbox(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+) -> Result<Json<ApiResponse<Vec<TeamMailboxMessageResponse>>>, ApiError> {
+    let messages = state
+        .service
+        .list_engagement_mailbox(&user.id, &params.id, &params.engagement_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(messages)))
 }
 
 #[derive(serde::Deserialize)]
