@@ -799,6 +799,104 @@ impl TeamSessionService {
         })
     }
 
+    /// Engagement-scoped twin of [`list_team_activity`]: identical clamp / merge /
+    /// cursor / `has_more` semantics, but bound to one engagement's rows.
+    /// Ownership runs FIRST via the SAME `load_owned_engagement` guard the Phase 5a
+    /// engagement routes use — team `:id` must be owned by the caller AND
+    /// `engagement_id` must resolve (user-scoped) to that team; a foreign/cross-user
+    /// id surfaces as `TeamNotFound` (404), existence never leaked. Reads go
+    /// through `list_messages_by_engagement_paged` / `list_tasks_by_engagement_paged`
+    /// (c4f98f9d).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_engagement_activity(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        engagement_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        kind: ActivityKind,
+        limit: i64,
+    ) -> Result<TeamActivityPageResponse, TeamError> {
+        self.load_owned_engagement(user_id, team_id, engagement_id).await?;
+        let limit = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+
+        let (mut items, mailbox_full, tasks_full) = match kind {
+            ActivityKind::Message => {
+                let rows = self
+                    .repo
+                    .list_messages_by_engagement_paged(user_id, engagement_id, cursor.clone(), direction, limit)
+                    .await?;
+                let full = rows.len() as i64 == limit;
+                (
+                    rows.iter().map(message_row_to_activity_item).collect::<Vec<_>>(),
+                    full,
+                    false,
+                )
+            }
+            ActivityKind::Task => {
+                let rows = self
+                    .repo
+                    .list_tasks_by_engagement_paged(user_id, engagement_id, cursor.clone(), direction, limit)
+                    .await?;
+                let full = rows.len() as i64 == limit;
+                (
+                    rows.iter().filter_map(task_row_to_activity_item).collect::<Vec<_>>(),
+                    false,
+                    full,
+                )
+            }
+            ActivityKind::All => {
+                let msgs = self
+                    .repo
+                    .list_messages_by_engagement_paged(user_id, engagement_id, cursor.clone(), direction, limit)
+                    .await?;
+                let tasks = self
+                    .repo
+                    .list_tasks_by_engagement_paged(user_id, engagement_id, cursor.clone(), direction, limit)
+                    .await?;
+                let mailbox_full = msgs.len() as i64 == limit;
+                let tasks_full = tasks.len() as i64 == limit;
+                let mut merged: Vec<_> = msgs
+                    .iter()
+                    .map(message_row_to_activity_item)
+                    .chain(tasks.iter().filter_map(task_row_to_activity_item))
+                    .collect();
+                sort_activity_items(&mut merged, direction);
+                (merged, mailbox_full, tasks_full)
+            }
+        };
+
+        // Truncate to the top `limit`; whether we cut anything feeds `has_more`.
+        let truncated = items.len() as i64 > limit;
+        items.truncate(limit as usize);
+
+        let has_more = mailbox_full || tasks_full || truncated;
+        let next_cursor = if has_more {
+            items.last().map(|i| TeamActivityCursor {
+                ts: i.created_at,
+                id: i.id.clone(),
+            })
+        } else {
+            None
+        };
+
+        info!(
+            kind = "team",
+            team_id,
+            engagement_id,
+            count = items.len(),
+            first_page = cursor.is_none(),
+            "engagement activity listed"
+        );
+
+        Ok(TeamActivityPageResponse {
+            items,
+            next_cursor,
+            has_more,
+        })
+    }
+
     pub async fn renew_active_lease(
         &self,
         user_id: &str,

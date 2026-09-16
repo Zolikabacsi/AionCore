@@ -230,6 +230,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             "/api/teams/{id}/engagements/{engagement_id}/mailbox",
             get(list_engagement_mailbox),
         )
+        .route(
+            "/api/teams/{id}/engagements/{engagement_id}/activity",
+            get(list_engagement_activity),
+        )
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
         .route(
@@ -547,6 +551,35 @@ async fn list_engagement_mailbox(
         .list_engagement_mailbox(&user.id, &params.id, &params.engagement_id)
         .await?;
     Ok(Json(ApiResponse::ok(messages)))
+}
+
+/// Engagement-scoped unified activity feed. Same guard as the other engagement
+/// routes; same `TeamActivityPageResponse` shape and `ActivityFeedQuery` parsing
+/// (direction/kind/limit/cursor) as the team-scoped `list_activity`, but bound to
+/// one engagement's rows. Read-only → no CSRF.
+async fn list_engagement_activity(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<EngagementPathParams>,
+    Query(query): Query<ActivityFeedQuery>,
+) -> Result<Json<ApiResponse<TeamActivityPageResponse>>, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT);
+    let direction = parse_direction(query.direction.as_deref());
+    let kind = parse_kind(query.kind.as_deref());
+    let cursor = build_cursor(query.cursor_ts, query.cursor_id.clone());
+    let page = state
+        .service
+        .list_engagement_activity(
+            &user.id,
+            &params.id,
+            &params.engagement_id,
+            cursor,
+            direction,
+            kind,
+            limit,
+        )
+        .await?;
+    Ok(Json(ApiResponse::ok(page)))
 }
 
 #[derive(serde::Deserialize)]
