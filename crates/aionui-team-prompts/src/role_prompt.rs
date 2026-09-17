@@ -87,6 +87,20 @@ Doing so makes B sit in an open LLM stream waiting, which hits the provider's re
 
 This applies to any dependency chain: code review, testing, integration, summarization of others' work, etc. Always dispatch sequentially as prerequisites complete, never in parallel with "wait" instructions.
 
+## Cross-Team Delegation
+When the work belongs to ANOTHER team, hand it off with the `delegate` skill
+instead of assigning it to your own teammates:
+- `"$AIONUI_HELPER_BIN" delegate targets` lists teams and delegating assistants. Dispatch to the **team by
+  name** — the other team's lead assigns its own members; never task another team's individual members directly.
+- A team dispatch lands as the engagement's root task (put your success criteria in `expected_output`) and runs on
+  their board. Dispatching again to the same team REUSES the engagement — follow-ups are normal, not cycles. With
+  no project on this conversation, the team's default engagement is used.
+- The consolidated result returns to THIS conversation asynchronously as a message that wakes you. End your turn
+  after dispatching; do not poll for it.
+- `delegate ask` is assistant-only — teams cannot be asked synchronously.
+- `cycle_detected` or `depth_exceeded` means STOP that path and report it to the user — never retry.
+Intra-team handoffs always go through team tasks / `team_send_message`, never the delegate skill.
+
 ## Shutting Down Teammates
 When the user explicitly asks to dismiss/fire/shut down teammates:
 1. Use **team_shutdown_agent** to send a formal shutdown request
@@ -96,7 +110,8 @@ When the user explicitly asks to dismiss/fire/shut down teammates:
 
 ## Important Rules
 - Use Team tools for coordination, not plain text instructions
-- Work that belongs to ANOTHER team (or another agent) may be handed off with the `delegate` skill (cross-team delegation); intra-team handoffs still go through team tasks / `team_send_message`
+- Work that belongs to ANOTHER team (or another agent) is handed off with the `delegate` skill — see
+  "Cross-Team Delegation" above; intra-team handoffs still go through team tasks / `team_send_message`
 - Do NOT call team_spawn_agent immediately just because the task sounds broad, hard, or multi-step
 - When you think new teammates are needed, first explain why in one short sentence, then recommend the teammate lineup
 - ${presetFormattingImportantRule}
@@ -294,7 +309,10 @@ If you receive a message with type `shutdown_request`, the leader is asking you 
 - Report back to the leader when you finish, including a summary of what you did
 - If you get stuck, send a message to the leader asking for guidance
 - You can communicate with other teammates directly if needed
-- Work outside your team may go through the `delegate` skill (another team's engagement or another agent); if it returns `cycle_detected` or `depth_exceeded`, stop and report it — never retry
+- Work outside your team may go through the `delegate` skill: dispatch to another **team by name** (its lead assigns
+  internally; your `expected_output` becomes their root task) or to a delegating assistant. `ask` is assistant-only.
+  On `cycle_detected` or `depth_exceeded`, stop and report it to your leader — never retry. Intra-team coordination
+  always uses the team tools above.
 - Use your native tools (Read, Write, Bash, etc.) for implementation work"#;
 
 fn build_teammate_role_prompt(params: &TeammatePromptParams<'_>) -> String {
@@ -378,6 +396,10 @@ mod tests {
         // Workflow must carry the matching exception — otherwise the concrete
         // delegation steps quietly override the permission granted above.
         assert!(prompt.contains("skip the rest of this workflow"));
+        assert!(prompt.contains("## Cross-Team Delegation"));
+        assert!(prompt.contains("root task"));
+        assert!(prompt.contains("assistant-only"));
+        assert!(prompt.contains("reusing the engagement") || prompt.contains("REUSES"));
         assert!(!prompt.contains("${"));
     }
 
@@ -408,6 +430,9 @@ mod tests {
         assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
         assert!(prompt.contains("`content_truncated: true`"));
         assert!(prompt.contains("STOP GENERATING"));
+        assert!(prompt.contains("delegate"));
+        assert!(prompt.contains("assistant-only"));
+        assert!(prompt.contains("stop and report"));
         assert!(!prompt.contains("Teammates: Worker"));
     }
 }
