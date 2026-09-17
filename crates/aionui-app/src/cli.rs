@@ -117,9 +117,9 @@ pub(crate) enum Command {
     /// Cross-session messaging: list deliverable conversations and deliver a
     /// message to one of them.
     Session(SessionArgs),
-    /// Cross-agent delegation: dispatch to or ask another agent by name.
-    /// CrewAI-style hierarchical delegation — works for any agent whose
-    /// `allow_delegation = 1`, addressed by name or assistant_id.
+    /// Cross-team / cross-agent delegation: dispatch a task to a team's engagement
+    /// (the team lead assigns internally) or to any delegating agent by name or
+    /// `assistant_id`. Sync `ask` is assistant-only.
     Delegate(DelegateArgs),
     /// Agent-facing read-only runtime CLI for THIS conversation's skills.
     /// Channel A of skill delivery: a normal tool call instead of the
