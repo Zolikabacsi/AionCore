@@ -46,8 +46,6 @@ pub enum DelegateToolErrorCode {
     TransportUnavailable,
     /// Sync-mode reply did not arrive before `timeout_seconds`.
     SyncTimeout,
-    /// Sync mode requested but the target does not support suspension.
-    SyncNotSupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
