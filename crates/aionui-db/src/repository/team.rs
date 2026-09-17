@@ -327,6 +327,42 @@ pub trait ITeamRepository: Send + Sync {
         ))
     }
 
+    /// Keyset-paginated engagement-scoped mailbox messages for the activity
+    /// feed. Mirrors `list_messages_by_team_paged` (identical cursor /
+    /// direction / ordering / limit semantics) but filters on `engagement_id`
+    /// and scopes via the engagement's owner (`team_engagements.user_id`). Up
+    /// to `limit` rows strictly beyond `cursor` in `direction` order (no
+    /// cursor = first page), ordered `(created_at, id)` per direction.
+    async fn list_messages_by_engagement_paged(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _cursor: Option<ActivityCursor>,
+        _direction: PageDirection,
+        _limit: i64,
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        Err(DbError::NotFound(
+            "list_messages_by_engagement_paged not implemented".to_string(),
+        ))
+    }
+
+    /// Keyset-paginated engagement-scoped tasks for the activity feed. Mirrors
+    /// `list_tasks_paged` (identical cursor / direction / ordering / limit
+    /// semantics) but filters on `engagement_id` and scopes via the
+    /// engagement's owner (`team_engagements.user_id`).
+    async fn list_tasks_by_engagement_paged(
+        &self,
+        _user_id: &str,
+        _engagement_id: &str,
+        _cursor: Option<ActivityCursor>,
+        _direction: PageDirection,
+        _limit: i64,
+    ) -> Result<Vec<TeamTaskRow>, DbError> {
+        Err(DbError::NotFound(
+            "list_tasks_by_engagement_paged not implemented".to_string(),
+        ))
+    }
+
     // ── Engagement-scoped runtime reads (Phase 2a Task 4b) ───────────────
     //
     // The session runtime must read ONLY the rows stamped with its own

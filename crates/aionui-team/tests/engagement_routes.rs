@@ -31,12 +31,13 @@ use aionui_api_types::{
 use aionui_common::{AgentKillReason, TimestampMs};
 use aionui_db::models::{MailboxMessageRow, MessageRow, TeamEngagementMemberRow, TeamTaskRow};
 use aionui_db::{
-    ITeamRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    ActivityCursor, ITeamRepository, PageDirection, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteProjectStore, SqliteProviderRepository, SqliteTeamRepository,
     init_database_memory,
 };
 use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
+use aionui_team::ActivityKind;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStatus, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
@@ -646,6 +647,57 @@ impl Harness {
         assert_ne!(e1.id, e2.id, "two projects yield two distinct engagements");
         (team.id, e1.id, e2.id)
     }
+
+    /// Seeds a task on `engagement` with an explicit `created_at` (for cursor
+    /// ordering), distinct from the fixed-ts `seed_task`.
+    async fn seed_task_at(&self, user: &str, team_id: &str, engagement: &str, task_id: &str, ts: i64) {
+        self.repo
+            .create_task(
+                user,
+                &TeamTaskRow {
+                    id: task_id.into(),
+                    team_id: team_id.into(),
+                    subject: format!("task {task_id}"),
+                    description: None,
+                    status: "pending".into(),
+                    owner: None,
+                    blocked_by: "[]".into(),
+                    blocks: "[]".into(),
+                    metadata: None,
+                    created_at: ts,
+                    updated_at: ts,
+                    engagement_id: Some(engagement.into()),
+                    expected_output: None,
+                    result: None,
+                    input_context: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seeds a mailbox message on `engagement` with an explicit `created_at`.
+    async fn seed_message_at(&self, user: &str, team_id: &str, engagement: &str, msg_id: &str, ts: i64) {
+        self.repo
+            .write_message(
+                user,
+                &MailboxMessageRow {
+                    id: msg_id.into(),
+                    team_id: team_id.into(),
+                    to_agent_id: "worker".into(),
+                    from_agent_id: "lead".into(),
+                    msg_type: "message".into(),
+                    content: format!("mail {msg_id}"),
+                    summary: None,
+                    files: None,
+                    read: false,
+                    created_at: ts,
+                    engagement_id: Some(engagement.into()),
+                },
+            )
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -786,4 +838,202 @@ async fn reads_reject_cross_user_and_foreign_team_engagement_id() {
             "engagement id bound to a foreign :id team must 404, got {err:?}"
         );
     }
+}
+
+// ── engagement-scoped unified activity feed (list_engagement_activity) ───────
+//
+// Phase 5c Task 2: the engagement twin of `list_team_activity`. It must produce
+// the SAME merged/cursor/limit/direction shape, but ONLY for one engagement's
+// rows, behind the SAME `load_owned_engagement` ownership guard. Assertions use
+// SPECIFIC ids (not just "non-empty") so a cross-engagement leak or a divergent
+// cursor scheme fails the test.
+
+#[tokio::test]
+async fn engagement_activity_returns_only_its_engagement_merged_ordered() {
+    let user = "user-act-iso";
+    let h = Harness::new(user).await;
+    let (team, e1, e2) = h.two_engagements(user, "ActIso").await;
+    // e1: interleaved mail@1000,3000 + task@2000,4000; e2 gets distinct rows.
+    h.seed_message_at(user, &team, &e1, "m-e1-1", 1000).await;
+    h.seed_message_at(user, &team, &e1, "m-e1-2", 3000).await;
+    h.seed_task_at(user, &team, &e1, "k-e1-1", 2000).await;
+    h.seed_task_at(user, &team, &e1, "k-e1-2", 4000).await;
+    h.seed_message_at(user, &team, &e2, "m-e2-1", 5000).await;
+    h.seed_task_at(user, &team, &e2, "k-e2-1", 6000).await;
+
+    let page = h
+        .svc
+        .list_engagement_activity(user, &team, &e1, None, PageDirection::Desc, ActivityKind::All, 10)
+        .await
+        .unwrap();
+    // desc merge of e1 only: k-e1-2(4000), m-e1-2(3000), k-e1-1(2000), m-e1-1(1000).
+    assert_eq!(
+        page.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["k-e1-2", "m-e1-2", "k-e1-1", "m-e1-1"],
+        "e1 page must be e1's merged rows, desc-ordered, nothing else"
+    );
+    assert!(!page.has_more, "all e1 rows fit within limit");
+
+    // e2 is fully disjoint — no e1 id appears in e2's page and vice versa.
+    let page2 = h
+        .svc
+        .list_engagement_activity(user, &team, &e2, None, PageDirection::Desc, ActivityKind::All, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["k-e2-1", "m-e2-1"],
+        "e2 page returns ONLY e2's rows"
+    );
+}
+
+#[tokio::test]
+async fn engagement_activity_paginates_via_next_cursor_excluding_prior_page() {
+    let user = "user-act-cursor";
+    let h = Harness::new(user).await;
+    let (team, e1, _) = h.two_engagements(user, "ActCursor").await;
+    h.seed_message_at(user, &team, &e1, "m1", 1000).await;
+    h.seed_message_at(user, &team, &e1, "m2", 3000).await;
+    h.seed_task_at(user, &team, &e1, "k1", 2000).await;
+    h.seed_task_at(user, &team, &e1, "k2", 4000).await;
+
+    let page = h
+        .svc
+        .list_engagement_activity(user, &team, &e1, None, PageDirection::Desc, ActivityKind::All, 3)
+        .await
+        .unwrap();
+    // desc top-3: k2(4000), m2(3000), k1(2000); m1(1000) deferred.
+    assert_eq!(
+        page.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["k2", "m2", "k1"]
+    );
+    assert!(page.has_more);
+    let c = page.next_cursor.expect("has_more implies a next cursor");
+    assert_eq!(
+        (c.ts, c.id.as_str()),
+        (2000, "k1"),
+        "cursor is the last item's (ts, id)"
+    );
+
+    let page2 = h
+        .svc
+        .list_engagement_activity(
+            user,
+            &team,
+            &e1,
+            Some(ActivityCursor {
+                created_at: c.ts,
+                id: c.id,
+            }),
+            PageDirection::Desc,
+            ActivityKind::All,
+            3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page2.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["m1"],
+        "second page excludes every page-1 id"
+    );
+    assert!(!page2.has_more);
+}
+
+#[tokio::test]
+async fn engagement_activity_honors_kind_filter_and_direction() {
+    let user = "user-act-kind";
+    let h = Harness::new(user).await;
+    let (team, e1, _) = h.two_engagements(user, "ActKind").await;
+    h.seed_message_at(user, &team, &e1, "m1", 1000).await;
+    h.seed_task_at(user, &team, &e1, "k1", 2000).await;
+    h.seed_message_at(user, &team, &e1, "m2", 3000).await;
+
+    let tasks_only = h
+        .svc
+        .list_engagement_activity(user, &team, &e1, None, PageDirection::Desc, ActivityKind::Task, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks_only.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["k1"],
+        "kind=task returns only tasks"
+    );
+
+    let msgs_only = h
+        .svc
+        .list_engagement_activity(user, &team, &e1, None, PageDirection::Desc, ActivityKind::Message, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        msgs_only.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["m2", "m1"],
+        "kind=message returns only messages"
+    );
+
+    let asc = h
+        .svc
+        .list_engagement_activity(user, &team, &e1, None, PageDirection::Asc, ActivityKind::All, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        asc.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["m1", "k1", "m2"],
+        "direction=asc orders oldest first"
+    );
+}
+
+#[tokio::test]
+async fn engagement_activity_rejects_foreign_team_and_cross_user() {
+    let owner = "user-act-owner";
+    let attacker = "user-act-attacker";
+    let h = Harness::new(owner).await;
+    let (team, e1, _) = h.two_engagements(owner, "ActGuard").await;
+    h.seed_task_at(owner, &team, &e1, "k-e1", 2000).await;
+
+    // Cross-user: attacker reads the victim's engagement under the victim's team.
+    let err = h
+        .svc
+        .list_engagement_activity(attacker, &team, &e1, None, PageDirection::Desc, ActivityKind::All, 10)
+        .await
+        .expect_err("attacker must not read another user's engagement activity");
+    assert!(
+        matches!(err, TeamError::TeamNotFound(_)),
+        "cross-user must 404, got {err:?}"
+    );
+
+    // Foreign team: same user, a different team id than the engagement's owner.
+    let other_team = h.create_team(owner, "Other").await;
+    let err = h
+        .svc
+        .list_engagement_activity(
+            owner,
+            &other_team.id,
+            &e1,
+            None,
+            PageDirection::Desc,
+            ActivityKind::All,
+            10,
+        )
+        .await
+        .expect_err("engagement id bound to a foreign :id team must 404");
+    assert!(
+        matches!(err, TeamError::TeamNotFound(_)),
+        "cross-team must 404, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn engagement_activity_empty_engagement_is_valid_empty_page() {
+    let user = "user-act-empty";
+    let h = Harness::new(user).await;
+    let (team, e1, _) = h.two_engagements(user, "ActEmpty").await;
+    // No rows seeded on e1.
+    let page = h
+        .svc
+        .list_engagement_activity(user, &team, &e1, None, PageDirection::Desc, ActivityKind::All, 10)
+        .await
+        .expect("an empty engagement is a valid (empty) page, not an error");
+    assert!(page.items.is_empty());
+    assert!(!page.has_more);
+    assert!(page.next_cursor.is_none());
 }
