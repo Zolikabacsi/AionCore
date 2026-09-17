@@ -92,10 +92,12 @@ The reply is in `data.reply` of the response envelope.
 JSON
 ```
 
-Returns **teams** (`kind: "Team"`) and delegating assistants
-(`kind: "Assistant"`, `allow_delegation = 1`), optionally filtered by
-substring. When a specialist (e.g. "CMO") belongs to a team, prefer
-dispatching to the TEAM — its lead assigns work internally.
+Returns delegating assistants (`allow_delegation = 1`) and **teams**.
+On the wire, a team row carries `"kind": "team"` (plus `team_id`); an
+assistant row has no "kind" field at all. Optionally filtered by substring.
+Address a team by its **name** in `to` (the team id shown is informational,
+not a dispatch key). When a specialist (e.g. "CMO") belongs to a team,
+prefer dispatching to the TEAM — its lead assigns work internally.
 
 ## Replying to a delegated task
 

@@ -508,11 +508,13 @@ fn delegate_skill_documents_the_team_engagement_contract() {
     ))
     .expect("delegate SKILL.md readable");
     for needle in [
-        "engagement",       // team dispatch semantics
-        "root task",        // what the dispatch creates
-        "assistant-only",   // ask limitation
-        "delegate targets", // the lookup command
-        "no project",       // sentinel default-engagement fallback (NOT a hard error)
+        "engagement",         // team dispatch semantics
+        "root task",          // what the dispatch creates
+        "assistant-only",     // ask limitation
+        "delegate targets",   // the lookup command
+        "no project",         // sentinel default-engagement fallback (NOT a hard error)
+        "\"kind\": \"team\"", // wire form for team rows (snake_case, skip-if-assistant)
+        "no \"kind\" field",  // assistant rows omit kind entirely
     ] {
         assert!(text.contains(needle), "delegate SKILL.md must mention {needle:?}");
     }
