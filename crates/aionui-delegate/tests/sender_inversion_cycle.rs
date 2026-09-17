@@ -497,6 +497,27 @@ fn delegate_skill_rule6_no_longer_prohibits_team_senders() {
     );
 }
 
+/// Phase 6: the shipped skill text must describe the shipped engagement
+/// contract (spec §13.1#6). Deliberate substrings — renaming them breaks this
+/// guard on purpose so guidance and capability re-diverge loudly.
+#[test]
+fn delegate_skill_documents_the_team_engagement_contract() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../aionui-app/assets/builtin-skills/auto-inject/delegate/SKILL.md"
+    ))
+    .expect("delegate SKILL.md readable");
+    for needle in [
+        "engagement",       // team dispatch semantics
+        "root task",        // what the dispatch creates
+        "assistant-only",   // ask limitation
+        "delegate targets", // the lookup command
+        "no project",       // sentinel default-engagement fallback (NOT a hard error)
+    ] {
+        assert!(text.contains(needle), "delegate SKILL.md must mention {needle:?}");
+    }
+}
+
 // ── FINAL-FIX: kill the assistant-mediated depth escape ─────────────────────
 
 /// A live engagement whose `delegate_depth` the seam persists on convene, and
