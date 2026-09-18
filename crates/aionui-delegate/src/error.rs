@@ -53,9 +53,6 @@ pub enum DelegateError {
 
     #[error("sync reply did not arrive within {timeout_seconds}s")]
     SyncTimeout { timeout_seconds: u64 },
-
-    #[error("target agent {assistant_id} does not support sync ask (allow_sync_delegation=0)")]
-    SyncNotSupported { assistant_id: String },
 }
 
 impl DelegateError {
@@ -77,7 +74,6 @@ impl DelegateError {
             Self::SchemaValidation { .. } => C::SchemaValidationFailed,
             Self::TransportUnavailable { .. } => C::TransportUnavailable,
             Self::SyncTimeout { .. } => C::SyncTimeout,
-            Self::SyncNotSupported { .. } => C::SyncNotSupported,
         }
     }
 
@@ -92,7 +88,7 @@ impl DelegateError {
             | C::ReplyTargetNotOwned => 403,
             C::CycleDetected | C::DepthExceeded => 409,
             C::RateLimited => 429,
-            C::SyncTimeout | C::SyncNotSupported => 408,
+            C::SyncTimeout => 408,
             _ => 400,
         }
     }

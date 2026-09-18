@@ -51,8 +51,7 @@ pub(crate) fn data() -> Value {
             "runtime_auth_failed",
             "schema_validation_failed",
             "transport_unavailable",
-            "sync_timeout",
-            "sync_not_supported"
+            "sync_timeout"
         ]
     })
 }

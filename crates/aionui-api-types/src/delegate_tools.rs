@@ -46,8 +46,6 @@ pub enum DelegateToolErrorCode {
     TransportUnavailable,
     /// Sync-mode reply did not arrive before `timeout_seconds`.
     SyncTimeout,
-    /// Sync mode requested but the target does not support suspension.
-    SyncNotSupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -353,8 +351,8 @@ fn delegate_tool_specs() -> Vec<DelegateToolSpec> {
     vec![
         DelegateToolSpec {
             name: DelegateToolName::DelegateTargets,
-            description: "List agents available for delegation (those with allow_delegation=1). \
-                           Use it when you need to look up the exact assistant_id before dispatching.",
+            description: "List delegation targets: teams (dispatching to one convenes or reuses its engagement for the caller's project) \
+                           and assistants with allow_delegation=1. Use it to look up the exact name or assistant_id before dispatching.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -370,13 +368,13 @@ fn delegate_tool_specs() -> Vec<DelegateToolSpec> {
         },
         DelegateToolSpec {
             name: DelegateToolName::DelegateDispatch,
-            description: "Async fan-out: deliver a task to another agent by name or assistant_id. \
-                           Recipient runs in their own conversation. Replies arrive as new user-role \
-                           messages in the conversation specified by `reply_to` (default: your conversation).",
+            description: "Async fan-out: deliver a task to a team or an agent by name or assistant_id. A team target convenes or reuses \
+                           that team's engagement for the caller's project and creates a root task; the consolidated reply arrives as a new \
+                           user-role message in `reply_to` (default: your conversation).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Target agent name (case-insensitive prefix match) or assistant_id." },
+                    "to": { "type": "string", "description": "Target team or agent name (case-insensitive prefix match) or assistant_id." },
                     "message": { "type": "string", "description": "Task body the recipient will execute." },
                     "files": { "type": "array", "items": { "type": "string" }, "description": "Optional absolute file paths to attach." },
                     "reply_to": { "type": "string", "description": "Optional conversation_id that should receive the reply. Default: your conversation." },
@@ -388,16 +386,17 @@ fn delegate_tool_specs() -> Vec<DelegateToolSpec> {
             }),
             cli_command: &["dispatch"],
             when: "Work that takes more than one agent turn (drafting, audit, build). Reply is asynchronous.",
-            input_summary: "{ to, message, optional files / reply_to / depth }",
+            input_summary: "{ to, message, optional files / reply_to / depth / expected_output }",
         },
         DelegateToolSpec {
             name: DelegateToolName::DelegateAsk,
-            description: "Sync round-trip: park your turn, target runs one turn, their reply text is \
-                           returned in-line. Use only for short yes/no questions you cannot proceed without.",
+            description: "Sync round-trip (assistants only — a team name is not askable and reports as not found): park your turn, the \
+                           target runs one turn, and the reply text is returned in-line. Use only for short yes/no questions you cannot \
+                           proceed without.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "Target agent name (case-insensitive prefix match) or assistant_id." },
+                    "to": { "type": "string", "description": "Target assistant name (case-insensitive prefix match) or assistant_id. Teams are not askable." },
                     "question": { "type": "string", "description": "The question to deliver to the recipient." },
                     "options": { "type": "array", "items": { "type": "string" }, "description": "Optional enum-like constraint to bias the recipient's reply shape. Not enforced." },
                     "timeout_seconds": { "type": "integer", "description": "Optional. Default 120s." }
@@ -446,4 +445,38 @@ pub fn tool_name_for_delegate_cli_path(path: &[String]) -> Option<DelegateToolNa
         .into_iter()
         .find(|spec| spec.cli_command == path.iter().map(String::as_str).collect::<Vec<_>>())
         .map(|spec| spec.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(n: DelegateToolName) -> DelegateToolSpec {
+        delegate_tool_specs().into_iter().find(|s| s.name == n).expect("spec")
+    }
+
+    #[test]
+    fn descriptors_describe_the_shipped_team_capability() {
+        let targets = spec(DelegateToolName::DelegateTargets).description;
+        assert!(
+            targets.contains("teams") && targets.contains("allow_delegation=1"),
+            "targets must enumerate BOTH sources: {targets}"
+        );
+        let dispatch = spec(DelegateToolName::DelegateDispatch).description;
+        assert!(
+            dispatch.contains("team") && dispatch.contains("engagement") && dispatch.contains("root task"),
+            "dispatch must describe the engagement bridge: {dispatch}"
+        );
+        let ask = spec(DelegateToolName::DelegateAsk).description.to_lowercase();
+        assert!(
+            ask.contains("assistant") && ask.contains("only"),
+            "ask must say assistant-only (teams are not askable): {ask}"
+        );
+        assert!(
+            spec(DelegateToolName::DelegateDispatch)
+                .input_summary
+                .contains("expected_output"),
+            "dispatch input_summary must list expected_output"
+        );
+    }
 }

@@ -1,23 +1,27 @@
 ---
 name: delegate
-description: Cross-agent delegation - dispatch a task to or ask another agent by name; replies route back to your conversation. Use for cross-squad work or when your role calls for hierarchical delegation.
+description: Cross-team and cross-agent delegation - dispatch a task into a team's engagement or ask an agent by name; consolidated replies route back to your conversation.
 ---
 
-# Cross-Agent Delegation Skill
+# Cross-Team & Cross-Agent Delegation Skill
 
-Deliver work to another agent — by **name** or by **assistant_id** — and
-receive their reply back in your conversation. CrewAI-style hierarchical
-delegation: any agent whose `allow_delegation = 1` can address any other.
+Hand work that lives OUTSIDE your own team to a **team** or an **agent** —
+by **name** (or `assistant_id`) — and get the result back in your own
+conversation. Teams are the primary targets: dispatching to "Marketing"
+convenes that team's engagement for your project and its lead assigns the
+Copywriter/Researcher roles internally (`delegate targets` first to see
+exact names). A standalone assistant is still addressable when its
+`allow_delegation = 1`.
 
 ## Rules
 
 1. Use this only when the user explicitly asks for delegation, OR when your
    role description says "delegate to X for this kind of task". Never
    delegate on your own initiative outside an explicit dispatcher pattern.
-2. Address targets by **name** (case-insensitive prefix match) or by
-   `assistant_id`. Names are resolved server-side via `targets`; never
-   pass a conversation id, slot id, or wildcard.
-3. `to` must name exactly one agent. There is no broadcast.
+2. Address targets by **team name**, **agent name** (case-insensitive prefix
+   match) or `assistant_id`. Names are resolved server-side via `targets`;
+   never pass a conversation id, slot id, or wildcard.
+3. `to` must name exactly one team or agent. There is no broadcast.
 4. Never pass, inline, export, echo, or set any `AIONUI_...` environment
    variable.
 5. Commands must directly call `"$AIONUI_HELPER_BIN" delegate ...`. Pass
@@ -26,40 +30,46 @@ delegation: any agent whose `allow_delegation = 1` can address any other.
    `team send-message`. This skill is for work outside your team — you MAY
    dispatch to ANOTHER team's engagement (name the team in `to`) or to any
    delegating agent. Cross-team loops are stopped server-side: a
-   `cycle_detected` or `depth_exceeded` response means stop (Rules 7/9).
-7. On `rate_limited`, STOP delivering. The two agents are spinning
-   against each other. Tell the user, do not retry.
-8. Word results precisely. `delivered` means "delivered to the target's
-   conversation; their turn will start when the runtime frees up".
-   `queued` means "their runtime is busy; will retry until it frees up".
-   `created_and_delivered` means "no prior conversation existed for this
-   target; the runtime created one and delivered". Never claim a message
-   was read.
-9. If the response is `cycle_detected`, STOP. The target is already on
-   your delegation chain. Do not retry.
+   `cycle_detected` or `depth_exceeded` response means stop (Rules 9/10).
+7. A team dispatch lands as the engagement's **root task** (your
+   `expected_output` becomes its success criteria) and runs on that team's
+   board. Dispatching to the same team again REUSES the engagement — a
+   follow-up is not a cycle. If your conversation has no project, the team's
+   default engagement is used.
+8. On `rate_limited`, STOP delivering. The two parties are spinning against
+   each other. Tell the user, do not retry.
+9. If the response is `cycle_detected`, STOP. The target is already on your
+   delegation chain. Do not retry.
 10. If `ask` returns `sync_timeout`, surface that to the user as "I asked
     X but didn't get a reply within N seconds".
+11. Word results precisely. The ack only means the work was ACCEPTED —
+    never claim anything completed or read. A team-dispatch ack carries the
+    engagement's `root_task_id`; the team's consolidated result arrives later
+    as a new user-role message in your conversation. End your turn; the
+    result wakes you. Don't poll.
 
 ## Delegating a task (async)
 
 ```bash
 "$AIONUI_HELPER_BIN" delegate dispatch <<'JSON'
 {
-  "to": "CMO",
+  "to": "Marketing",
   "message": "Draft a 3-tweet launch thread for the new product.",
+  "expected_output": "Three publish-ready tweets with an approval call from the team's reviewer.",
   "files": ["/abs/path/to/brief.md"]
 }
 JSON
 ```
 
-The recipient runs in their own conversation. Their reply arrives as a
-new user-role message in YOUR conversation (because `reply_to` defaults to
-your conversation id).
+The team runs the root task inside its own engagement; their lead
+consolidates and replies — the answer arrives as a new user-role message in
+YOUR conversation (because `reply_to` defaults to your conversation id).
 
-## Asking a question (sync)
+## Asking a question (sync, assistant-only)
 
-Use only when you cannot proceed without the answer. Your turn is
-suspended until the target replies or the timeout fires.
+`ask` targets **assistants only** — a team name is not askable and reports
+as not found. Use only when you cannot proceed without the answer. Your turn
+is suspended until the target replies or the timeout fires.
 
 ```bash
 "$AIONUI_HELPER_BIN" delegate ask <<'JSON'
@@ -82,25 +92,30 @@ The reply is in `data.reply` of the response envelope.
 JSON
 ```
 
-Returns every agent whose `allow_delegation = 1`, optionally filtered by
-substring.
+Returns delegating assistants (`allow_delegation = 1`) and **teams**.
+On the wire, a team row carries `"kind": "team"` (plus `team_id`); an
+assistant row has no "kind" field at all. Optionally filtered by substring.
+Address a team by its **name** in `to` (the team id shown is informational,
+not a dispatch key). When a specialist (e.g. "CMO") belongs to a team,
+prefer dispatching to the TEAM — its lead assigns work internally.
 
 ## Replying to a delegated task
 
 If a delegated task arrives with `reply_to` in its envelope block,
 deliver your response by addressing your own `delegate dispatch` to the
-agent named in `reply_to` (or to the conversation id in `reply_to` via
-`session send-message` if the conversation id is what you have).
+team or agent named in `reply_to` (or to the conversation id in `reply_to`
+via `session send-message` if the conversation id is what you have).
 
 ## Constraints
 
-- Depth ceiling: 3 (CEO → CMO → Copywriter → leaf). If `depth` would
+- Depth ceiling: 3 (CEO → team → member → leaf). If `depth` would
   exceed 3, the runtime returns `depth_exceeded`. Reply inline instead of
   delegating further when you see a high `depth` on the incoming envelope.
 - Cycle protection: server-side. If you ever get `cycle_detected`, report
   to the user and stop delegating along that path.
-- CMedO's VETO is binding. If you receive a VETO in any reply, surface to
-  the user immediately and stop further dispatch on that chain.
+- If your squad's preset makes a reviewer's VETO binding: a VETO in any
+  reply is surfaced to the user immediately and stops further dispatch on
+  that chain.
 - File paths must be absolute. Cross-workspace relative paths silently
   resolve against the recipient's directory.
 
